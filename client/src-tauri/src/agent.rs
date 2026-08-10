@@ -44,6 +44,19 @@ pub fn kill_action(request_id: &str) -> bool {
     unsafe { libc::kill(-pid, libc::SIGKILL) == 0 }
 }
 
+/// Validate an ssh target before handing it to OpenSSH. A host carrying
+/// whitespace/control characters (e.g. a stray newline from pasted input) makes
+/// OpenSSH fail with the confusing "remote username contains invalid characters".
+fn validate_host(host: &str) -> Result<(), String> {
+    if host.trim().is_empty() {
+        return Err("empty host".into());
+    }
+    if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("host contains whitespace or control characters".into());
+    }
+    Ok(())
+}
+
 /// Run one agent action on `host`. `emit` is called for each streamed event.
 ///
 /// Blocking — call from a worker thread (e.g. `spawn_blocking`) in the app.
@@ -54,6 +67,7 @@ pub fn run_action(
     request_id: &str,
     emit: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<AgentRunResult, String> {
+    validate_host(host)?;
     let agent = std::env::var("PUPPETTERM_AGENT_BIN")
         .unwrap_or_else(|_| "/usr/local/bin/puppetterm-agent".to_string());
 

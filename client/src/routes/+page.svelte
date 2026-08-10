@@ -48,6 +48,7 @@
   let aiHasKey = $state(false);
   let aiReady = $state(false);
   let chatBusy = $state(false);
+  let aiThinking = $state(false);
   let chatText = $state("");
   let chatLog = $state<Array<{ role: string; text: string }>>([]);
   let history = $state<any[]>([]);
@@ -200,7 +201,10 @@
         i += 1;
         continue;
       }
-      return tok;
+      // Strip control/whitespace characters (a stray newline/tab makes OpenSSH
+      // reject the username with 'remote username contains invalid characters').
+      const host = tok.replace(/[\s\x00-\x1f\x7f]/g, "");
+      return host.length > 0 ? host : null;
     }
     return null;
   }
@@ -469,31 +473,26 @@
   async function sendChat() {
     const text = chatText.trim();
     if (!text) return;
-    if (!activeHost) {
-      pushChat(
-        "ai",
-        "(no remote connection in this tab — type `ssh user@host` to connect, then I can act on it)",
-      );
-      return;
-    }
     if (!aiReady) {
       pushChat("ai", "(AI not configured — set the endpoint/model in settings)");
       return;
     }
     // Pin the target now: the whole task runs against THIS host and streams
-    // into THIS terminal, even if the user switches tabs mid-task.
-    const target = { host: activeHost, tabId: activeTabId ?? -1 };
+    // into THIS terminal, even if the user switches tabs mid-task. The host may
+    // be empty (local tab) — read_terminal still works, agent tools will say so.
+    const target = { host: activeHost ?? "", tabId: activeTabId ?? -1 };
     chatTarget = target;
     abortRequested = false;
     chatText = "";
     pushChat("user", text);
-    pushChat("ai", `(acting on ${target.host} — this terminal)`);
+    pushChat("ai", `(acting on ${target.host || "the local terminal"})`);
     history = [...history, { role: "user", content: text }];
     chatBusy = true;
     try {
       await runAiLoop();
     } finally {
       chatBusy = false;
+      aiThinking = false;
       chatTarget = null;
       currentRequestId = null;
       loadActivity();
@@ -557,7 +556,13 @@
         return;
       }
       history = compactHistory(history);
-      const resp = await call<any>("ai_chat", { messages: history, tools: AGENT_TOOLS });
+      aiThinking = true;
+      let resp: any;
+      try {
+        resp = await call<any>("ai_chat", { messages: history, tools: AGENT_TOOLS });
+      } finally {
+        aiThinking = false;
+      }
       const msg = resp?.choices?.[0]?.message;
       if (!msg) {
         pushChat("ai", "(no response from the model)");
@@ -638,15 +643,23 @@
         ? termByTab.get(chatTarget.tabId)?.term ?? null
         : activeTerm();
 
-    // Client-local tools (no SSH round-trip).
+    // Client-local tools (no SSH round-trip) — work on local OR remote tabs.
     if (name === "read_terminal") {
       if (!term) return { error: "no active terminal" };
       const text = terminalText(term, 200);
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
-        host,
+        host: host || null,
         note: "live terminal screen (not shell history)",
         terminal: text.slice(-8000),
+      };
+    }
+
+    // Tools that run on the remote host need an ssh target.
+    if (!host) {
+      return {
+        error:
+          "no remote connection in this tab — type `ssh user@host` to connect, then I can act on it",
       };
     }
 
@@ -923,6 +936,11 @@
         {#each chatLog as m, i (i)}
           <div class="msg {m.role}">{m.text}</div>
         {/each}
+        {#if aiThinking}
+          <div class="msg ai thinking">
+            <span class="spinner"></span> thinking…
+          </div>
+        {/if}
       </div>
       <div class="chat-input">
         <input
@@ -1412,6 +1430,27 @@
     background: #161b22;
     align-self: flex-start;
     max-width: 90%;
+  }
+  .msg.thinking {
+    color: #8b949e;
+    font-style: italic;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .spinner {
+    display: inline-block;
+    width: 11px;
+    height: 11px;
+    border: 2px solid #8b949e;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .chat-input {
     display: flex;

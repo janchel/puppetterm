@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/puppetterm/agent/internal/action"
@@ -17,6 +19,22 @@ import (
 )
 
 func main() {
+	// Don't die on EPIPE before we can clean up the running command.
+	signal.Ignore(syscall.SIGPIPE)
+
+	// When asked to stop (the client's Abort sends SIGTERM via a remote
+	// pkill), kill the running command's process group so it does not keep
+	// executing on the host after the agent exits.
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, syscall.SIGTERM, syscall.SIGHUP)
+		<-c
+		if pid := action.ActiveCommandPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+		os.Exit(124)
+	}()
+
 	os.Exit(run(os.Stdin, os.Stdout))
 }
 

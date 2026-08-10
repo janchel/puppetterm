@@ -66,6 +66,8 @@ func Run(ctx context.Context, req protocol.Request, out *protocol.Encoder) int {
 		_ = out.Errorf(req.RequestID, "start: %v", err)
 		return 1
 	}
+	activeCmdPID.Store(int64(cmd.Process.Pid))
+	defer activeCmdPID.Store(0)
 
 	// Kill the entire process group when the context (timeout/cancel) fires.
 	stop := context.AfterFunc(ctx, func() {

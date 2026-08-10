@@ -26,6 +26,10 @@
   // The host the AI chat binds to (the active session's host).
   let activeHost = $derived(tabs.find((t) => t.id === activeTabId)?.host ?? null);
 
+  // Pinned at send time: the terminal + host a chat task is acting on. Kept so
+  // switching tabs mid-task can never redirect the AI to a different server.
+  let chatTarget = $state<{ host: string; tabId: number } | null>(null);
+
   // AI panel width (persisted; draggable splitter).
   let aiWidth = $state(
     typeof localStorage !== "undefined"
@@ -438,14 +442,20 @@
       pushChat("ai", "(AI not configured — set the endpoint/model in settings)");
       return;
     }
+    // Pin the target now: the whole task runs against THIS host and streams
+    // into THIS terminal, even if the user switches tabs mid-task.
+    const target = { host: activeHost, tabId: activeTabId ?? -1 };
+    chatTarget = target;
     chatText = "";
     pushChat("user", text);
+    pushChat("ai", `(acting on ${target.host} — this terminal)`);
     history = [...history, { role: "user", content: text }];
     chatBusy = true;
     try {
       await runAiLoop();
     } finally {
       chatBusy = false;
+      chatTarget = null;
     }
   }
 
@@ -546,7 +556,13 @@
   async function executeTool(tc: { id: string; function: { name: string; arguments: string } }) {
     const name = tc.function.name;
     const args = safeParse(tc.function.arguments);
-    const term = activeTerm();
+    // Act on the pinned target (set when the chat was sent), falling back to
+    // the current active tab. Never chase a tab switch mid-task.
+    const host = chatTarget?.host ?? activeHost;
+    const term =
+      chatTarget?.tabId != null && chatTarget.tabId >= 0
+        ? termByTab.get(chatTarget.tabId)?.term ?? null
+        : activeTerm();
 
     // Client-local tools (no SSH round-trip).
     if (name === "read_terminal") {
@@ -554,7 +570,7 @@
       const text = terminalText(term, 200);
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
-        host: activeHost,
+        host,
         note: "live terminal screen (not shell history)",
         terminal: text.slice(-8000),
       };
@@ -566,7 +582,7 @@
     }
     const request = { action, params: args, request_id: tc.id };
     const res = await call<any>("run_agent_action", {
-      host: activeHost,
+      host,
       request: JSON.stringify(request),
       source: "ai",
       approved: true,
@@ -584,7 +600,7 @@
       .join("")
       .slice(-4000);
     return {
-      host: activeHost,
+      host,
       exit: resultEvent?.exit ?? res?.exit ?? null,
       outputs,
       structured: resultEvent?.structured ?? null,
@@ -772,6 +788,7 @@
           <div class="approval-label">Approve action?</div>
           <div class="approval-cmd">
             {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
+            <div class="approval-host">on {chatTarget?.host ?? activeHost}</div>
           </div>
           <div class="approval-btns">
             <button onclick={reject}>Reject</button>
@@ -779,6 +796,18 @@
           </div>
         </div>
       {/if}
+
+      <div class="ai-target">
+        <span class="dot {activeHost ? 'up' : 'down'}"></span>
+        {#if activeHost}
+          acting on <b>{activeHost}</b>
+          {#if chatBusy && chatTarget && chatTarget.host !== activeHost}
+            <span class="warn">(pinned — you switched tabs)</span>
+          {/if}
+        {:else}
+          local — ssh to a remote first
+        {/if}
+      </div>
 
       <div class="chat-log">
         {#if chatLog.length === 0}
@@ -1114,6 +1143,31 @@
     padding: 6px 8px;
     word-break: break-all;
     white-space: pre-wrap;
+  }
+  .approval-host {
+    margin-top: 6px;
+    color: #d29922;
+    font-weight: 600;
+  }
+  .ai-target {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 12px 8px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #8b949e;
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    flex: none;
+  }
+  .ai-target b {
+    color: #e6edf3;
+    font-family: monospace;
+  }
+  .ai-target .warn {
+    color: #d29922;
   }
   .approval-btns {
     display: flex;

@@ -309,19 +309,13 @@
       const sel = term.getSelection();
       if (sel) copyText(sel); // auto-copy on selection (best-effort)
     });
-    // Right-click: preserve the selection captured on mousedown, then copy it;
-    // if there is no selection, paste from the clipboard instead.
-    let rightClickSel = "";
-    term.element?.addEventListener("mousedown", (e) => {
-      if (e.button === 2) rightClickSel = term.getSelection();
-    });
-    term.element?.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      const sel = rightClickSel || term.getSelection();
-      rightClickSel = "";
-      if (sel) copyText(sel);
-      else pasteIntoTerminal(term);
-    });
+    // Right-click copy/paste: xterm's built-in rightClickHandler already
+    // populates its hidden textarea with the current selection and focuses it,
+    // so the webview's NATIVE context menu's "Copy"/"Paste" operate on the
+    // terminal selection. We must NOT preventDefault here, or the native menu
+    // is suppressed and right-click copy breaks in WebKitGTK (Tauri on Linux).
+    // (Instant copy/paste is provided by Ctrl+Shift+C / Ctrl+Shift+V and
+    // onSelectionChange auto-copy, which go through the native clipboard plugin.)
   }
 
   // ---- splitter (resizable AI panel) ---------------------------------------

@@ -1029,6 +1029,12 @@
       } catch (e) {
         console.warn("ai config unavailable:", e);
       }
+      // Land in a working LOCAL shell on launch (like a normal terminal)
+      // instead of the empty "No open sessions" state — the local-terminal-first
+      // flow is then one keystroke away: type `ssh user@host` to connect.
+      if (tabs.length === 0) {
+        await openTab();
+      }
     })();
 
     return () => {

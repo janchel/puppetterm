@@ -400,8 +400,12 @@
           // corrected typo (e.g. `ubuntu2<BS>@host`) detects as `ubuntu@host`.
           const target = parseSshTarget(cleanTyped(line));
           if (target && target !== t.host) {
+            // Set the host immediately, but DON'T check for the agent here —
+            // on password-only remotes the check would run before the user has
+            // connected (no ControlMaster yet) and fail. The prompt-gated
+            // buffer scan (maybeDetectSshFromBuffer) does the check once the
+            // connection is actually established.
             t.host = target;
-            checkAndHintAgent(id, target);
           }
         } else if (t.buf.length > 4096) {
           t.buf = "";
@@ -702,7 +706,7 @@
     installPrompt = { tabId, host };
     term.write(
       `\r\n\x1b[33m[puppetterm]\x1b[0m Install puppetterm-agent on \x1b[1m${host}\x1b[0m ` +
-        `(user-space, no sudo — uses your SSH key)? [y/N] `,
+        `(user-space, no sudo — reuses your SSH connection)? [y/N] `,
     );
   }
 
@@ -738,7 +742,7 @@
       if (!ok) {
         termByTab.get(id)?.term.write(
           `\r\n\x1b[90m[puppetterm] agent not detected on ${host} — ` +
-            `click "Install agent" to set it up (no sudo, uses your SSH key).\x1b[0m\r\n`,
+            `click "Install agent" to set it up (no sudo, reuses your SSH connection).\x1b[0m\r\n`,
         );
       }
     } catch {
@@ -764,11 +768,14 @@
   /** Detect an ssh target from what's on screen. This catches commands that
    *  never passed through onData — e.g. recalled with the up-arrow — because
    *  the shell echoes them into the pty output. Only scans when the shell is
-   *  back at a prompt (i.e. the connection has been established / command done). */
+   *  back at a prompt (i.e. the connection has been established / command done).
+   *  This is ALSO where the agent check/hint happens (once per host per
+   *  session), so on password-only remotes the check runs only after the user's
+   *  interactive ssh has authenticated and created the ControlMaster socket. */
   function maybeDetectSshFromBuffer(id: number) {
     const t = tabs.find((x) => x.id === id);
     const term = termByTab.get(id)?.term;
-    if (!t || !term || t.host !== "") return; // already have a host for this tab
+    if (!t || !term) return;
     const lines = terminalText(term, 60).split("\n");
     // The shell prompt is the last non-empty line (a trailing blank line can
     // follow the prompt, e.g. after a redraw — skip it before gating).
@@ -779,8 +786,8 @@
     for (let i = li; i >= 0; i--) {
       const target = detectSshFromLine(lines[i]);
       if (target) {
-        t.host = target;
-        checkAndHintAgent(id, target);
+        if (t.host !== target) t.host = target;
+        checkAndHintAgent(id, t.host); // idempotent per host per session
         return;
       }
     }
@@ -1190,7 +1197,7 @@
           <button
             class="install-agent"
             onclick={promptInstall}
-            title="Install puppetterm-agent on {activeHost} (no sudo, uses your SSH key)"
+            title="Install puppetterm-agent on {activeHost} (no sudo, reuses your SSH connection)"
           >
             Install agent
           </button>

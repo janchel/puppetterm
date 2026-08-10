@@ -2,7 +2,7 @@
 name = "client"
 version = "0.1.0"
 description = "puppetterm — SSH-native agentic terminal"
-authors = ["janchel"]
+authors = ["Jan Bas"]
 license = "MIT"
 edition = "2021"
 

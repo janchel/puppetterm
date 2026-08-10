@@ -203,6 +203,7 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - Delivered: `client/src-tauri/src/ai.rs` (OpenAI-compatible chat completions w/ function calling; config `~/.config/puppetterm/ai.json`, key never sent to frontend) + `ai_chat` command; frontend `runAiLoop` executes tool calls via `run_agent_action`.
   - **AC:** a request like "check disk on this host" triggers a `snapshot`/`run` tool call, results come back, and the AI answers from them.
   - ✅ Verified: live endpoint test (`PUPPETTERM_TEST_AI=1`) — plain completion + `get_weather` tool call both OK against **192.168.5.52:20128** (model `jandelcombo`, tool_calling capability confirmed). Frontend loop verified in browser (mock).
+  - ✅ `read_terminal` tool added: returns the live active-terminal buffer (via xterm `buffer.active`) so the AI sees the real screen, not `~/.bash_history`. System prompt updated to prefer it.
 
 - [x] **T5.2 — Session-bound AI (active host only)**
   - Depends on: T5.1

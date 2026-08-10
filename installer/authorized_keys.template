@@ -1,0 +1,4 @@
+# puppetterm-agent — dedicated, command-locked key (AI actions only).
+# Installed by installer/install.sh; do not edit by hand.
+# The lock means this key can ONLY invoke puppetterm-agent — never a shell.
+restrict,command="/usr/local/bin/puppetterm-agent",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding <PASTE_AGENT_PUBKEY_HERE> puppetterm-agent

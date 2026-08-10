@@ -244,15 +244,19 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
 **Goal:** everything is recorded, resilient, and pleasant to use.
 **DoD:** audit trail exists on both sides; end-to-end demo script passes.
 
-- [ ] **T6.1 — Client SQLite audit log**
+- [x] **T6.1 — Client SQLite audit log**
   - Depends on: T4.4
   - Every action: timestamp, host, source (user/AI), approval state, result.
+  - Delivered: `client/src-tauri/src/audit.rs` (rusqlite bundled; db at `~/.config/puppetterm/audit.db`, override `PUPPETTERM_AUDIT_DB`; UPDATE/DELETE triggers = append-only). `run_agent_action` records host/source/action/params/approval/exit/result; `audit_recent` command added.
   - **AC:** after a few actions, `sqlite3 client.db 'select * from audit;'` shows each with all fields; rows are immutable (no UPDATE allowed).
+  - ✅ Unit test `record_and_recent` passes (record, newest-first query, UPDATE blocked).
 
-- [ ] **T6.2 — Agent-side append-only log**
+- [x] **T6.2 — Agent-side append-only log**
   - Depends on: T2.4
   - Agent appends executed actions to a log file.
+  - Delivered: `agent/internal/audit/audit.go` — O_APPEND log at `/var/log/puppetterm/audit.log` (dir created by install.sh) with `~/.puppetterm/audit.log` fallback; records timestamp/action/request_id/exit/truncated-params; wired into `main.go` after every action. install.sh creates + chowns `/var/log/puppetterm`.
   - **AC:** running actions produces append-only entries on the box (`tail` the log); rotation policy documented (e.g. logrotate).
+  - ✅ Unit test passes (append + param truncation). ⚠️ Live on server1 pending re-run of `install.sh` (also fixes the preset sudoers bug found this turn).
 
 - [ ] **T6.3 — Themes & status indicators**
   - Depends on: T3.1, T3.2

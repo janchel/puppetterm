@@ -6,6 +6,7 @@
 
 mod agent;
 mod ai;
+mod audit;
 mod ssh;
 
 use std::collections::HashMap;
@@ -136,20 +137,55 @@ fn stop_ssh_session(state: State<'_, AppState>, id: u32) -> Result<(), String> {
 
 /// Run one agent action on a host over SSH. Streams NDJSON events as
 /// `agent-event` Tauri events and returns the collected result.
+/// Every action is recorded in the append-only audit log.
 #[tauri::command]
 async fn run_agent_action(
     app: AppHandle,
     host: String,
     request: String,
+    source: Option<String>,
+    approved: Option<bool>,
 ) -> Result<agent::AgentRunResult, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        agent::run_action(&host, &request, move |ev| {
+    let source = source.unwrap_or_else(|| "user".to_string());
+    let approval = match approved {
+        Some(true) => "approved",
+        Some(false) => "rejected",
+        None => "auto",
+    };
+
+    let host_for_action = host.clone();
+    let request_for_action = request.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        agent::run_action(&host_for_action, &request_for_action, move |ev| {
             let _ = app2.emit("agent-event", ev);
         })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    // Audit log (best-effort — never blocks or fails the action).
+    let req_value: serde_json::Value = serde_json::from_str(&request).unwrap_or_default();
+    let action = req_value
+        .get("action")
+        .and_then(|a| a.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let params = req_value.get("params").map(|p| p.to_string());
+    let exit = result.as_ref().map(|r| r.exit as i64).ok();
+    let summary = match &result {
+        Ok(r) => serde_json::json!({ "exit": r.exit, "events": r.events.len() }).to_string(),
+        Err(e) => serde_json::json!({ "error": e }).to_string(),
+    };
+    let _ = audit::record(&host, &source, &action, params.as_deref(), approval, exit, Some(&summary));
+
+    result
+}
+
+/// Return the most recent audit log entries (newest first).
+#[tauri::command]
+fn audit_recent(limit: Option<i64>) -> Result<Vec<audit::AuditRow>, String> {
+    audit::recent(limit.unwrap_or(50))
 }
 
 /// Return the AI provider config (endpoint + model + whether a key is set).
@@ -214,6 +250,7 @@ pub fn run() {
             resize_ssh_pty,
             stop_ssh_session,
             run_agent_action,
+            audit_recent,
             get_ai_config,
             set_ai_config,
             ai_chat

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/puppetterm/agent/internal/action"
+	"github.com/puppetterm/agent/internal/audit"
 	"github.com/puppetterm/agent/internal/protocol"
 )
 
@@ -49,5 +50,11 @@ func run(in io.Reader, outw io.Writer) int {
 		defer cancel()
 	}
 
-	return action.NewRegistry().Handle(ctx, req, out)
+	reg := action.NewRegistry()
+	code := reg.Handle(ctx, req, out)
+
+	// Append-only audit log on the host (best-effort).
+	audit.Record(req.Action, req.RequestID, string(req.Params), code)
+
+	return code
 }

@@ -99,9 +99,24 @@ EOF
     ;;
 esac
 
+# --- agent audit log dir ------------------------------------------------------
+mkdir -p /var/log/puppetterm
+chown "$SSH_USER" /var/log/puppetterm 2>/dev/null || true
+echo "    audit log dir: /var/log/puppetterm (owner: $SSH_USER)"
+
 # --- scoped sudoers ----------------------------------------------------------
 SUDOERS_FILE="/etc/sudoers.d/puppetterm-agent"
+SUDOERS_CURRENT=""
 if [ -f "$SUDOERS_FILE" ] && grep -q "^$SSH_USER " "$SUDOERS_FILE"; then
+  SUDOERS_CURRENT=1
+  # A preset may require extra aliases the existing file lacks — rewrite then.
+  case "$PRESET" in
+    web-server)
+      grep -q "PUPPETTERM_WEB_CFG" "$SUDOERS_FILE" || SUDOERS_CURRENT=""
+      ;;
+  esac
+fi
+if [ -n "$SUDOERS_CURRENT" ]; then
   echo "    sudoers already configured for $SSH_USER (skipping)"
 else
   if confirm "install scoped sudoers for user '$SSH_USER'?"; then

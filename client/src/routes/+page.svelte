@@ -399,6 +399,8 @@
     const res = await call<any>("run_agent_action", {
       host: activeHost,
       request: JSON.stringify(request),
+      source: "ai",
+      approved: true,
     });
     for (const ev of res?.events ?? []) {
       if (ev?.type === "output" && term) term.write(ev.data ?? "");

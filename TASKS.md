@@ -260,14 +260,20 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - **AC:** running actions produces append-only entries on the box (`tail` the log); rotation policy documented (e.g. logrotate).
   - ✅ Unit test passes (append + param truncation). ✅ Live on **192.168.5.50**: actions logged to `/var/log/puppetterm/audit.log` (snapshot/service/config entries observed).
 
-- [ ] **T6.3 — Themes & status indicators**
+- [~] **T6.3 — Themes & status indicators**
   - Depends on: T3.1, T3.2
-  - Theme switcher; live status dots; last-seen timestamps.
+  - Theme switcher; live status dots; last-seen timestamps; resizable terminal/AI panes; terminal copy/paste.
+  - **Delivered:**
+    - Resizable splitter between terminal area and AI panel — drag to resize (clamped 260px–50% of window), width persisted to localStorage (`pp.aiWidth`) and restored on reload. Verified in browser: drag 320→472px, persisted across reload; no console errors.
+    - Terminal copy/paste: `Ctrl+Shift+C` / `Ctrl+Insert` / right-click auto-copy the selection, `Ctrl+Shift+V` / `Shift+Insert` / right-click (no selection) paste; `onSelectionChange` auto-copies. Verified: selection → `onSelectionChange` → `navigator.clipboard.writeText` OK (clipboard received selected text); right-click paste echoed into the terminal.
+  - **Remaining:** theme switcher (dark theme toggle), live status dots, last-seen timestamps.
   - **AC:** switching theme restyles the terminal without reload; status dot reflects real connectivity; last-seen updates on activity.
 
-- [ ] **T6.4 — Error UX**
+- [~] **T6.4 — Error UX**
   - Depends on: T3.4, T5.3
   - Offline host, bad key, API failure — clear messages, no crashes.
+  - **Delivered:** `runAiLoop` wrapped in try/catch — any AI/chat failure is surfaced as a chat message (`(AI error: …)`) and logged to console instead of crashing the app.
+  - **Remaining:** inline human-readable messages for offline host / bad SSH key with a retry path (e.g. after `ssh-add`).
   - **AC:** each failure shows a human-readable inline message; app stays responsive; retry path works (e.g. after `ssh-add`).
 
 - [x] **T6.5 — End-to-end acceptance script**

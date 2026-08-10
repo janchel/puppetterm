@@ -54,12 +54,14 @@ fn check_host(host: String) -> bool {
     ssh::check_host(&host)
 }
 
-/// Open an interactive SSH session to `host` and start streaming its pty.
-#[tauri::command]
-fn start_ssh_session(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    host: String,
+/// Open a pty running `cmd` (optionally in `cwd`) and stream its output as
+/// `pty-output`/`pty-exit` events. Returns the new session id.
+fn spawn_pty_session(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    cmd_name: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
 ) -> Result<u32, String> {
     let id = state.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -68,8 +70,11 @@ fn start_ssh_session(
         .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())?;
 
-    let mut cmd = CommandBuilder::new("ssh");
-    cmd.args(["-tt", &host]);
+    let mut cmd = CommandBuilder::new(cmd_name);
+    cmd.args(args);
+    if let Some(cwd) = cwd {
+        cmd.cwd(cwd);
+    }
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
@@ -99,6 +104,24 @@ fn start_ssh_session(
     }
 
     Ok(id)
+}
+
+/// Open an interactive SSH session to `host` and start streaming its pty.
+#[tauri::command]
+fn start_ssh_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    host: String,
+) -> Result<u32, String> {
+    spawn_pty_session(&app, &state, "ssh", &["-tt", &host], None)
+}
+
+/// Open a local shell in the user's home directory (no remote connection).
+#[tauri::command]
+fn start_local_session(app: AppHandle, state: State<'_, AppState>) -> Result<u32, String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    spawn_pty_session(&app, &state, &shell, &[], Some(std::path::Path::new(&home)))
 }
 
 /// Send terminal input (keystrokes) to the session.
@@ -247,6 +270,7 @@ pub fn run() {
             list_ssh_hosts,
             check_host,
             start_ssh_session,
+            start_local_session,
             write_ssh_input,
             resize_ssh_pty,
             stop_ssh_session,

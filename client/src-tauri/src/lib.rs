@@ -7,6 +7,7 @@
 mod agent;
 mod ai;
 mod audit;
+mod install;
 mod ssh;
 
 use std::collections::HashMap;
@@ -40,6 +41,13 @@ struct PtyOutput {
 #[derive(Clone, Serialize)]
 struct PtyExit {
     id: u32,
+}
+
+/// Progress line emitted while installing the agent on a remote host.
+#[derive(Clone, Serialize)]
+struct InstallOutput {
+    host: String,
+    data: String,
 }
 
 /// List concrete host aliases from ~/.ssh/config.
@@ -218,6 +226,36 @@ fn stop_agent_action(request_id: String) -> bool {
     agent::kill_action(&request_id)
 }
 
+/// Whether the puppetterm agent is already present on the host.
+#[tauri::command]
+fn check_agent(host: String) -> bool {
+    install::check_agent(&host)
+}
+
+/// Install the puppetterm agent on a host over the existing SSH key
+/// (user-space by default; upgraded to root when passwordless sudo exists).
+/// Streams progress lines as `install-output` events.
+#[tauri::command]
+async fn install_agent_on_host(
+    app: AppHandle,
+    host: String,
+    agent_dir: Option<String>,
+    pubkey_path: Option<String>,
+) -> Result<install::InstallResult, String> {
+    let app2 = app.clone();
+    let host2 = host.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        install::install_agent(&host2, agent_dir, pubkey_path, &|line| {
+            let _ = app2.emit(
+                "install-output",
+                InstallOutput { host: host2.clone(), data: line.to_string() },
+            );
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Return the most recent audit log entries (newest first).
 #[tauri::command]
 fn audit_recent(limit: Option<i64>) -> Result<Vec<audit::AuditRow>, String> {
@@ -289,6 +327,8 @@ pub fn run() {
             stop_ssh_session,
             run_agent_action,
             stop_agent_action,
+            check_agent,
+            install_agent_on_host,
             audit_recent,
             get_ai_config,
             set_ai_config,

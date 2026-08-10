@@ -308,6 +308,15 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - **AC:** a state-changing `run_command` shows an approval with the target host; a dangerous one shows a red warning and is NOT auto-run in any mode; Abort stops a running task and kills the remote action; read-only-auto rejects state changes; the Activity panel lists recent actions.
   - ✅ Verified in browser mock: Activity panel renders 3 audit rows; Abort button appears while a task runs; `rm -rf / --no-preserve-root` approval renders as red "⚠ Dangerous action" with "on server1" and Reject works; svelte-check 0/0, build + cargo check OK.
 
+- [x] **T6.8 — In-app agent installer (Warp-style)**
+  - Depends on: T6.6, T4.5, installer
+  - Install the `puppetterm-agent` on the connected host straight from the app, with approval in the terminal, using the user's existing SSH keys (no password/sudo required).
+  - **Delivered:**
+    - Backend `install.rs`: `install_agent_on_host` installs a **user-space** agent (binary → `~/.puppetterm/bin/`, command-locked key → `~/.ssh/authorized_keys`, config → `~/.puppetterm/config.json`) by streaming files over SSH (`ssh host "cat > …"`), then verifies with a snapshot. If **passwordless sudo** exists (`sudo -n true`), it auto-upgrades to a **root** install by running the existing `installer/install.sh` (systemctl/apt grants, /etc config, /var/log audit). `check_agent(host)` reports whether the agent is reachable. Binaries resolved from `PUPPETTERM_AGENT_DIR` / `~/.puppetterm/agents` (or a passed path).
+    - Frontend: after `ssh <target>` detection, a one-time hint prints if the agent isn't present ("agent not detected on \<host\> — click 'Install agent'…"). The **Install agent** button (AI panel, per active host) writes an **in-terminal prompt**: "Install puppetterm-agent on \<host\> (user-space, no sudo — uses your SSH key)? [y/N]" — typing `y` starts the install (the keypress is consumed, not sent to the shell); progress streams into the terminal via `install-output` events; `n`/Enter/Ctrl+C cancels.
+  - **AC:** on a host without the agent, connecting prints the hint; clicking Install agent prompts in the terminal; `y` installs and streams progress; `n` cancels; `check_agent` flips true afterward; on a host with passwordless sudo it upgrades to root.
+  - ✅ Verified LIVE on **192.168.5.50**: user-space agent installed over the existing key (binary + config + command-locked key; snapshot via `~/.puppetterm/bin/puppetterm-agent` returns exit 0); root upgrade correctly skipped (no passwordless sudo). Browser mock: hint on connect to `staging`, in-terminal prompt, `y` streams install progress into the terminal, done message, `y` consumed. svelte-check 0/0, build OK, `cargo test --lib` 5/5 (incl. live install tests via `PUPPETTERM_TEST_INSTALL=1`).
+
 ---
 
 ## Phase dependency overview

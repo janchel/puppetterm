@@ -30,6 +30,12 @@
   // switching tabs mid-task can never redirect the AI to a different server.
   let chatTarget = $state<{ host: string; tabId: number } | null>(null);
 
+  // ---- agent install (Warp-style: install the agent on the connected host) ---
+  let installPrompt = $state<{ tabId: number; host: string } | null>(null); // awaiting y/n in the terminal
+  let installBusy = $state(false);
+  let installTabId = $state<number | null>(null); // route install-output events here
+  let agentChecked = $state<Set<string>>(new Set()); // hosts we've already hinted about
+
   // AI panel width (persisted; draggable splitter).
   let aiWidth = $state(
     typeof localStorage !== "undefined"
@@ -243,6 +249,20 @@
 
     term.onData((data) => {
       const t = tabById(id);
+      // In-terminal approval for installing the agent (consumes the keypress,
+      // does NOT forward it to the shell).
+      if (installPrompt && installPrompt.tabId === id) {
+        const ch = data.trim().toLowerCase();
+        if (ch === "y") {
+          const { host } = installPrompt;
+          installPrompt = null;
+          runInstall(id, host);
+        } else if (ch === "n" || ch === "\r" || ch === "\u0003") {
+          term.write("\r\n\x1b[90m[puppetterm] install cancelled\x1b[0m\r\n");
+          installPrompt = null;
+        }
+        return;
+      }
       if (t?.sessionId != null) call("write_ssh_input", { id: t.sessionId, data });
       // Track `ssh <target>` so the tab shows the remote connection (like a
       // normal terminal: open local, type `ssh user@host` to connect).
@@ -253,7 +273,10 @@
           const line = t.buf.slice(0, nl).trim();
           t.buf = t.buf.slice(nl + 1);
           const target = parseSshTarget(line);
-          if (target && target !== t.host) t.host = target;
+          if (target && target !== t.host) {
+            t.host = target;
+            checkAndHintAgent(id, target);
+          }
         } else if (t.buf.length > 4096) {
           t.buf = "";
         }
@@ -522,6 +545,59 @@
     }
   }
 
+  // ---- agent install (Warp-style) ------------------------------------------
+  /** Ask in the terminal: install the agent on the active host? [y/N] */
+  function promptInstall() {
+    const host = activeHost;
+    const tabId = activeTabId;
+    const term = activeTerm();
+    if (!host || !tabId || !term || installBusy) return;
+    installPrompt = { tabId, host };
+    term.write(
+      `\r\n\x1b[33m[puppetterm]\x1b[0m Install puppetterm-agent on \x1b[1m${host}\x1b[0m ` +
+        `(user-space, no sudo — uses your SSH key)? [y/N] `,
+    );
+  }
+
+  /** Stream the install into the terminal for the given tab. */
+  async function runInstall(id: number, host: string) {
+    const term = termByTab.get(id)?.term;
+    installTabId = id;
+    installBusy = true;
+    term?.write(`\r\n\x1b[35m[puppetterm install] starting on ${host}…\x1b[0m\r\n`);
+    try {
+      const res = await call<any>("install_agent_on_host", { host });
+      term?.write(
+        `\r\n\x1b[32m[puppetterm install] done — ${res?.mode ?? "user"} install at ` +
+          `${res?.agent_path ?? "~/.puppetterm/bin/puppetterm-agent"}\x1b[0m\r\n`,
+      );
+      loadActivity();
+    } catch (e) {
+      term?.write(`\r\n\x1b[31m[puppetterm install] failed: ${e}\x1b[0m\r\n`);
+    } finally {
+      installBusy = false;
+      installTabId = null;
+    }
+  }
+
+  /** After ssh detection, quietly check whether the agent is present; if not,
+   *  print a one-time hint offering to install it. */
+  async function checkAndHintAgent(id: number, host: string) {
+    if (agentChecked.has(host)) return;
+    agentChecked.add(host);
+    try {
+      const ok = await call<boolean>("check_agent", { host });
+      if (!ok) {
+        termByTab.get(id)?.term.write(
+          `\r\n\x1b[90m[puppetterm] agent not detected on ${host} — ` +
+            `click "Install agent" to set it up (no sudo, uses your SSH key).\x1b[0m\r\n`,
+        );
+      }
+    } catch {
+      /* ignore — hint is best-effort */
+    }
+  }
+
   // Keep the conversation bounded so long investigations don't blow the
   // model's context window: drop the middle, keep system + original request +
   // the most recent turns.
@@ -725,6 +801,13 @@
                 ?.term.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");
             }
           }),
+          await on<{ host: string; data: string }>("install-output", (p) => {
+            const term =
+              installTabId != null
+                ? termByTab.get(installTabId)?.term
+                : activeTerm();
+            term?.write(`\r\n\x1b[35m[puppetterm install]\x1b[0m ${p.data}\r\n`);
+          }),
         ];
       } catch (e) {
         console.warn("event listeners unavailable:", e);
@@ -904,6 +987,15 @@
           {/if}
         {:else}
           local — ssh to a remote first
+        {/if}
+        {#if activeHost && !installBusy}
+          <button
+            class="install-agent"
+            onclick={promptInstall}
+            title="Install puppetterm-agent on {activeHost} (no sudo, uses your SSH key)"
+          >
+            Install agent
+          </button>
         {/if}
       </div>
 
@@ -1383,6 +1475,21 @@
   }
   .ai-target .warn {
     color: #d29922;
+  }
+  .install-agent {
+    margin-left: auto;
+    border: 1px solid #238636;
+    background: transparent;
+    color: #3fb950;
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 11.5px;
+    cursor: pointer;
+    flex: none;
+  }
+  .install-agent:hover {
+    background: #238636;
+    color: #fff;
   }
   .approval-btns {
     display: flex;

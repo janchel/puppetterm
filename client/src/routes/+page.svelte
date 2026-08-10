@@ -58,6 +58,14 @@
   // preset URL). Remembered so switching to DeepSeek/Claude and back restores
   // it — otherwise the model switcher leaves a stale preset URL behind.
   let customBaseUrl = $state("");
+  // Lightweight toast for quick confirmations (e.g. "AI settings saved").
+  let toast = $state<{ msg: string; kind: "ok" | "err" } | null>(null);
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  function notify(msg: string, kind: "ok" | "err" = "ok") {
+    toast = { msg, kind };
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (toast = null), 3500);
+  }
 
   // Provider presets: predefined endpoint + default models.
   const AI_PROVIDERS: Record<
@@ -614,8 +622,10 @@
       aiReady = true;
       if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
       pushChat("ai", "(AI settings saved)");
+      notify(`AI settings saved — ${AI_PROVIDERS[aiProvider]?.label ?? "Custom"} · ${aiModel}`);
     } catch (e) {
       pushChat("ai", `(failed to save AI settings: ${e})`);
+      notify(`Failed to save AI settings: ${e}`, "err");
     }
   }
 
@@ -733,6 +743,42 @@
       }
     } catch {
       /* ignore — hint is best-effort */
+    }
+  }
+
+  /** Find an `ssh <target>` inside a DISPLAYED terminal line, e.g. the echo of
+   *  a command recalled from shell history: `devops@host:~$ ssh user@host`.
+   *  Returns the last match so the most recent command wins. */
+  function detectSshFromLine(line: string): string | null {
+    const re = /(?:^|[\s;])(?:ssh(?:2)?)[\s]+/gi;
+    let m: RegExpExecArray | null;
+    let target: string | null = null;
+    while ((m = re.exec(line)) !== null) {
+      const rest = line.slice(m.index + m[0].length).split(/[;|&]/)[0].trim();
+      const t = parseSshTarget("ssh " + rest);
+      if (t) target = t;
+    }
+    return target;
+  }
+
+  /** Detect an ssh target from what's on screen. This catches commands that
+   *  never passed through onData — e.g. recalled with the up-arrow — because
+   *  the shell echoes them into the pty output. Only scans when the shell is
+   *  back at a prompt (i.e. the connection has been established / command done). */
+  function maybeDetectSshFromBuffer(id: number) {
+    const t = tabs.find((x) => x.id === id);
+    const term = termByTab.get(id)?.term;
+    if (!t || !term || t.host !== "") return; // already have a host for this tab
+    const lines = terminalText(term, 60).split("\n");
+    const last = (lines[lines.length - 1] ?? "").trim();
+    if (!/[\$#>] ?$/.test(last)) return; // only when at a shell prompt
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const target = detectSshFromLine(lines[i]);
+      if (target) {
+        t.host = target;
+        checkAndHintAgent(id, target);
+        return;
+      }
     }
   }
 
@@ -928,7 +974,13 @@
         unlisteners = [
           await on<{ id: number; data: string }>("pty-output", (p) => {
             const t = tabs.find((x) => x.sessionId === p.id);
-            if (t) termByTab.get(t.id)?.term.write(p.data);
+            if (t) {
+              const term = termByTab.get(t.id)?.term;
+              term?.write(p.data);
+              // Catch ssh commands that were recalled from history (up-arrow):
+              // the command text is echoed in the pty output, not onData.
+              maybeDetectSshFromBuffer(t.id);
+            }
           }),
           await on<{ id: number }>("pty-exit", (p) => {
             const t = tabs.find((x) => x.sessionId === p.id);
@@ -979,6 +1031,11 @@
 </script>
 
 <div class="app" class:resizing={resizing}>
+  {#if toast}
+    <div class="toast {toast.kind === 'err' ? 'err' : ''}" role="status">
+      {toast.msg}
+    </div>
+  {/if}
   <header class="topbar">
     <div class="brand">puppetterm</div>
     <nav class="tabs">
@@ -1444,6 +1501,36 @@
   .ai-model-row select:focus {
     outline: 1px solid #1f6feb;
     border-color: #1f6feb;
+  }
+  .toast {
+    position: fixed;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1000;
+    max-width: 90vw;
+    background: #1c2128;
+    border: 1px solid #3d444d;
+    border-left: 3px solid #2f81f7;
+    color: #e6edf3;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    animation: toast-in 0.15s ease-out;
+  }
+  .toast.err {
+    border-left-color: #f85149;
+  }
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, 8px);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
   }
   .ai-unconfigured {
     margin: 8px 12px;

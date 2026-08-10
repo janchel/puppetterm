@@ -17,6 +17,7 @@ BINARY_SRC=""
 RELEASE_URL=""
 AGENT_PUBKEY=""
 SSH_USER="${SUDO_USER:-$(id -un)}"
+PRESET=""
 ASSUME_YES=0
 
 usage() {
@@ -28,6 +29,7 @@ Options:
   --release <url>        download the binary from <url> (overrides --binary)
   --agent-pubkey <path>  client's dedicated agent public key (hardened entry)
   --ssh-user <name>      SSH user to grant scoped privileges to (default: current)
+  --preset <name>        capability preset: web-server (grants /etc/nginx/ config writes)
   --yes                  non-interactive (auto-confirm)
   -h, --help             show this help
 EOF
@@ -39,11 +41,17 @@ while [ $# -gt 0 ]; do
     --release)     RELEASE_URL="$2"; shift 2 ;;
     --agent-pubkey) AGENT_PUBKEY="$2"; shift 2 ;;
     --ssh-user)    SSH_USER="$2"; shift 2 ;;
+    --preset)      PRESET="$2"; shift 2 ;;
     --yes)         ASSUME_YES=1; shift ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+case "$PRESET" in
+  ""|web-server) ;;
+  *) echo "error: unknown preset '$PRESET' (supported: web-server)" >&2; exit 2 ;;
+esac
 
 # --- root check (re-exec with sudo if needed) -------------------------------
 if [ "$(id -u)" -ne 0 ]; then
@@ -80,21 +88,43 @@ fi
 echo "    installed: $AGENT_PATH"
 "$AGENT_PATH" </dev/null >/dev/null 2>&1 || true # smoke: should exit 1 with an error, not crash
 
+# --- capability preset --------------------------------------------------------
+case "$PRESET" in
+  web-server)
+    mkdir -p /etc/puppetterm
+    cat > /etc/puppetterm/config.json <<'EOF'
+{"log_prefixes":["/var/log/"],"config_prefixes":["/etc/nginx/"]}
+EOF
+    echo "    preset web-server: allow-list (/etc/nginx/) written"
+    ;;
+esac
+
 # --- scoped sudoers ----------------------------------------------------------
 SUDOERS_FILE="/etc/sudoers.d/puppetterm-agent"
 if [ -f "$SUDOERS_FILE" ] && grep -q "^$SSH_USER " "$SUDOERS_FILE"; then
   echo "    sudoers already configured for $SSH_USER (skipping)"
 else
   if confirm "install scoped sudoers for user '$SSH_USER'?"; then
-    cat > "$SUDOERS_FILE" <<EOF
-# puppetterm-agent — scoped privileges (managed by install.sh)
-Cmnd_Alias PUPPETTERM_SYSTEMCTL = /usr/bin/systemctl status *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl restart *, /usr/bin/systemctl enable *, /usr/bin/systemctl disable *, /usr/bin/systemctl is-active *, /usr/bin/systemctl is-enabled *
-Cmnd_Alias PUPPETTERM_APT = /usr/bin/apt-get update, /usr/bin/apt-get install -y *, /usr/bin/apt-get remove -y *, /usr/bin/apt-get autoremove -y *, /usr/bin/apt update, /usr/bin/apt install -y *, /usr/bin/apt remove -y *, /usr/bin/apt autoremove -y *
-Cmnd_Alias PUPPETTERM_DEPLOY = /usr/bin/git pull, /usr/bin/systemctl restart *
-# No cat/tail/journalctl aliases: arbitrary file reads (e.g. /etc/shadow) must
-# stay denied. Log reads rely on group access (user in 'adm') instead.
-$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_DEPLOY
-EOF
+    {
+      echo "# puppetterm-agent — scoped privileges (managed by install.sh)"
+      echo "Cmnd_Alias PUPPETTERM_SYSTEMCTL = /usr/bin/systemctl status *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl restart *, /usr/bin/systemctl enable *, /usr/bin/systemctl disable *, /usr/bin/systemctl is-active *, /usr/bin/systemctl is-enabled *"
+      echo "Cmnd_Alias PUPPETTERM_APT = /usr/bin/apt-get update, /usr/bin/apt-get install -y *, /usr/bin/apt-get remove -y *, /usr/bin/apt-get autoremove -y *, /usr/bin/apt update, /usr/bin/apt install -y *, /usr/bin/apt remove -y *, /usr/bin/apt autoremove -y *"
+      echo "Cmnd_Alias PUPPETTERM_DEPLOY = /usr/bin/git pull, /usr/bin/systemctl restart *"
+      echo "# No cat/tail/journalctl aliases: arbitrary file reads (e.g. /etc/shadow) must"
+      echo "# stay denied. Log reads rely on group access (user in 'adm') instead."
+      EXTRA=""
+      case "$PRESET" in
+        web-server)
+          echo "Cmnd_Alias PUPPETTERM_WEB_CFG = /usr/bin/tee /etc/nginx/*"
+          EXTRA="PUPPETTERM_WEB_CFG"
+          ;;
+      esac
+      if [ -n "$EXTRA" ]; then
+        echo "$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_DEPLOY, $EXTRA"
+      else
+        echo "$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_DEPLOY"
+      fi
+    } > "$SUDOERS_FILE"
     chmod 0440 "$SUDOERS_FILE"
     if ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
       rm -f "$SUDOERS_FILE"
@@ -145,6 +175,7 @@ cat <<EOF
     agent:      $AGENT_PATH
     sudoers:    $SUDOERS_FILE (user: $SSH_USER)
     agent key:  $(if [ -n "$AGENT_PUBKEY" ]; then echo "command-locked in $AUTH_KEYS"; else echo "NOT configured"; fi)
+    preset:     ${PRESET:-none}
 
 Next steps on your client:
     1. Add this host to the client (host alias from ~/.ssh/config).

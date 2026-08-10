@@ -430,7 +430,99 @@ Host *
         format!("{include}\n{}\n", filtered.join("\n").trim_end())
     };
     std::fs::write(&main, merged).map_err(|e| e.to_string())?;
+    // Clean up stale/broken master sockets in the background — never blocks
+    // startup or install.
+    std::thread::spawn(cleanup_stale_masters);
     Ok(())
+}
+
+/// Run a command; return true if it exits 0 within `ms` (killed on timeout).
+fn run_with_timeout(args: &[&str], ms: u64) -> bool {
+    use std::time::{Duration, Instant};
+    let mut child = match std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let start = Instant::now();
+    loop {
+        if let Some(st) = child.try_wait().unwrap_or(None) {
+            return st.success();
+        }
+        if start.elapsed() >= Duration::from_millis(ms) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Remove ControlMaster sockets whose master is dead OR broken. A broken master
+/// — alive enough to answer `-O check` but unable to serve a new session — makes
+/// the user's next interactive `ssh` hang or fail with "PTY allocation request
+/// failed", so each socket is probed by attaching a throwaway session. Best-effort.
+fn cleanup_stale_masters() {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let mux_dir = std::path::Path::new(&home).join(".ssh/puppetterm-mux");
+    let entries = match std::fs::read_dir(&mux_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Socket filenames are `user@host:port` (no `.sock` extension), so
+        // process every non-directory entry in the mux dir.
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        // Socket filename is `user@host:port` (from %r@%h:%p).
+        let (user, host_port) = match name.rfind('@') {
+            Some(i) => (name[..i].to_string(), name[i + 1..].to_string()),
+            None => (String::new(), name.clone()),
+        };
+        let (host, port) = match host_port.rfind(':') {
+            Some(i) => (host_port[..i].to_string(), host_port[i + 1..].to_string()),
+            None => (host_port.clone(), "22".to_string()),
+        };
+        let target = if user.is_empty() {
+            host
+        } else {
+            format!("{user}@{host}")
+        };
+        let sock = path.to_string_lossy().into_owned();
+        // Attach a throwaway session: healthy master → `true` returns 0 fast;
+        // broken/dead master → fails or hangs (killed by the timeout).
+        let ok = run_with_timeout(
+            &[
+                "ssh",
+                "-S", &sock,
+                "-o", "ControlMaster=no",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=2",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-p", &port,
+                &target,
+                "true",
+            ],
+            4000,
+        );
+        if !ok {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("[puppetterm] removed broken ControlMaster socket {name}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +544,7 @@ mod tests {
 
         ensure_ssh_control_master().unwrap();
         ensure_ssh_control_master().unwrap(); // second run must not duplicate
+
 
         let body = std::fs::read_to_string(&main).unwrap();
         let inc = format!("Include {}/.ssh/puppetterm-control", dir.display());

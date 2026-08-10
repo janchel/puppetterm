@@ -84,6 +84,44 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
       emitMock("pty-exit", { id });
       return Promise.resolve(undefined as T);
     }
+    case "stop_agent_action":
+      return Promise.resolve(true as T);
+    case "audit_recent":
+      return Promise.resolve([
+        {
+          id: 1,
+          ts: "2026-08-10T10:00:01Z",
+          host: "server1",
+          source: "ai",
+          action: "snapshot",
+          params: "{}",
+          approval: "auto",
+          exit: 0,
+          result: '{"exit":0}',
+        },
+        {
+          id: 2,
+          ts: "2026-08-10T10:01:33Z",
+          host: "server1",
+          source: "ai",
+          action: "service",
+          params: '{"unit":"nginx","op":"restart"}',
+          approval: "approved",
+          exit: 0,
+          result: '{"exit":0}',
+        },
+        {
+          id: 3,
+          ts: "2026-08-10T10:02:10Z",
+          host: "server1",
+          source: "user",
+          action: "run",
+          params: '{"cmd":"whoami"}',
+          approval: "auto",
+          exit: 0,
+          result: '{"exit":0}',
+        },
+      ] as T);
     case "get_ai_config":
       return Promise.resolve({
         base_url: "http://192.168.5.52:20128/v1",

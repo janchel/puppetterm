@@ -295,6 +295,17 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - ✅ Verified in browser mock: + New → tab `local` + `(local shell)` prompt; `ssh server1` → tab becomes `server1` (AI placeholder updates); `ssh -p 2222 ubuntu@192.168.5.50` → tab `ubuntu@192.168.5.50`; chevron lists saved hosts; svelte-check 0/0, build + cargo check OK.
   - 🛡️ **AI targeting safety:** the AI executes against the **active tab's** detected host (never "types" into a random terminal). The target is **pinned at send time** (`chatTarget` = host + tabId) so switching tabs mid-task cannot redirect a running task to another server; output streams into the pinned terminal. A persistent "acting on \<host\>" banner in the AI panel shows the current target, each task opens with "(acting on \<host\> — this terminal)", the approval prompt shows "on \<host\>", and switching tabs mid-task shows "(pinned — you switched tabs)".
 
+- [x] **T6.7 — Agentic AI safety: abort, guardrails, activity**
+  - Depends on: T6.6, T5.3, T2.4
+  - "Take back control" + guardrails for the agentic AI. (Warp-style takeover isn't needed — the AI runs in a separate panel — but the emergency-stop, guardrail, and accountability layers are.)
+  - **Delivered:**
+    - **Abort (take back control):** an **Abort** button appears in the chat while a task runs. It stops the AI loop between steps and kills the **in-flight remote action** — backend tracks ssh child pids per request_id (`agent::ACTIVE_ACTIONS`, process group), new `stop_agent_action(request_id)` command kills the process group → ssh drops → the remote agent command dies.
+    - **Dangerous-command guardrails:** `DANGEROUS_PATTERNS` (rm --no-preserve-root, rm -rf / or /*, mkfs, dd of=/dev/, >/dev/sd*, shutdown/reboot/halt/poweroff, fork bomb, chmod -R 777 /, mv /, init 0/6). Matching `run_command`s get a **red "⚠ Dangerous action" approval** with the target host; they still run only on explicit Approve.
+    - **Read-only mode now truly read-only:** `read-only-auto` auto-approves only read-only tools; state-changing tools are auto-**rejected** with a chat message (previously it auto-approved everything, a safety gap).
+    - **Activity/accountability view:** an "Activity (n)" collapsible in the AI panel lists the recent audit rows (time / host / action / exit) from `audit_recent`, refreshed after each task — you can always see what the AI did.
+  - **AC:** a state-changing `run_command` shows an approval with the target host; a dangerous one shows a red warning and is NOT auto-run in any mode; Abort stops a running task and kills the remote action; read-only-auto rejects state changes; the Activity panel lists recent actions.
+  - ✅ Verified in browser mock: Activity panel renders 3 audit rows; Abort button appears while a task runs; `rm -rf / --no-preserve-root` approval renders as red "⚠ Dangerous action" with "on server1" and Reject works; svelte-check 0/0, build + cargo check OK.
+
 ---
 
 ## Phase dependency overview

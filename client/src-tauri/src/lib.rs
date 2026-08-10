@@ -179,8 +179,14 @@ async fn run_agent_action(
 
     let host_for_action = host.clone();
     let request_for_action = request.clone();
+    let request_value: serde_json::Value = serde_json::from_str(&request).unwrap_or_default();
+    let request_id = request_value
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        agent::run_action(&host_for_action, &request_for_action, move |ev| {
+        agent::run_action(&host_for_action, &request_for_action, &request_id, move |ev| {
             let _ = app2.emit("agent-event", ev);
         })
     })
@@ -203,6 +209,13 @@ async fn run_agent_action(
     let _ = audit::record(&host, &source, &action, params.as_deref(), approval, exit, Some(&summary));
 
     result
+}
+
+/// Abort a running agent action (kills its ssh process group — the remote
+/// agent command dies too). This is the "take back control" escape hatch.
+#[tauri::command]
+fn stop_agent_action(request_id: String) -> bool {
+    agent::kill_action(&request_id)
 }
 
 /// Return the most recent audit log entries (newest first).
@@ -275,6 +288,7 @@ pub fn run() {
             resize_ssh_pty,
             stop_ssh_session,
             run_agent_action,
+            stop_agent_action,
             audit_recent,
             get_ai_config,
             set_ai_config,

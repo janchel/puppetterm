@@ -1,6 +1,7 @@
 <script lang="ts">
   import { call, on, type UnlistenFn } from "$lib/backend";
   import { Terminal } from "xterm";
+  import "xterm/css/xterm.css";
   import { FitAddon } from "@xterm/addon-fit";
   import { onMount, tick } from "svelte";
 

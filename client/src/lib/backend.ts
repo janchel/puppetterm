@@ -153,6 +153,7 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
       return Promise.resolve({
         base_url: "http://192.0.2.52:20128/v1",
         model: "custom-model",
+        provider: "openai",
         has_api_key: true,
       } as T);
     case "set_ai_config":

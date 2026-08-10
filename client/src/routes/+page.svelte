@@ -86,6 +86,33 @@
     if (preset && preset.baseUrl) aiBaseUrl = preset.baseUrl;
     if (preset?.model) aiModel = preset.model;
   }
+
+  // Every model across all provider presets, plus whatever is currently saved.
+  let allModels = $derived.by(() => {
+    const set = new Set<string>();
+    for (const p of Object.values(AI_PROVIDERS)) for (const m of p.models) set.add(m);
+    if (aiModel) set.add(aiModel);
+    return [...set];
+  });
+
+  /** Pick a model in the chat panel. If it belongs to a provider preset,
+   *  switch the provider + endpoint too; then persist. */
+  function applyAiModel(m: string) {
+    aiModel = m;
+    for (const [key, p] of Object.entries(AI_PROVIDERS)) {
+      if (p.models.includes(m)) {
+        aiProvider = key;
+        if (p.baseUrl) aiBaseUrl = p.baseUrl;
+        break;
+      }
+    }
+    aiReady = true;
+    call("set_ai_config", {
+      baseUrl: aiBaseUrl,
+      model: aiModel,
+      provider: aiProvider,
+    }).catch((e) => console.error("save model", e));
+  }
   let chatBusy = $state(false);
   let aiThinking = $state(false);
   let chatText = $state("");
@@ -998,6 +1025,22 @@
           ⚙ settings
         </button>
       </div>
+
+      <div class="ai-model-row" title="Switch the AI model (persisted)">
+        <span class="ai-provider-tag">{AI_PROVIDERS[aiProvider]?.label ?? "Custom"}</span>
+        <select
+          value={aiModel}
+          onchange={(e) => applyAiModel((e.currentTarget as HTMLSelectElement).value)}
+        >
+          {#if !aiModel}
+            <option value="">(no model)</option>
+          {/if}
+          {#each allModels as m (m)}
+            <option value={m}>{m}</option>
+          {/each}
+        </select>
+      </div>
+
       {#if !aiReady}
         <div class="ai-unconfigured">
           AI not configured — open <button onclick={() => (showSettings = true)}>⚙ Settings</button> to set the endpoint &amp; model.
@@ -1318,6 +1361,35 @@
   }
   .ai-settings-link:hover {
     color: #e6edf3;
+  }
+  .ai-model-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px 8px;
+    flex: none;
+  }
+  .ai-provider-tag {
+    font-size: 11px;
+    color: #8b949e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ai-model-row select {
+    flex: 1;
+    min-width: 0;
+    background: #010409;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #e6edf3;
+    padding: 4px 8px;
+    font-size: 12px;
+    color-scheme: dark; /* keep the native dropdown dark (WebKitGTK) */
+  }
+  .ai-model-row select:focus {
+    outline: 1px solid #1f6feb;
+    border-color: #1f6feb;
   }
   .ai-unconfigured {
     margin: 8px 12px;

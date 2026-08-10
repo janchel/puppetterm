@@ -90,12 +90,17 @@ else
 # puppetterm-agent — scoped privileges (managed by install.sh)
 Cmnd_Alias PUPPETTERM_SYSTEMCTL = /usr/bin/systemctl status *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl restart *, /usr/bin/systemctl enable *, /usr/bin/systemctl disable *, /usr/bin/systemctl is-active *, /usr/bin/systemctl is-enabled *
 Cmnd_Alias PUPPETTERM_APT = /usr/bin/apt-get update, /usr/bin/apt-get install -y *, /usr/bin/apt-get remove -y *, /usr/bin/apt-get autoremove -y *, /usr/bin/apt update, /usr/bin/apt install -y *, /usr/bin/apt remove -y *, /usr/bin/apt autoremove -y *
-Cmnd_Alias PUPPETTERM_READ = /usr/bin/tail *, /bin/tail *, /usr/bin/journalctl *, /bin/journalctl *, /usr/bin/cat *, /bin/cat *
 Cmnd_Alias PUPPETTERM_DEPLOY = /usr/bin/git pull, /usr/bin/systemctl restart *
-$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_READ, PUPPETTERM_DEPLOY
+# No cat/tail/journalctl aliases: arbitrary file reads (e.g. /etc/shadow) must
+# stay denied. Log reads rely on group access (user in 'adm') instead.
+$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_DEPLOY
 EOF
     chmod 0440 "$SUDOERS_FILE"
-    visudo -cf "$SUDOERS_FILE" >/dev/null
+    if ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
+      rm -f "$SUDOERS_FILE"
+      echo "error: sudoers validation failed; no changes made" >&2
+      exit 1
+    fi
     echo "    wrote $SUDOERS_FILE"
   else
     echo "    skipped sudoers"

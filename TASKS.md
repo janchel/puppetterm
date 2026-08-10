@@ -75,9 +75,9 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
 
 ---
 
-## Phase 2 — SSH Plumbing & Provisioning (Ubuntu)
+## Phase 2 — SSH Plumbing & Provisioning (Ubuntu) ✅
 **Goal:** the agent runs on a real Ubuntu box, reachable only through the user's SSH, with hardening applied.
-**DoD:** an end-to-end `ssh <host> puppetterm-agent snapshot` works on a VPS; a plain `ssh <host>` shell is refused.
+**DoD:** an end-to-end `ssh <host> puppetterm-agent snapshot` works on a VPS; a plain `ssh <host>` shell is refused. ✅ **Met on 192.168.5.50** (all tasks T2.1–T2.7 done).
 
 - [x] **T2.1 — ControlMaster session helper**
   - Depends on: T1.6
@@ -85,11 +85,11 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - Delivered: `client/scripts/ssh-mux.sh` (`start`/`run`/`agent`/`stop`/`status`/`list`).
   - **AC:** master opens; `ssh -S <socket> <host> true` completes instantly the second time; closing the master cleans up the socket file. ✅ verified end-to-end against localhost (start → status up → run → agent action → parallel actions → stop → status down).
 
-- [ ] **T2.2 — Agent over SSH on a VPS**
+- [x] **T2.2 — Agent over SSH on a VPS**
   - Depends on: T2.1, T0.3
   - Copy agent to a throwaway Ubuntu VPS; invoke through SSH.
   - **AC:** `ssh -S <socket> <host> /usr/local/bin/puppetterm-agent snapshot` returns valid NDJSON; works with the user's existing `~/.ssh` key; no listener/port is open (`ss -ltn` shows nothing new).
-  - ⚠️ Mechanics verified end-to-end against **localhost** (snapshot + run + parallel over the mux). Pending a real Ubuntu VPS to close the AC.
+  - ✅ Verified on **192.168.5.50** (Ubuntu 26.04, x86_64): snapshot via mux returned valid NDJSON; `ss -ltn` showed **no new listeners**; parallel actions clean; no orphaned masters.
 
 - [ ] **T2.3 — `~/.ssh/config` integration**
   - Depends on: T2.2
@@ -100,18 +100,22 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - Depends on: T2.2
   - Idempotent install: place binary, add hardened `authorized_keys` entry (`restrict,command=...`), install scoped sudoers.
   - Delivered: `installer/install.sh`, `installer/sudoers.d/puppetterm-agent`, `installer/authorized_keys.template` (all `bash -n` clean, executable).
-  - **AC:** on a fresh Ubuntu box, running `install.sh` twice is safe (second run makes no conflicting changes); binary present at `/usr/local/bin/puppetterm-agent`; service not installed. ⚠️ Pending live verification on a real box.
+  - **AC:** on a fresh Ubuntu box, running `install.sh` twice is safe (second run makes no conflicting changes); binary present at `/usr/local/bin/puppetterm-agent`; service not installed.
+  - ✅ Verified on **192.168.5.50**: binary at `/usr/local/bin/puppetterm-agent`; command-locked key added (re-run correctly skipped it); `sudo -n -l` confirms the scoped rules are active for `ubuntu` (so a re-run skips sudoers too).
+  - 🐛 Gotcha: `installer/sudoers.d/puppetterm-agent` is a **template** with a `USER` placeholder — never install it directly; always go through `install.sh` (it substitutes the user).
 
-- [ ] **T2.5 — Sudoers scoping verified**
+- [x] **T2.5 — Sudoers scoping verified**
   - Depends on: T2.4
-  - NOPASSWD for exactly the needed commands (`systemctl`, `apt`, `tail`, ...) only.
+  - NOPASSWD for exactly the needed commands (`systemctl`, `apt`) only — no file reads.
   - **AC:** the agent's SSH user can `sudo -n systemctl status nginx` without a password; any other `sudo -n` command (e.g. `sudo -n cat /etc/shadow`) is denied.
+  - ✅ Verified on **192.168.5.50**: `sudo -n systemctl status ssh` → OK; `sudo -n systemctl restart nginx` → allowed (unit not found); `sudo -n cat /etc/shadow` and `sudo -n tail /etc/shadow` → denied; `sudo -n -l` shows only the scoped aliases.
+  - 🐛 The original `cat *`/`tail *` grant was a scoping hole (allowed reading `/etc/shadow`) — caught by the AC, removed from the template + `install.sh`.
 
-- [ ] **T2.6 — authorized_keys lock verified**
+- [x] **T2.6 — authorized_keys lock verified**
   - Depends on: T2.4
   - `restrict,command=` entry.
   - **AC:** a plain `ssh <host>` (no agent invocation) is refused; only the `command="puppetterm-agent ..."` path executes; connecting with a different (non-enrolled) key is refused.
-  - ⚠️ Lock mechanics verified locally: shell attempt → refused (agent ran instead); agent actions via locked key → work; normal key → shell unaffected. Pending live VPS to close the AC.
+  - ✅ Verified on **192.168.5.50**: shell attempt via locked key → refused (agent ran instead); snapshot via locked key → worked; normal key → shell unaffected. Temporary test entry cleaned up afterwards.
 
 - [x] **T2.7 — Cross-compile both arches**
   - Depends on: T0.3

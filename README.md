@@ -18,7 +18,7 @@ A lightweight, Warp-like desktop terminal for managing Ubuntu servers over your
 
 - **Phase 0** (scaffold) — done.
 - **Phase 1** (agent MVP) — done: `run` + `snapshot` over NDJSON, unit tests + smoke green.
-- **Phase 2** (SSH plumbing & provisioning) — code done: `client/scripts/ssh-mux.sh` (ControlMaster, verified against localhost), `installer/install.sh` + sudoers + `authorized_keys` lock (lock verified locally), cross-compile amd64/arm64. Remaining ACs need a real Ubuntu VPS.
+- **Phase 2** (SSH plumbing & provisioning) — **done**, verified end-to-end on a real Ubuntu box (192.168.5.50): ControlMaster mux, hardened install (`install.sh`), scoped sudoers (T2.5 AC caught + fixed a `cat *` hole), command-locked `authorized_keys`, cross-compile amd64/arm64.
 - Next: **Phase 3** (Tauri client shell) — pending Rust toolchain.
 - Go toolchain: installed locally at `~/.local/go` — add to PATH with `export PATH="$HOME/.local/go/bin:$PATH"`.
 

@@ -4,6 +4,7 @@
 //! streams pty output to the webview as events, and provides host discovery
 //! from ~/.ssh/config.
 
+mod agent;
 mod ssh;
 
 use std::collections::HashMap;
@@ -132,6 +133,24 @@ fn stop_ssh_session(state: State<'_, AppState>, id: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Run one agent action on a host over SSH. Streams NDJSON events as
+/// `agent-event` Tauri events and returns the collected result.
+#[tauri::command]
+async fn run_agent_action(
+    app: AppHandle,
+    host: String,
+    request: String,
+) -> Result<agent::AgentRunResult, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        agent::run_action(&host, &request, move |ev| {
+            let _ = app2.emit("agent-event", ev);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -143,7 +162,8 @@ pub fn run() {
             start_ssh_session,
             write_ssh_input,
             resize_ssh_pty,
-            stop_ssh_session
+            stop_ssh_session,
+            run_agent_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

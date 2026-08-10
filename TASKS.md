@@ -179,10 +179,12 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - **AC:** read works inside the allow-list; write updates the file; read/write of a path outside the allow-list is rejected with a clear error.
   - ✅ Verified on **192.168.5.50** with a temp allow-list: read streamed file + `bytes` in result; write via `direct` updated the file; denied path → clear allow-list error. Unit tests green (read/write + denial).
 
-- [ ] **T4.4 — Client action runner (parallel over mux)**
+- [x] **T4.4 — Client action runner (parallel over mux)**
   - Depends on: T3.1, T2.1
   - Issue multiple actions concurrently over one mux; render each into the terminal.
+  - Delivered: `client/src-tauri/src/agent.rs` (`run_action`) + Tauri command `run_agent_action` (spawn_blocking; streams each NDJSON event as an `agent-event` Tauri event; best-effort ControlMaster socket reuse).
   - **AC:** two simultaneous actions (e.g. snapshot + service status) both complete; their NDJSON streams don't interleave or corrupt; each renders distinctly in the terminal.
+  - ✅ Verified: `run_action_parallel_no_interleave` test against real localhost SSH — single snapshot + 4 parallel runs; each stream contains only its own marker, no leakage. (Frontend rendering of `agent-event` into the terminal lands with the AI panel in Phase 5.)
 
 - [ ] **T4.5 — Capability presets + session extension**
   - Depends on: T4.1–T4.3, T2.5

@@ -79,6 +79,19 @@
     localStorage.setItem("pp.autonomy", autonomy);
   });
 
+  // ---- settings modal + theme ----------------------------------------------
+  let showSettings = $state(false);
+  // Single theme for now (dark); kept as a setting so more can be added later.
+  let themeName = $state(
+    typeof localStorage !== "undefined"
+      ? (localStorage.getItem("pp.theme") ?? "dark")
+      : "dark",
+  );
+  $effect(() => {
+    localStorage.setItem("pp.theme", themeName);
+    document.documentElement.dataset.theme = themeName;
+  });
+
   // Guardrails: destructive commands get a red-flagged approval and are never
   // auto-run. The AI still CAN run them, but only with an explicit Approve.
   const DANGEROUS_PATTERNS = [
@@ -493,6 +506,12 @@
     }
   }
 
+  /** Save everything from the Settings modal and close it. */
+  async function saveSettings() {
+    await saveAiConfig();
+    showSettings = false;
+  }
+
   async function sendChat() {
     const text = chatText.trim();
     if (!text) return;
@@ -895,6 +914,7 @@
       </span>
 
       <button class="refresh" onclick={loadHosts} title="Refresh hosts">↻</button>
+      <button class="settings-btn" onclick={() => (showSettings = true)} title="Settings">⚙</button>
     </nav>
   </header>
 
@@ -926,39 +946,17 @@
     ></div>
 
     <aside class="ai-panel" style={`width: ${aiWidth}px`}>
-      <div class="pane-title">AI</div>
-      <div class="ai-opts">
-        <label>
-          Endpoint
-          <input bind:value={aiBaseUrl} placeholder="http://host:port/v1" />
-        </label>
-        <label>
-          Model
-          <input bind:value={aiModel} placeholder="model-name" />
-        </label>
-        <label>
-          API key
-          <input
-            bind:value={aiKey}
-            type="password"
-            placeholder={aiHasKey ? "••• (set) — type to replace" : "sk-…"}
-          />
-        </label>
-        <label>
-          Autonomy
-          <select bind:value={autonomy}>
-            <option value="ask-first">Ask first (default)</option>
-            <option value="read-only-auto">Read-only auto</option>
-          </select>
-        </label>
-        <button
-          class="save-btn"
-          onclick={saveAiConfig}
-          disabled={!aiBaseUrl.trim() || !aiModel.trim()}
-        >
-          Save AI settings
+      <div class="pane-title">
+        AI
+        <button class="ai-settings-link" onclick={() => (showSettings = true)} title="AI settings">
+          ⚙ settings
         </button>
       </div>
+      {#if !aiReady}
+        <div class="ai-unconfigured">
+          AI not configured — open <button onclick={() => (showSettings = true)}>⚙ Settings</button> to set the endpoint &amp; model.
+        </div>
+      {/if}
 
       {#if pendingApproval}
         <div class="approval {pendingApproval.danger ? 'danger' : ''}">
@@ -1055,6 +1053,74 @@
       </div>
     </aside>
   </main>
+
+  {#if showSettings}
+    <div
+      class="modal-backdrop"
+      role="button"
+      tabindex="-1"
+      aria-label="Close settings"
+      onclick={() => (showSettings = false)}
+      onkeydown={(e) => {
+        if (e.key === "Escape") showSettings = false;
+      }}
+    >
+      <div
+        class="modal"
+        role="dialog"
+        aria-label="Settings"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
+        <div class="modal-title">Settings</div>
+
+        <div class="modal-section">AI model</div>
+        <label class="modal-field">
+          Endpoint
+          <input bind:value={aiBaseUrl} placeholder="http://host:port/v1" />
+        </label>
+        <label class="modal-field">
+          Model
+          <input bind:value={aiModel} placeholder="model-name" />
+        </label>
+        <label class="modal-field">
+          API key
+          <input
+            bind:value={aiKey}
+            type="password"
+            placeholder={aiHasKey ? "••• (set) — type to replace" : "sk-…"}
+          />
+        </label>
+        <label class="modal-field">
+          Autonomy
+          <select bind:value={autonomy}>
+            <option value="ask-first">Ask first (default)</option>
+            <option value="read-only-auto">Read-only auto</option>
+          </select>
+        </label>
+
+        <div class="modal-section">Appearance</div>
+        <label class="modal-field">
+          Theme
+          <select bind:value={themeName}>
+            <option value="dark">Dark (default)</option>
+          </select>
+        </label>
+
+        <div class="modal-btns">
+          <button onclick={() => (showSettings = false)}>Cancel</button>
+          <button
+            class="primary"
+            onclick={saveSettings}
+            disabled={!aiBaseUrl.trim() || !aiModel.trim()}
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -1165,6 +1231,47 @@
   .new-chevron:hover,
   .refresh:hover {
     background: #21262d;
+  }
+  .settings-btn {
+    height: 26px;
+    width: 34px;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    background: #0d1117;
+    color: #8b949e;
+    font-size: 15px;
+    cursor: pointer;
+    margin-left: 6px;
+  }
+  .settings-btn:hover {
+    background: #21262d;
+    color: #e6edf3;
+  }
+  .ai-settings-link {
+    border: none;
+    background: transparent;
+    color: #8b949e;
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .ai-settings-link:hover {
+    color: #e6edf3;
+  }
+  .ai-unconfigured {
+    margin: 8px 12px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #d29922;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+  }
+  .ai-unconfigured button {
+    border: none;
+    background: transparent;
+    color: #58a6ff;
+    cursor: pointer;
+    text-decoration: underline;
   }
   .host-menu {
     position: absolute;
@@ -1284,6 +1391,9 @@
     background: #010409;
   }
   .pane-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     padding: 10px 12px;
     font-size: 12px;
     font-weight: 700;
@@ -1292,23 +1402,6 @@
     color: #8b949e;
     border-bottom: 1px solid #21262d;
   }
-  .ai-opts {
-    padding: 10px 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    border-bottom: 1px solid #21262d;
-  }
-  .ai-opts label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 12px;
-    color: #8b949e;
-    font-weight: 600;
-  }
-  .ai-opts select,
-  .ai-opts input,
   .chat-input input {
     background: #0d1117;
     border: 1px solid #30363d;
@@ -1318,8 +1411,6 @@
     font-size: 13px;
     outline: none;
   }
-  .ai-opts select:focus,
-  .ai-opts input:focus,
   .chat-input input:focus {
     border-color: #1f6feb;
   }
@@ -1456,6 +1547,89 @@
     background: #f85149;
     color: #fff;
   }
+
+  /* ---- settings modal ---- */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(1, 4, 9, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .modal {
+    width: 420px;
+    max-width: 92vw;
+    max-height: 86vh;
+    overflow-y: auto;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 18px 20px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .modal-title {
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 14px;
+  }
+  .modal-section {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8b949e;
+    margin: 14px 0 8px;
+    border-top: 1px solid #21262d;
+    padding-top: 10px;
+  }
+  .modal-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12.5px;
+    color: #8b949e;
+    margin-bottom: 10px;
+  }
+  .modal-field input,
+  .modal-field select {
+    background: #010409;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #e6edf3;
+    padding: 7px 10px;
+    font-size: 13px;
+  }
+  .modal-field input:focus,
+  .modal-field select:focus {
+    outline: 1px solid #1f6feb;
+    border-color: #1f6feb;
+  }
+  .modal-btns {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .modal-btns button {
+    border: 1px solid #30363d;
+    background: #21262d;
+    color: #e6edf3;
+    border-radius: 6px;
+    padding: 7px 16px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .modal-btns button.primary {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+  }
+  .modal-btns button:hover {
+    filter: brightness(1.1);
+  }
+
   .ai-target {
     display: flex;
     align-items: center;

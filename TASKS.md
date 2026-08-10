@@ -264,9 +264,10 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - Depends on: T3.1, T3.2
   - Theme switcher; live status dots; last-seen timestamps; resizable terminal/AI panes; terminal copy/paste.
   - **Delivered:**
+    - **Settings modal** (⚙ in the topbar + "⚙ settings" link in the AI panel): an **AI model** section (endpoint / model / API key / autonomy) and an **Appearance** section with a **single theme for now** ("Dark (default)") — persisted to localStorage `pp.theme` and applied via `document.documentElement.dataset.theme`, so more themes can be added later without rework. The old inline AI-config block was removed from the chat panel to declutter; when no AI config is set, the AI panel shows an "open Settings to configure" hint.
     - Resizable splitter between terminal area and AI panel — drag to resize (clamped 260px–50% of window), width persisted to localStorage (`pp.aiWidth`) and restored on reload. Verified in browser: drag 320→472px, persisted across reload; no console errors.
     - Terminal copy/paste: `Ctrl+Shift+C` / `Ctrl+Insert` copy the selection, `Ctrl+Shift+V` / `Shift+Insert` paste; `onSelectionChange` auto-copies (Warp-style: select → already on clipboard). Right-click shows the **native context menu** (xterm's built-in handler populates its hidden textarea with the selection and focuses it, so the menu's Copy/Paste operate on the terminal selection) — WebKitGTK-guaranteed. Copy/paste write through the **native Tauri clipboard plugin** (`tauri-plugin-clipboard-manager`, arboard backend) with web-API fallback for browser mode. Earlier attempts failed because (a) WebKitGTK's `navigator.clipboard` is unreliable and (b) our `contextmenu` `preventDefault()` suppressed the native menu. Verified: browser right-click triggers xterm's handler (textarea moved+focused, no preventDefault); svelte-check 0/0, build OK, cargo check OK.
-  - **Remaining:** theme switcher (dark theme toggle), live status dots, last-seen timestamps.
+  - **Remaining:** more themes (e.g. light), live status dots, last-seen timestamps.
   - **AC:** switching theme restyles the terminal without reload; status dot reflects real connectivity; last-seen updates on activity.
 
 - [~] **T6.4 — Error UX**

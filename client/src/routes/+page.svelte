@@ -30,7 +30,7 @@
   // switching tabs mid-task can never redirect the AI to a different server.
   let chatTarget = $state<{ host: string; tabId: number } | null>(null);
 
-  // ---- agent install (Warp-style: install the agent on the connected host) ---
+  // ---- agent install (in-terminal, approval-style: install the agent on the connected host) ---
   let installPrompt = $state<{ tabId: number; host: string } | null>(null); // awaiting y/n in the terminal
   let installBusy = $state(false);
   let installTabId = $state<number | null>(null); // route install-output events here
@@ -727,7 +727,7 @@
     }
   }
 
-  // ---- agent install (Warp-style) ------------------------------------------
+  // ---- agent install (in-terminal, approval-style) --------------------------------
   /** Ask in the terminal: install the agent on the active host? [y/N] */
   function promptInstall() {
     const host = activeHost;

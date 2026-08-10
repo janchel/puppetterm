@@ -1,9 +1,10 @@
 # puppetterm
 
-A lightweight, Warp-like **desktop terminal + agentic AI** for managing Linux/Ubuntu
-servers over your **existing SSH setup**. No extra daemons, no listeners, no cloud —
-the app talks to servers the same way you do, and **every state-changing action
-requires your approval**.
+**puppetterm** is a desktop terminal + AI assistant for managing Linux/Ubuntu servers
+over your **existing SSH setup**. The AI is your *puppet*: you pull the strings — it can
+work agentically (inspect, install, configure, fix), but it only ever moves with your
+approval. No extra daemons, no listeners, no cloud — it talks to servers the same way
+you do.
 
 > 🧪 Experimental solo project — early stage.
 

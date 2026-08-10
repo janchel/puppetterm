@@ -197,35 +197,42 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
 **Goal:** the Warp-like flow — ask the AI, it plans and acts on the active host, you only approve.
 **DoD:** the full nginx scenario works: install + configure + start + verify, with the user only clicking Approve.
 
-- [ ] **T5.1 — Claude tool-calling loop**
+- [x] **T5.1 — Tool-calling loop (OpenAI-compatible)**
   - Depends on: T3.3, T4.4
   - Chat sends tools (agent actions); receives `tool_calls`; executes; returns results; final answer.
+  - Delivered: `client/src-tauri/src/ai.rs` (OpenAI-compatible chat completions w/ function calling; config `~/.config/puppetterm/ai.json`, key never sent to frontend) + `ai_chat` command; frontend `runAiLoop` executes tool calls via `run_agent_action`.
   - **AC:** a request like "check disk on this host" triggers a `snapshot`/`run` tool call, results come back, and the AI answers from them.
+  - ✅ Verified: live endpoint test (`PUPPETTERM_TEST_AI=1`) — plain completion + `get_weather` tool call both OK against **192.168.5.52:20128** (model `jandelcombo`, tool_calling capability confirmed). Frontend loop verified in browser (mock).
 
-- [ ] **T5.2 — Session-bound AI (active host only)**
+- [x] **T5.2 — Session-bound AI (active host only)**
   - Depends on: T5.1
   - Chat binds to the focused host; never guesses a host.
   - **AC:** tool calls always target the active host; switching hosts rebinds; a prompt with no active host refuses to act ("no active session").
+  - ✅ Implemented: `activeHost` derived from the active tab; `sendChat` refuses without a session; actions sent to `run_agent_action(activeHost, …)`.
 
-- [ ] **T5.3 — Approval gates**
+- [x] **T5.3 — Approval gates**
   - Depends on: T5.1, T4.5
   - Read-only auto-run; state-changing ask-first, with exact command + target host + preview.
   - **AC:** snapshot/log/status auto-run silently; `apt install`/`config write`/`systemctl restart` require Approve; Reject cancels and the terminal shows the pending action clearly.
+  - ✅ Implemented: `toolReadOnly` + autonomy selector (ask-first default / read-only-auto); inline **Approve/Reject** panel showing the exact tool + args; rejected actions reported back to the model.
 
-- [ ] **T5.4 — Plan-then-approve + per-step mode**
+- [~] **T5.4 — Plan-then-approve + per-step mode**
   - Depends on: T5.3
   - AI proposes a multi-step plan; approve plan or per-step. Per-step is default for state changes.
   - **AC:** "install nginx" shows a plan; approving the plan runs read-only steps and prompts per state-changing step; toggling per-step mode prompts for every state-changing step individually.
+  - ⚠️ Per-step approval is done (each state-changing action prompts). Plan-then-approve (approve the whole proposed plan at once) is pending.
 
-- [ ] **T5.5 — Stream AI actions into terminal**
+- [x] **T5.5 — Stream AI actions into terminal**
   - Depends on: T5.3, T4.4
   - Every AI-executed action's output renders in the terminal in real time.
   - **AC:** during the nginx flow, apt output, config diffs, and status lines all appear in the terminal as they happen; nothing is hidden.
+  - ✅ Implemented: `executeTool` writes the tool name + args banner into the active tab's terminal, then streams every `output` event live.
 
-- [ ] **T5.6 — Token/context management**
+- [~] **T5.6 — Token/context management**
   - Depends on: T5.1
   - Truncate large tool results (tail N lines); AI can request more.
-  - **AC:** a multi-MB log returns only the last N lines to Claude; the AI can explicitly fetch more; no context-limit errors on a 10k-line tail.
+  - **AC:** a multi-MB log returns only the last N lines to the model; the AI can explicitly fetch more; no context-limit errors on a 10k-line tail.
+  - ⚠️ Outputs truncated to last 4000 chars before returning to the model. Explicit "fetch more" affordance + smarter per-action truncation pending.
 
 ---
 

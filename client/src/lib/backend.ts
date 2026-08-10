@@ -73,6 +73,32 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
       emitMock("pty-exit", { id });
       return Promise.resolve(undefined as T);
     }
+    case "get_ai_config":
+      return Promise.resolve({
+        base_url: "http://192.168.5.52:20128/v1",
+        model: "jandelcombo",
+        has_api_key: true,
+      } as T);
+    case "set_ai_config":
+      return Promise.resolve(undefined as T);
+    case "ai_chat": {
+      const messages = (args.messages ?? []) as { role?: string; content?: string }[];
+      const last = messages.filter((m) => m.role === "user").pop()?.content ?? "";
+      return Promise.resolve({
+        id: "mock-chat",
+        choices: [
+          {
+            index: 0,
+            finish_reason: "stop",
+            message: {
+              role: "assistant",
+              content: `(mock AI) got: ${String(last).slice(0, 80)} — run the Tauri app to use the real endpoint.`,
+            },
+          },
+        ],
+        usage: null,
+      } as T);
+    }
     default:
       return Promise.resolve(undefined as T);
   }

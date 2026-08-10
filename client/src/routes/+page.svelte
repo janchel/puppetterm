@@ -18,26 +18,56 @@
   let activeTabId = $state<number | null>(null);
   let showHostMenu = $state(false);
 
-  // AI panel settings (persisted). Chat itself arrives in Phase 5.
-  let model = $state(
-    typeof localStorage !== "undefined"
-      ? (localStorage.getItem("pp.model") ?? "claude-sonnet-4-5")
-      : "claude-sonnet-4-5",
-  );
+  // The host the AI chat binds to (the active session's host).
+  let activeHost = $derived(tabs.find((t) => t.id === activeTabId)?.host ?? null);
+
+  // ---- AI integration (OpenAI-compatible) --------------------------------
+  let aiBaseUrl = $state("");
+  let aiModel = $state("");
+  let aiKey = $state("");
+  let aiHasKey = $state(false);
+  let aiReady = $state(false);
+  let chatBusy = $state(false);
+  let chatText = $state("");
+  let chatLog = $state<Array<{ role: string; text: string }>>([]);
+  let history = $state<any[]>([]);
   let autonomy = $state(
     typeof localStorage !== "undefined"
       ? (localStorage.getItem("pp.autonomy") ?? "ask-first")
       : "ask-first",
   );
-  let chatText = $state("");
-  let chatLog = $state<Array<{ role: string; text: string }>>([]);
+  let pendingApproval = $state<{
+    id: string;
+    tool: string;
+    args: Record<string, unknown>;
+    resolve: (ok: boolean) => void;
+  } | null>(null);
 
-  $effect(() => {
-    localStorage.setItem("pp.model", model);
-  });
   $effect(() => {
     localStorage.setItem("pp.autonomy", autonomy);
   });
+
+  const SYSTEM_PROMPT =
+    "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
+    "using the provided tools. Prefer the structured tools (service/log/config/snapshot) over " +
+    "run_command. State-changing actions are approved by the user before execution; you will be " +
+    "told if one is rejected. Be concise and summarize tool results for the user.";
+
+  const AGENT_TOOLS = [
+    { type: "function", function: { name: "run_command", description: "Run an arbitrary shell command on the active host (always approved first).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
+    { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime.", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "service", description: "Control a systemd service on the active host.", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
+    { type: "function", function: { name: "log", description: "Tail a log file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
+    { type: "function", function: { name: "config", description: "Read or write a config file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
+  ];
+
+  const TOOL_TO_ACTION: Record<string, string> = {
+    run_command: "run",
+    snapshot: "snapshot",
+    service: "service",
+    log: "log",
+    config: "config",
+  };
 
   // ---- terminal plumbing (per-tab, non-reactive) --------------------------
   let viewports = $state<Record<number, HTMLDivElement>>({});
@@ -186,12 +216,155 @@
     }
   }
 
-  function sendChat() {
+  function pushChat(role: string, text: string) {
+    chatLog = [...chatLog, { role, text }];
+  }
+
+  function safeParse(s: string): Record<string, unknown> {
+    try {
+      const v = JSON.parse(s);
+      return v && typeof v === "object" ? v : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function activeTerm(): Terminal | null {
+    if (activeTabId == null) return null;
+    return termByTab.get(activeTabId)?.term ?? null;
+  }
+
+  function toolReadOnly(tool: string, args: Record<string, unknown>): boolean {
+    if (tool === "snapshot" || tool === "log") return true;
+    if (tool === "service") {
+      const op = String(args.op ?? "");
+      return op === "status" || op === "is-active" || op === "is-enabled";
+    }
+    if (tool === "config") return args.op === "read";
+    return false; // run_command and anything else asks
+  }
+
+  async function saveAiConfig() {
+    try {
+      await call("set_ai_config", { baseUrl: aiBaseUrl, model: aiModel, apiKey: aiKey });
+      aiKey = "";
+      const v = await call<any>("get_ai_config");
+      aiBaseUrl = v.base_url;
+      aiModel = v.model;
+      aiHasKey = v.has_api_key;
+      aiReady = true;
+      pushChat("ai", "(AI settings saved)");
+    } catch (e) {
+      pushChat("ai", `(failed to save AI settings: ${e})`);
+    }
+  }
+
+  async function sendChat() {
     const text = chatText.trim();
     if (!text) return;
-    chatLog = [...chatLog, { role: "user", text }];
+    if (!activeHost) {
+      pushChat("ai", "(open a session first — the AI acts on the active host)");
+      return;
+    }
+    if (!aiReady) {
+      pushChat("ai", "(AI not configured — set the endpoint/model in settings)");
+      return;
+    }
     chatText = "";
-    chatLog = [...chatLog, { role: "ai", text: "(AI chat arrives in Phase 5)" }];
+    pushChat("user", text);
+    history = [...history, { role: "user", content: text }];
+    chatBusy = true;
+    try {
+      await runAiLoop();
+    } finally {
+      chatBusy = false;
+    }
+  }
+
+  async function runAiLoop() {
+    let guard = 0;
+    while (guard++ < 10) {
+      const resp = await call<any>("ai_chat", { messages: history, tools: AGENT_TOOLS });
+      const msg = resp?.choices?.[0]?.message;
+      if (!msg) {
+        pushChat("ai", "(no response from the model)");
+        return;
+      }
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        history = [
+          ...history,
+          { role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls },
+        ];
+        for (const tc of msg.tool_calls) {
+          const ok = await requestApproval(tc);
+          const content = ok
+            ? JSON.stringify(await executeTool(tc))
+            : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
+          history = [...history, { role: "tool", tool_call_id: tc.id, content }];
+        }
+        continue;
+      }
+      const text = msg.content ?? "(done)";
+      pushChat("ai", text);
+      history = [...history, { role: "assistant", content: text }];
+      return;
+    }
+    pushChat("ai", "(stopped after too many tool steps)");
+  }
+
+  function requestApproval(tc: { id: string; function: { name: string; arguments: string } }): Promise<boolean> {
+    const name = tc.function.name;
+    const args = safeParse(tc.function.arguments);
+    if (autonomy === "read-only-auto" || toolReadOnly(name, args)) {
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      pendingApproval = { id: tc.id, tool: name, args, resolve };
+    });
+  }
+
+  function approve() {
+    pendingApproval?.resolve(true);
+    pendingApproval = null;
+  }
+
+  function reject() {
+    pendingApproval?.resolve(false);
+    pendingApproval = null;
+  }
+
+  async function executeTool(tc: { id: string; function: { name: string; arguments: string } }) {
+    const name = tc.function.name;
+    const args = safeParse(tc.function.arguments);
+    const action = TOOL_TO_ACTION[name] ?? "run";
+    const term = activeTerm();
+    if (term) {
+      term.write(`\r\n\x1b[36m[puppetterm] AI → ${name} ${JSON.stringify(args)}\x1b[0m\r\n`);
+    }
+    const request = { action, params: args, request_id: tc.id };
+    const res = await call<any>("run_agent_action", {
+      host: activeHost,
+      request: JSON.stringify(request),
+    });
+    for (const ev of res?.events ?? []) {
+      if (ev?.type === "output" && term) term.write(ev.data ?? "");
+    }
+    if (res?.error && term) {
+      term.write(`\r\n\x1b[31m[puppetterm] action error: ${res.error}\x1b[0m\r\n`);
+    }
+    const resultEvent = [...(res?.events ?? [])].reverse().find((e: any) => e?.type === "result");
+    const outputs = (res?.events ?? [])
+      .filter((e: any) => e?.type === "output")
+      .map((e: any) => e.data ?? "")
+      .join("")
+      .slice(-4000);
+    return {
+      host: activeHost,
+      exit: resultEvent?.exit ?? res?.exit ?? null,
+      outputs,
+      structured: resultEvent?.structured ?? null,
+      error: res?.error ?? null,
+    };
   }
 
   onMount(() => {
@@ -223,6 +396,16 @@
         console.warn("event listeners unavailable:", e);
       }
       await loadHosts();
+      try {
+        const v = await call<any>("get_ai_config");
+        aiBaseUrl = v.base_url;
+        aiModel = v.model;
+        aiHasKey = v.has_api_key;
+        aiReady = true;
+        history = [{ role: "system", content: SYSTEM_PROMPT }];
+      } catch (e) {
+        console.warn("ai config unavailable:", e);
+      }
     })();
 
     return () => {
@@ -309,12 +492,20 @@
       <div class="pane-title">AI</div>
       <div class="ai-opts">
         <label>
+          Endpoint
+          <input bind:value={aiBaseUrl} placeholder="http://host:port/v1" />
+        </label>
+        <label>
           Model
-          <select bind:value={model}>
-            <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
-            <option value="claude-opus-4-1">Claude Opus 4.1</option>
-            <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
-          </select>
+          <input bind:value={aiModel} placeholder="model-name" />
+        </label>
+        <label>
+          API key
+          <input
+            bind:value={aiKey}
+            type="password"
+            placeholder={aiHasKey ? "••• (set) — type to replace" : "sk-…"}
+          />
         </label>
         <label>
           Autonomy
@@ -323,10 +514,31 @@
             <option value="read-only-auto">Read-only auto</option>
           </select>
         </label>
+        <button
+          class="save-btn"
+          onclick={saveAiConfig}
+          disabled={!aiBaseUrl.trim() || !aiModel.trim()}
+        >
+          Save AI settings
+        </button>
       </div>
+
+      {#if pendingApproval}
+        <div class="approval">
+          <div class="approval-label">Approve action?</div>
+          <div class="approval-cmd">
+            {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
+          </div>
+          <div class="approval-btns">
+            <button onclick={reject}>Reject</button>
+            <button class="primary" onclick={approve}>Approve</button>
+          </div>
+        </div>
+      {/if}
+
       <div class="chat-log">
         {#if chatLog.length === 0}
-          <p class="muted">Chat is wired up in Phase 5.</p>
+          <p class="muted">Ask the AI to inspect or change the active host.</p>
         {/if}
         {#each chatLog as m, i (i)}
           <div class="msg {m.role}">{m.text}</div>
@@ -334,13 +546,15 @@
       </div>
       <div class="chat-input">
         <input
-          placeholder="Ask the AI to act on the active host…"
+          placeholder="Ask the AI to act on {activeHost ?? 'the active host'}…"
           bind:value={chatText}
           onkeydown={(e) => {
             if (e.key === "Enter") sendChat();
           }}
         />
-        <button onclick={sendChat} disabled={!chatText.trim()}>Send</button>
+        <button onclick={sendChat} disabled={!chatText.trim() || chatBusy}>
+          {chatBusy ? "…" : "Send"}
+        </button>
       </div>
     </aside>
   </main>
@@ -574,6 +788,7 @@
     font-weight: 600;
   }
   .ai-opts select,
+  .ai-opts input,
   .chat-input input {
     background: #0d1117;
     border: 1px solid #30363d;
@@ -584,8 +799,74 @@
     outline: none;
   }
   .ai-opts select:focus,
+  .ai-opts input:focus,
   .chat-input input:focus {
     border-color: #1f6feb;
+  }
+  .save-btn {
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #e6edf3;
+    padding: 6px 8px;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .save-btn:hover:not(:disabled) {
+    background: #1f6feb;
+  }
+  .save-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .approval {
+    margin: 8px 12px;
+    border: 1px solid #d29922;
+    border-radius: 8px;
+    background: #161b22;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .approval-label {
+    font-size: 12px;
+    font-weight: 700;
+    color: #d29922;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .approval-cmd {
+    font-family: monospace;
+    font-size: 12px;
+    background: #0d1117;
+    border-radius: 6px;
+    padding: 6px 8px;
+    word-break: break-all;
+    white-space: pre-wrap;
+  }
+  .approval-btns {
+    display: flex;
+    gap: 8px;
+  }
+  .approval-btns button {
+    flex: 1;
+    border: 1px solid #30363d;
+    background: #21262d;
+    color: #e6edf3;
+    border-radius: 6px;
+    padding: 6px 0;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .approval-btns button.primary {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+  }
+  .approval-btns button:hover {
+    filter: brightness(1.1);
   }
   .chat-log {
     flex: 1;

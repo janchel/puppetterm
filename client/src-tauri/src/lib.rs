@@ -5,6 +5,7 @@
 //! from ~/.ssh/config.
 
 mod agent;
+mod ai;
 mod ssh;
 
 use std::collections::HashMap;
@@ -151,6 +152,55 @@ async fn run_agent_action(
     .map_err(|e| e.to_string())?
 }
 
+/// Return the AI provider config (endpoint + model + whether a key is set).
+/// The API key itself is never returned to the frontend.
+#[tauri::command]
+fn get_ai_config() -> Result<ai::AiConfigView, String> {
+    let cfg = ai::load_config()?;
+    Ok(ai::AiConfigView {
+        base_url: cfg.base_url,
+        model: cfg.model,
+        has_api_key: !cfg.api_key.is_empty(),
+    })
+}
+
+/// Update the AI provider config on disk (key optional — kept if blank).
+#[tauri::command]
+fn set_ai_config(
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let mut cfg = match ai::load_config() {
+        Ok(c) => c,
+        Err(_) => ai::AiConfig { base_url: String::new(), api_key: String::new(), model: String::new() },
+    };
+    if !base_url.trim().is_empty() {
+        cfg.base_url = base_url.trim().to_string();
+    }
+    if !model.trim().is_empty() {
+        cfg.model = model.trim().to_string();
+    }
+    if let Some(k) = api_key {
+        let k = k.trim();
+        if !k.is_empty() {
+            cfg.api_key = k.to_string();
+        }
+    }
+    ai::save_config(&cfg)
+}
+
+/// Send a chat completion to the configured OpenAI-compatible endpoint,
+/// including tool calls. The API key is read from disk/env, never the frontend.
+#[tauri::command]
+async fn ai_chat(
+    messages: Vec<ai::ChatMessage>,
+    tools: Option<Vec<ai::ToolDef>>,
+) -> Result<ai::ChatResponse, String> {
+    let cfg = ai::load_config()?;
+    ai::chat_completion(&cfg, messages, tools, Some(4096)).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -163,7 +213,10 @@ pub fn run() {
             write_ssh_input,
             resize_ssh_pty,
             stop_ssh_session,
-            run_agent_action
+            run_agent_action,
+            get_ai_config,
+            set_ai_config,
+            ai_chat
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -158,5 +158,5 @@ scripts/e2e.py --host user@server --approve-all   # full end-to-end
 
 ## License
 
-[MIT](./LICENSE) © 2026 [janchel](https://github.com/janchel)
+[MIT](./LICENSE) © 2026 [Jan Bas](https://github.com/janchel)
 

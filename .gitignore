@@ -58,3 +58,7 @@ puppetterm-ai.json
 *.control
 puppetterm-*.sock
 
+# --- Internal docs (not for public GitHub) ---
+TASKS.md
+agentic-remote-terminal-plan.txt
+

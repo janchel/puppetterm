@@ -5,8 +5,7 @@ servers over your **existing SSH setup**. No extra daemons, no listeners, no clo
 the app talks to servers the same way you do, and **every state-changing action
 requires your approval**.
 
-> 🧪 Experimental solo project. See [`agentic-remote-terminal-plan.txt`](./agentic-remote-terminal-plan.txt)
-> for the design and [`TASKS.md`](./TASKS.md) for the task tracker.
+> 🧪 Experimental solo project — early stage.
 
 ---
 
@@ -155,7 +154,4 @@ cd client/src-tauri && cargo test --lib # Rust backend (AI, install, audit, agen
 cd client && npm run check && npm run build   # frontend (svelte-check + vite)
 scripts/e2e.py --host user@server --approve-all   # full end-to-end
 ```
-
-See [`TASKS.md`](./TASKS.md) for the roadmap (Phase 6 = current work: polish, error UX,
-approval flow, session-extension UI).
 

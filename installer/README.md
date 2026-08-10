@@ -6,4 +6,4 @@ Bootstrap + hardening for Ubuntu boxes:
 - scoped `sudoers.d/` entry
 - `authorized_keys` entry locked with `restrict,command=...`
 
-**Status:** not started — Phase 2 of `TASKS.md`.
+**Status:** not started.

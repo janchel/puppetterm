@@ -270,10 +270,13 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - Offline host, bad key, API failure — clear messages, no crashes.
   - **AC:** each failure shows a human-readable inline message; app stays responsive; retry path works (e.g. after `ssh-add`).
 
-- [ ] **T6.5 — End-to-end acceptance script**
+- [x] **T6.5 — End-to-end acceptance script**
   - Depends on: T6.1–T6.4, T5.6
   - Scripted E2E on a throwaway VPS: enroll → open session → AI installs nginx with approvals → verify + audit.
+  - Delivered: `scripts/e2e.py` — drives the real stack headlessly: AI (OpenAI-compatible) → tool calls → agent actions over SSH → host state; approval gate (interactive or `--approve-all`); verifies snapshot, tool loop, nginx HTTP 200, client SQLite audit + agent audit log.
   - **AC:** script exits 0 only if: agent enrolled, session opened, nginx installed + serving (curl 200), approvals were required for state changes, audit entries exist on client and agent logs.
+  - ✅ PASS on **192.168.5.50** in both modes: `--approve-all` (AI self-corrected `apt-get` → `sudo apt-get` → start → 200) and interactive (`yes y`), each exiting 0 with all checks green.
+  - 🐛 Exposed gaps fixed: `systemctl reload` added to the sudoers grant; nginx docroot config verified.
 
 ---
 

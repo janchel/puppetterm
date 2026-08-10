@@ -139,7 +139,7 @@ else
     tmpfile="$(mktemp "${SUDOERS_FILE}.XXXXXX")"
     {
       echo "# puppetterm-agent — scoped privileges (managed by install.sh)"
-      echo "Cmnd_Alias PUPPETTERM_SYSTEMCTL = /usr/bin/systemctl status *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl restart *, /usr/bin/systemctl enable *, /usr/bin/systemctl disable *, /usr/bin/systemctl is-active *, /usr/bin/systemctl is-enabled *"
+      echo "Cmnd_Alias PUPPETTERM_SYSTEMCTL = /usr/bin/systemctl status *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl restart *, /usr/bin/systemctl reload *, /usr/bin/systemctl reload-or-restart *, /usr/bin/systemctl enable *, /usr/bin/systemctl disable *, /usr/bin/systemctl is-active *, /usr/bin/systemctl is-enabled *"
       echo "Cmnd_Alias PUPPETTERM_APT = /usr/bin/apt-get update, /usr/bin/apt-get install -y *, /usr/bin/apt-get remove -y *, /usr/bin/apt-get autoremove -y *, /usr/bin/apt update, /usr/bin/apt install -y *, /usr/bin/apt remove -y *, /usr/bin/apt autoremove -y *"
       echo "Cmnd_Alias PUPPETTERM_DEPLOY = /usr/bin/git pull, /usr/bin/systemctl restart *"
       echo "# No cat/tail/journalctl aliases: arbitrary file reads (e.g. /etc/shadow) must"

@@ -414,14 +414,18 @@ Host *
     .map_err(|e| e.to_string())?;
     let include = format!("Include {}", extra.display());
     let body = std::fs::read_to_string(&main).unwrap_or_default();
-    if !body.lines().any(|l| l.trim() == include.trim()) {
-        let merged = if body.trim().is_empty() {
-            format!("{include}\n")
-        } else {
-            format!("{}\n{}\n", body.trim_end(), include)
-        };
-        std::fs::write(&main, merged).map_err(|e| e.to_string())?;
-    }
+    // The Include MUST be at the TOP of the main config: OpenSSH has a quirk
+    // where an Include placed after a `Host` block makes the included `Host *`
+    // stop matching non-alias targets (e.g. `isr@192.168.150.22` got
+    // controlmaster=false while the `server1` alias got true). Drop any
+    // existing (possibly mis-positioned) occurrence, then prepend once.
+    let filtered: Vec<&str> = body.lines().filter(|l| l.trim() != include.trim()).collect();
+    let merged = if filtered.is_empty() {
+        format!("{include}\n")
+    } else {
+        format!("{include}\n{}\n", filtered.join("\n").trim_end())
+    };
+    std::fs::write(&main, merged).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -449,6 +453,10 @@ mod tests {
         let inc = format!("Include {}/.ssh/puppetterm-control", dir.display());
         assert!(body.contains("Host server1"), "existing config preserved");
         assert_eq!(body.matches(&inc).count(), 1, "Include added exactly once");
+        assert!(
+            body.trim_start().starts_with(&inc),
+            "Include must be at the TOP (a trailing Include breaks `Host *` matching)"
+        );
 
         let ctl = std::fs::read_to_string(dir.join(".ssh/puppetterm-control")).unwrap();
         assert!(ctl.contains("ControlMaster yes"), "master must be `yes` (auto only reuses)");

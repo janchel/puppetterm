@@ -591,6 +591,18 @@
     chatLog = [...chatLog, { role, text }];
   }
 
+  /** Start a fresh conversation: reset history to just the system prompt and
+   *  clear the visible chat log. History is in-memory (not persisted) and is
+   *  already bounded by compaction while a task runs. */
+  function newChat() {
+    if (chatBusy) return; // don't clear mid-task
+    history = [{ role: "system", content: SYSTEM_PROMPT }];
+    chatLog = [];
+    chatText = "";
+    pushChat("ai", "(new chat started — earlier conversation cleared)");
+    notify("New chat started");
+  }
+
   function safeParse(s: string): Record<string, unknown> {
     try {
       const v = JSON.parse(s);
@@ -770,10 +782,13 @@
   }
 
   /** Find an `ssh <target>` inside a DISPLAYED terminal line, e.g. the echo of
-   *  a command recalled from shell history: `devops@host:~$ ssh user@host`.
-   *  Returns the last match so the most recent command wins. */
+   *  a command recalled from history: `devops@host:~$ ssh user@host`.
+   *  Returns the last match so the most recent command wins.
+   *  `ssh` must appear right after a shell prompt ($, #, >) or at line start —
+   *  prose like "…close the ssh connection…" must NOT be parsed as a target
+   *  (that made the tab label become garbage like "connection"). */
   function detectSshFromLine(line: string): string | null {
-    const re = /(?:^|[\s;])(?:ssh(?:2)?)[\s]+/gi;
+    const re = /(?:^|[$#>]\s*)(?:ssh(?:2)?)[\s]+/gi;
     let m: RegExpExecArray | null;
     let target: string | null = null;
     while ((m = re.exec(line)) !== null) {
@@ -1211,6 +1226,14 @@
         AI
         <button class="ai-settings-link" onclick={() => (showSettings = true)} title="AI settings">
           ⚙ settings
+        </button>
+        <button
+          class="ai-settings-link"
+          onclick={newChat}
+          disabled={chatBusy}
+          title="Start a new chat (clear this conversation)"
+        >
+          ＋ new chat
         </button>
       </div>
 

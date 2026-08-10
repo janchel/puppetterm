@@ -46,7 +46,6 @@ pub fn check_host(host: &str) -> bool {
     Command::new("ssh")
         .args([
             "-o", "BatchMode=yes",
-            "-o", "ControlMaster=auto",
             "-o", "ConnectTimeout=2",
             "-o", "StrictHostKeyChecking=accept-new",
             host,

@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { call, on, type UnlistenFn } from "$lib/backend";
   import { Terminal } from "xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { onMount, tick } from "svelte";
@@ -41,7 +40,7 @@
   });
 
   // ---- terminal plumbing (per-tab, non-reactive) --------------------------
-  const viewports: Record<number, HTMLDivElement> = {};
+  let viewports = $state<Record<number, HTMLDivElement>>({});
   const termByTab = new Map<number, { term: Terminal; fit: FitAddon }>();
   let nextTabId = 1;
 
@@ -78,7 +77,7 @@
 
   async function loadHosts() {
     try {
-      hosts = await invoke<string[]>("list_ssh_hosts");
+      hosts = await call<string[]>("list_ssh_hosts");
       for (const h of hosts) checkStatus(h);
     } catch (e) {
       console.error("loadHosts", e);
@@ -86,7 +85,7 @@
   }
 
   async function checkStatus(h: string) {
-    statuses[h] = await invoke<boolean>("check_host", { host: h });
+    statuses[h] = await call<boolean>("check_host", { host: h });
   }
 
   async function openTab(host: string) {
@@ -121,7 +120,7 @@
 
     term.onData((data) => {
       const t = tabById(id);
-      if (t?.sessionId != null) invoke("write_ssh_input", { id: t.sessionId, data });
+      if (t?.sessionId != null) call("write_ssh_input", { id: t.sessionId, data });
     });
 
     termByTab.set(id, { term, fit });
@@ -134,7 +133,7 @@
     t.connecting = true;
     termByTab.get(id)?.term.write(`\x1b[33m[puppetterm] connecting to ${host}...\x1b[0m\r\n`);
     try {
-      const sessionId = await invoke<number>("start_ssh_session", { host });
+      const sessionId = await call<number>("start_ssh_session", { host });
       t.sessionId = sessionId;
       fitTab(id);
     } catch (e) {
@@ -159,7 +158,7 @@
     entry.fit.fit();
     const t = tabById(id);
     if (t?.sessionId != null) {
-      invoke("resize_ssh_pty", {
+      call("resize_ssh_pty", {
         id: t.sessionId,
         cols: entry.term.cols,
         rows: entry.term.rows,
@@ -169,7 +168,7 @@
 
   async function closeTab(id: number) {
     const t = tabById(id);
-    if (t?.sessionId != null) await invoke("stop_ssh_session", { id: t.sessionId });
+    if (t?.sessionId != null) await call("stop_ssh_session", { id: t.sessionId });
     termByTab.get(id)?.term.dispose();
     termByTab.delete(id);
     delete viewports[id];
@@ -206,12 +205,12 @@
     (async () => {
       try {
         unlisteners = [
-          await listen<{ id: number; data: string }>("pty-output", (e) => {
-            const t = tabs.find((x) => x.sessionId === e.payload.id);
-            if (t) termByTab.get(t.id)?.term.write(e.payload.data);
+          await on<{ id: number; data: string }>("pty-output", (p) => {
+            const t = tabs.find((x) => x.sessionId === p.id);
+            if (t) termByTab.get(t.id)?.term.write(p.data);
           }),
-          await listen<{ id: number }>("pty-exit", (e) => {
-            const t = tabs.find((x) => x.sessionId === e.payload.id);
+          await on<{ id: number }>("pty-exit", (p) => {
+            const t = tabs.find((x) => x.sessionId === p.id);
             if (t) {
               t.sessionId = null;
               termByTab
@@ -230,7 +229,7 @@
       unlisteners.forEach((u) => u());
       resizeObserver?.disconnect();
       for (const t of tabs) {
-        if (t.sessionId != null) invoke("stop_ssh_session", { id: t.sessionId });
+        if (t.sessionId != null) call("stop_ssh_session", { id: t.sessionId });
         termByTab.get(t.id)?.term.dispose();
       }
       termByTab.clear();
@@ -352,6 +351,7 @@
     display: flex;
     flex-direction: column;
     height: 100vh;
+    overflow: hidden;
     background: #0d1117;
     color: #e6edf3;
   }
@@ -360,6 +360,9 @@
   .topbar {
     display: flex;
     align-items: stretch;
+    flex: none;
+    position: relative;
+    z-index: 10;
     height: 40px;
     background: #010409;
     border-bottom: 1px solid #21262d;
@@ -505,12 +508,15 @@
     display: flex;
     flex: 1;
     min-height: 0;
+    position: relative;
   }
 
   .term-area {
     position: relative;
     flex: 1;
     min-width: 0;
+    min-height: 0;
+    overflow: hidden;
     background: #0d1117;
   }
   .term-viewport {
@@ -536,6 +542,8 @@
   .ai-panel {
     display: flex;
     flex-direction: column;
+    position: relative;
+    z-index: 5;
     width: 300px;
     min-width: 260px;
     border-left: 1px solid #21262d;

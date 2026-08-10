@@ -72,7 +72,14 @@ pub fn run_action(
         .unwrap_or_else(|_| "/usr/local/bin/puppetterm-agent".to_string());
 
     let mut cmd = Command::new("ssh");
-    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
+    // ControlMaster=auto: attach to the user's interactive connection (the
+    // ControlMaster=yes master from ~/.ssh/puppetterm-control) so password-only
+    // remotes work; falls back to a direct connection when no socket exists.
+    cmd.args([
+        "-o", "BatchMode=yes",
+        "-o", "ControlMaster=auto",
+        "-o", "ConnectTimeout=10",
+    ]);
     if let Some(sock) = mux_socket_for(host) {
         cmd.arg("-S").arg(sock);
     }

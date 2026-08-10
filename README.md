@@ -156,3 +156,7 @@ cd client && npm run check && npm run build   # frontend (svelte-check + vite)
 scripts/e2e.py --host user@server --approve-all   # full end-to-end
 ```
 
+## License
+
+[MIT](./LICENSE) © 2026 [janchel](https://github.com/janchel)
+

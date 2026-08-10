@@ -53,6 +53,17 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
       }, 250);
       return Promise.resolve(id as T);
     }
+    case "start_local_session": {
+      const id = mockNextId++;
+      mockSessions.set(id, "local");
+      setTimeout(() => {
+        emitMock("pty-output", {
+          id,
+          data: `\r\n\x1b[32m(local shell)\x1b[0m\r\n$ `,
+        });
+      }, 250);
+      return Promise.resolve(id as T);
+    }
     case "write_ssh_input": {
       const id = Number(args.id);
       const data = String(args.data ?? "");

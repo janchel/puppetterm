@@ -284,6 +284,16 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - ✅ PASS on **192.168.5.50** in both modes: `--approve-all` (AI self-corrected `apt-get` → `sudo apt-get` → start → 200) and interactive (`yes y`), each exiting 0 with all checks green.
   - 🐛 Exposed gaps fixed: `systemctl reload` added to the sudoers grant; nginx docroot config verified.
 
+- [x] **T6.6 — Local-terminal-first connection UX**
+  - Depends on: T3.1, T3.4, T4.1
+  - Like any normal terminal: "+ New" opens a **local shell in the home directory**; the user types `ssh user@host` to reach a server; the tab tracks the remote connection; the AI targets the detected host.
+  - Delivered:
+    - Backend: `start_local_session` Tauri command — spawns `$SHELL` (fallback `/bin/bash`) in `$HOME` via portable-pty, reusing a shared `spawn_pty_session` helper (also used by `start_ssh_session`); registered in invoke_handler.
+    - Frontend: `openTab(host?)` — no arg = local tab (`host: ""`, label `local`); arg = quick-connect to a saved host (reuses its tab). `startSession` dispatches to local vs ssh. Input stream is parsed for `ssh <target>` (handles `-p/-i/-l/-o/-J` options) so the tab label + AI `activeHost` update to the remote target. "+ New" opens local; a `▾` chevron keeps the saved-host quick-connect dropdown (from `list_ssh_hosts`). AI chat shows an inline hint until a remote connection is detected.
+    - Mock backend (`backend.ts`) gained `start_local_session`.
+  - **AC:** clicking "+ New" opens a local shell at `~` with no SSH; typing `ssh -p 2222 user@host` + Enter updates the tab title to `user@host`; the AI chat targets that host; saved-host quick connect still works.
+  - ✅ Verified in browser mock: + New → tab `local` + `(local shell)` prompt; `ssh server1` → tab becomes `server1` (AI placeholder updates); `ssh -p 2222 ubuntu@192.168.5.50` → tab `ubuntu@192.168.5.50`; chevron lists saved hosts; svelte-check 0/0, build + cargo check OK.
+
 ---
 
 ## Phase dependency overview

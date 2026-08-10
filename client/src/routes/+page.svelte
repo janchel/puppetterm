@@ -10,9 +10,10 @@
 
   type Tab = {
     id: number;
-    host: string;
+    host: string; // remote target ("" = local shell); updated when `ssh <target>` is detected
     sessionId: number | null;
     connecting: boolean;
+    buf: string; // input buffer used to detect `ssh <target>` commands
   };
 
   // ---- reactive state ----------------------------------------------------
@@ -137,17 +138,44 @@
     statuses[h] = await call<boolean>("check_host", { host: h });
   }
 
-  async function openTab(host: string) {
-    // Reuse an existing tab for the same host instead of duplicating.
-    const existing = tabs.find((t) => t.host === host);
-    if (existing) {
-      showHostMenu = false;
-      await activateTab(existing.id);
-      return;
+  function tabLabel(t: Tab): string {
+    return t.host || "local";
+  }
+
+  /** Extract the target host from a line like `ssh -p 2222 user@host`. */
+  function parseSshTarget(line: string): string | null {
+    const m = line.trim().match(/^ssh(?:2)?\s+(.+)$/i);
+    if (!m) return null;
+    const tokens = m[1].trim().split(/\s+/).filter(Boolean);
+    let i = 0;
+    while (i < tokens.length) {
+      const tok = tokens[i];
+      if (tok === "-p" || tok === "-i" || tok === "-l" || tok === "-o" || tok === "-J") {
+        i += 2; // option + its value
+        continue;
+      }
+      if (tok.startsWith("-")) {
+        i += 1;
+        continue;
+      }
+      return tok;
+    }
+    return null;
+  }
+
+  async function openTab(host?: string) {
+    // Quick-connect to a named host reuses its existing tab.
+    if (host) {
+      const existing = tabs.find((t) => t.host === host);
+      if (existing) {
+        showHostMenu = false;
+        await activateTab(existing.id);
+        return;
+      }
     }
 
     const id = nextTabId++;
-    tabs = [...tabs, { id, host, sessionId: null, connecting: false }];
+    tabs = [...tabs, { id, host: host ?? "", sessionId: null, connecting: false, buf: "" }];
     activeTabId = id;
     showHostMenu = false;
     await tick();
@@ -170,6 +198,20 @@
     term.onData((data) => {
       const t = tabById(id);
       if (t?.sessionId != null) call("write_ssh_input", { id: t.sessionId, data });
+      // Track `ssh <target>` so the tab shows the remote connection (like a
+      // normal terminal: open local, type `ssh user@host` to connect).
+      if (t) {
+        t.buf += data;
+        const nl = t.buf.search(/[\r\n]/);
+        if (nl >= 0) {
+          const line = t.buf.slice(0, nl).trim();
+          t.buf = t.buf.slice(nl + 1);
+          const target = parseSshTarget(line);
+          if (target && target !== t.host) t.host = target;
+        } else if (t.buf.length > 4096) {
+          t.buf = "";
+        }
+      }
     });
 
     termByTab.set(id, { term, fit });
@@ -177,19 +219,23 @@
     startSession(id, host);
   }
 
-  async function startSession(id: number, host: string) {
+  async function startSession(id: number, host?: string) {
     const t = tabById(id);
     if (!t) return;
     t.connecting = true;
-    termByTab.get(id)?.term.write(`\x1b[33m[puppetterm] connecting to ${host}...\x1b[0m\r\n`);
+    if (host) {
+      termByTab.get(id)?.term.write(`\x1b[33m[puppetterm] connecting to ${host}...\x1b[0m\r\n`);
+    }
     try {
-      const sessionId = await call<number>("start_ssh_session", { host });
+      const sessionId = host
+        ? await call<number>("start_ssh_session", { host })
+        : await call<number>("start_local_session");
       t.sessionId = sessionId;
       fitTab(id);
     } catch (e) {
       termByTab
         .get(id)
-        ?.term.write(`\r\n\x1b[31m[puppetterm] failed to connect: ${e}\x1b[0m\r\n`);
+        ?.term.write(`\r\n\x1b[31m[puppetterm] failed to start session: ${e}\x1b[0m\r\n`);
     } finally {
       t.connecting = false;
     }
@@ -382,7 +428,10 @@
     const text = chatText.trim();
     if (!text) return;
     if (!activeHost) {
-      pushChat("ai", "(open a session first — the AI acts on the active host)");
+      pushChat(
+        "ai",
+        "(no remote connection in this tab — type `ssh user@host` to connect, then I can act on it)",
+      );
       return;
     }
     if (!aiReady) {
@@ -605,7 +654,7 @@
           class="tab {t.id === activeTabId ? 'active' : ''}"
           role="button"
           tabindex="0"
-          title={t.host}
+          title={tabLabel(t)}
           onclick={() => activateTab(t.id)}
           onkeydown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
@@ -615,11 +664,11 @@
           }}
         >
           <span class="dot {t.connecting ? 'busy' : t.sessionId != null ? 'up' : 'down'}"></span>
-          <span class="tab-host">{t.host}</span>
+          <span class="tab-host">{tabLabel(t)}</span>
           <button
             class="tab-close"
             type="button"
-            aria-label={`close ${t.host}`}
+            aria-label={`close ${tabLabel(t)}`}
             onclick={(e) => {
               e.stopPropagation();
               closeTab(t.id);
@@ -629,7 +678,14 @@
       {/each}
 
       <span class="new-wrap">
-        <button class="new-host" onclick={() => (showHostMenu = !showHostMenu)}>+ New</button>
+        <button class="new-host" onclick={() => openTab()} title="Open a local terminal">+ New</button>
+        <button
+          class="new-chevron"
+          onclick={() => (showHostMenu = !showHostMenu)}
+          title="Connect to a saved host"
+        >
+          ▾
+        </button>
         {#if showHostMenu}
           <div class="host-menu">
             {#if hosts.length === 0}
@@ -653,7 +709,8 @@
     <section class="term-area" bind:this={terminalArea}>
       {#if tabs.length === 0}
         <div class="placeholder">
-          No open sessions — click <b>+ New</b> to connect.
+          No open sessions — click <b>+ New</b> to open a local terminal, then
+          <code>ssh user@host</code> to connect to a server.
         </div>
       {/if}
       {#each tabs as t (t.id)}
@@ -733,7 +790,9 @@
       </div>
       <div class="chat-input">
         <input
-          placeholder="Ask the AI to act on {activeHost ?? 'the active host'}…"
+          placeholder={activeHost
+            ? `Ask the AI to act on ${activeHost}…`
+            : "Ask the AI to act on a remote — ssh to it first…"}
           bind:value={chatText}
           onkeydown={(e) => {
             if (e.key === "Enter") sendChat();
@@ -834,6 +893,7 @@
     display: inline-flex;
   }
   .new-host,
+  .new-chevron,
   .refresh {
     height: 26px;
     border: 1px solid #30363d;
@@ -844,7 +904,14 @@
     cursor: pointer;
     padding: 0 10px;
   }
+  .new-chevron {
+    margin-left: 4px;
+    padding: 0 6px;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+  }
   .new-host:hover,
+  .new-chevron:hover,
   .refresh:hover {
     background: #21262d;
   }

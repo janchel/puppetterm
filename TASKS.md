@@ -186,12 +186,14 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - **AC:** two simultaneous actions (e.g. snapshot + service status) both complete; their NDJSON streams don't interleave or corrupt; each renders distinctly in the terminal.
   - ✅ Verified: `run_action_parallel_no_interleave` test against real localhost SSH — single snapshot + 4 parallel runs; each stream contains only its own marker, no leakage. (Frontend rendering of `agent-event` into the terminal lands with the AI panel in Phase 5.)
 
-- [~] **T4.5 — Capability presets + session extension**
+- [x] **T4.5 — Capability presets + session extension**
   - Depends on: T4.1–T4.3, T2.5
   - Presets (e.g. `web-server`: `/etc/nginx/` writes + `apt`/`systemctl` sudo); out-of-grant actions trigger "extend capability for this session?".
-  - Delivered: `install.sh --preset web-server` — writes `/etc/puppetterm/config.json` (config_prefixes `/etc/nginx/`) + adds sudoers `tee /etc/nginx/*` grant; validated with `visudo`. The agent already honors the allow-list config file.
+  - Delivered: `install.sh --preset web-server` — writes `/etc/puppetterm/config.json` (config_prefixes `/etc/nginx/`) + installs scoped write helper `/usr/local/lib/puppetterm/write-file` (grants it NOPASSWD). Agent config-write falls back to `sudo -n <helper>`.
   - **AC:** a `web-server`-preset agent can write `/etc/nginx/` and run `apt`; an out-of-grant action (e.g. writing `/etc/hosts`) prompts for a session-scoped grant; granting is logged and not permanent (next session requires it again).
-  - ⚠️ Presets implemented + validated; live run on a box pending (`install.sh --preset web-server`). Session-scoped grant UI pending (stateless agent → would need a client-passed override).
+  - ✅ Verified on **192.168.5.50**: agent `config write` → `/etc/nginx/nginx.conf` via `sudo-helper` (file written + audited); helper denies outside `/etc/nginx`; base systemctl/apt grants intact.
+  - 🐛 Lesson: newer sudo **rejects wildcards in command arguments** (`tee /etc/nginx/*` fails `visudo`); fix = plain-command grant + path-enforcing helper. install.sh now writes sudoers atomically (temp → `visudo -cf` → `mv`).
+  - ⚠️ Session-scoped grant UI still pending (stateless agent → client-passed override).
 
 ---
 
@@ -256,7 +258,7 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - Agent appends executed actions to a log file.
   - Delivered: `agent/internal/audit/audit.go` — O_APPEND log at `/var/log/puppetterm/audit.log` (dir created by install.sh) with `~/.puppetterm/audit.log` fallback; records timestamp/action/request_id/exit/truncated-params; wired into `main.go` after every action. install.sh creates + chowns `/var/log/puppetterm`.
   - **AC:** running actions produces append-only entries on the box (`tail` the log); rotation policy documented (e.g. logrotate).
-  - ✅ Unit test passes (append + param truncation). ⚠️ Live on server1 pending re-run of `install.sh` (also fixes the preset sudoers bug found this turn).
+  - ✅ Unit test passes (append + param truncation). ✅ Live on **192.168.5.50**: actions logged to `/var/log/puppetterm/audit.log` (snapshot/service/config entries observed).
 
 - [ ] **T6.3 — Themes & status indicators**
   - Depends on: T3.1, T3.2

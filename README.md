@@ -1,5 +1,9 @@
 # puppetterm
 
+<p align="center">
+  <img src="docs/puppetterm-logo-1024.png" alt="puppetterm logo" width="180" />
+</p>
+
 **puppetterm** is a desktop terminal + AI assistant for managing Linux/Ubuntu servers
 over your **existing SSH setup**. The AI is your *puppet*: you pull the strings — it can
 work agentically (inspect, install, configure, fix), but it only ever moves with your
@@ -144,6 +148,7 @@ Open **Settings (⚙)** in the app:
 | `agent/` | Go — stateless remote worker (`puppetterm-agent`), invoked through SSH (NDJSON on stdin/stdout). No listener, no daemon. |
 | `client/` | Tauri desktop app (Svelte 5 + xterm.js) — tabbed terminals + AI chat panel. |
 | `installer/` | `install.sh` + sudoers/`authorized_keys` templates for hardening. |
+| `docs/` | Branding assets — `puppetterm-logo-1024.png` (regenerate icons via `npm --prefix client run tauri icon`). |
 | `scripts/` | `e2e.py` end-to-end test, `ssh-mux.sh` ControlMaster helper. |
 | `dev.sh` | One-command dev launcher (adds toolchains to PATH, runs the app). |
 

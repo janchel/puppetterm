@@ -12,8 +12,8 @@ Exits 0 only if ALL checks pass:
     5. audit entries exist (client SQLite DB + agent /var/log/puppetterm)
 
 Usage:
-    scripts/e2e.py --host ubuntu@192.168.5.50 --approve-all
-    scripts/e2e.py --host ubuntu@192.168.5.50            # interactive approvals
+    scripts/e2e.py --host user@server --approve-all
+    scripts/e2e.py --host user@server            # interactive approvals
 """
 import argparse
 import json

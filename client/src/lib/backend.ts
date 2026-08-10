@@ -150,11 +150,14 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
         },
       ] as T);
     case "get_ai_config":
+      // Fresh-install state: no custom provider configured. The real app reads
+      // ~/.config/puppetterm/ai.json (outside the repo); the browser mock must
+      // NOT contain the developer's private endpoint/model.
       return Promise.resolve({
-        base_url: "http://192.168.5.52:20128/v1",
-        model: "jandelcombo",
+        base_url: "",
+        model: "",
         provider: "openai",
-        has_api_key: true,
+        has_api_key: false,
       } as T);
     case "set_ai_config":
       return Promise.resolve(undefined as T);

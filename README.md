@@ -153,7 +153,7 @@ Open **Settings (⚙)** in the app:
 cd agent && make test && make smoke   # Go agent: unit + protocol smoke
 cd client/src-tauri && cargo test --lib # Rust backend (AI, install, audit, agent)
 cd client && npm run check && npm run build   # frontend (svelte-check + vite)
-scripts/e2e.py --host ubuntu@192.168.5.50 --approve-all   # full end-to-end
+scripts/e2e.py --host user@server --approve-all   # full end-to-end
 ```
 
 See [`TASKS.md`](./TASKS.md) for the roadmap (Phase 6 = current work: polish, error UX,

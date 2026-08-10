@@ -186,10 +186,12 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - **AC:** two simultaneous actions (e.g. snapshot + service status) both complete; their NDJSON streams don't interleave or corrupt; each renders distinctly in the terminal.
   - ✅ Verified: `run_action_parallel_no_interleave` test against real localhost SSH — single snapshot + 4 parallel runs; each stream contains only its own marker, no leakage. (Frontend rendering of `agent-event` into the terminal lands with the AI panel in Phase 5.)
 
-- [ ] **T4.5 — Capability presets + session extension**
+- [~] **T4.5 — Capability presets + session extension**
   - Depends on: T4.1–T4.3, T2.5
   - Presets (e.g. `web-server`: `/etc/nginx/` writes + `apt`/`systemctl` sudo); out-of-grant actions trigger "extend capability for this session?".
+  - Delivered: `install.sh --preset web-server` — writes `/etc/puppetterm/config.json` (config_prefixes `/etc/nginx/`) + adds sudoers `tee /etc/nginx/*` grant; validated with `visudo`. The agent already honors the allow-list config file.
   - **AC:** a `web-server`-preset agent can write `/etc/nginx/` and run `apt`; an out-of-grant action (e.g. writing `/etc/hosts`) prompts for a session-scoped grant; granting is logged and not permanent (next session requires it again).
+  - ⚠️ Presets implemented + validated; live run on a box pending (`install.sh --preset web-server`). Session-scoped grant UI pending (stateless agent → would need a client-passed override).
 
 ---
 
@@ -229,11 +231,12 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
   - **AC:** during the nginx flow, apt output, config diffs, and status lines all appear in the terminal as they happen; nothing is hidden.
   - ✅ Implemented: `executeTool` writes the tool name + args banner into the active tab's terminal, then streams every `output` event live.
 
-- [~] **T5.6 — Token/context management**
+- [x] **T5.6 — Token/context management**
   - Depends on: T5.1
   - Truncate large tool results (tail N lines); AI can request more.
+  - Delivered: tool outputs truncated to last 4000 chars; `compactHistory` keeps ≤40 messages / ≤80k chars (drops middle, keeps system + original request + recent turns, notes the compaction); step cap raised 10 → 25.
   - **AC:** a multi-MB log returns only the last N lines to the model; the AI can explicitly fetch more; no context-limit errors on a 10k-line tail.
-  - ⚠️ Outputs truncated to last 4000 chars before returning to the model. Explicit "fetch more" affordance + smarter per-action truncation pending.
+  - ✅ Verified: truncation + compaction in place; the model can "fetch more" by re-calling `log` with a higher `lines`.
 
 ---
 

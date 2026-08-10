@@ -285,9 +285,35 @@
     }
   }
 
+  // Keep the conversation bounded so long investigations don't blow the
+  // model's context window: drop the middle, keep system + original request +
+  // the most recent turns.
+  const MAX_HISTORY = 40;
+  const MAX_CONTEXT_CHARS = 80000;
+
+  function compactHistory(h: any[]): any[] {
+    const chars = h.reduce(
+      (n, m) => n + (typeof m.content === "string" ? m.content.length : 0),
+      0,
+    );
+    if (h.length <= MAX_HISTORY && chars <= MAX_CONTEXT_CHARS) return h;
+    const head = h.slice(0, 2); // system + original request
+    const tail = h.slice(-24);
+    const dropped = h.length - head.length - tail.length;
+    return [
+      ...head,
+      {
+        role: "system",
+        content: `(Note: ${dropped} earlier messages and ~${Math.max(0, chars - MAX_CONTEXT_CHARS)} chars of tool output were compacted to keep the conversation bounded. Continue based on the latest tool results and terminal state.)`,
+      },
+      ...tail,
+    ];
+  }
+
   async function runAiLoop() {
     let guard = 0;
-    while (guard++ < 10) {
+    while (guard++ < 25) {
+      history = compactHistory(history);
       const resp = await call<any>("ai_chat", { messages: history, tools: AGENT_TOOLS });
       const msg = resp?.choices?.[0]?.message;
       if (!msg) {

@@ -770,9 +770,13 @@
     const term = termByTab.get(id)?.term;
     if (!t || !term || t.host !== "") return; // already have a host for this tab
     const lines = terminalText(term, 60).split("\n");
-    const last = (lines[lines.length - 1] ?? "").trim();
+    // The shell prompt is the last non-empty line (a trailing blank line can
+    // follow the prompt, e.g. after a redraw — skip it before gating).
+    let li = lines.length - 1;
+    while (li >= 0 && lines[li].trim() === "") li--;
+    const last = (lines[li] ?? "").trim();
     if (!/[\$#>] ?$/.test(last)) return; // only when at a shell prompt
-    for (let i = lines.length - 1; i >= 0; i--) {
+    for (let i = li; i >= 0; i--) {
       const target = detectSshFromLine(lines[i]);
       if (target) {
         t.host = target;
@@ -976,10 +980,12 @@
             const t = tabs.find((x) => x.sessionId === p.id);
             if (t) {
               const term = termByTab.get(t.id)?.term;
-              term?.write(p.data);
-              // Catch ssh commands that were recalled from history (up-arrow):
-              // the command text is echoed in the pty output, not onData.
-              maybeDetectSshFromBuffer(t.id);
+              // xterm.write() parses data ASYNCHRONOUSLY, so scanning the
+              // buffer synchronously here reads a stale snapshot. The ssh
+              // command echo + MOTD + remote prompt often land in the SAME
+              // chunk, so we'd miss them entirely. Scan inside the write
+              // callback (runs once this chunk is rendered) instead.
+              term?.write(p.data, () => maybeDetectSshFromBuffer(t.id));
             }
           }),
           await on<{ id: number }>("pty-exit", (p) => {

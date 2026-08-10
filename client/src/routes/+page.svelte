@@ -3,14 +3,21 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { Terminal } from "xterm";
   import { FitAddon } from "@xterm/addon-fit";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
+
+  type Tab = {
+    id: number;
+    host: string;
+    sessionId: number | null;
+    connecting: boolean;
+  };
 
   // ---- reactive state ----------------------------------------------------
   let hosts = $state<string[]>([]);
   let statuses = $state<Record<string, boolean>>({});
-  let activeHost = $state<string | null>(null);
-  let sessionId = $state<number | null>(null);
-  let busy = $state(false);
+  let tabs = $state<Tab[]>([]);
+  let activeTabId = $state<number | null>(null);
+  let showHostMenu = $state(false);
 
   // AI panel settings (persisted). Chat itself arrives in Phase 5.
   let model = $state(
@@ -33,10 +40,12 @@
     localStorage.setItem("pp.autonomy", autonomy);
   });
 
-  // ---- non-reactive terminal objects --------------------------------------
-  let term: Terminal | null = null;
-  let fit: FitAddon | null = null;
-  let container: HTMLDivElement;
+  // ---- terminal plumbing (per-tab, non-reactive) --------------------------
+  const viewports: Record<number, HTMLDivElement> = {};
+  const termByTab = new Map<number, { term: Terminal; fit: FitAddon }>();
+  let nextTabId = 1;
+
+  let terminalArea: HTMLElement;
   let resizeObserver: ResizeObserver | null = null;
   let unlisteners: UnlistenFn[] = [];
 
@@ -63,6 +72,10 @@
     brightWhite: "#f0f6fc",
   };
 
+  function tabById(id: number): Tab | undefined {
+    return tabs.find((t) => t.id === id);
+  }
+
   async function loadHosts() {
     try {
       hosts = await invoke<string[]>("list_ssh_hosts");
@@ -76,46 +89,101 @@
     statuses[h] = await invoke<boolean>("check_host", { host: h });
   }
 
-  async function openSession(host: string) {
-    if (busy) return;
-    if (host === activeHost && sessionId !== null) return;
-    if (sessionId !== null) {
-      await invoke("stop_ssh_session", { id: sessionId });
-      sessionId = null;
+  async function openTab(host: string) {
+    // Reuse an existing tab for the same host instead of duplicating.
+    const existing = tabs.find((t) => t.host === host);
+    if (existing) {
+      showHostMenu = false;
+      await activateTab(existing.id);
+      return;
     }
-    activeHost = host;
-    busy = true;
-    term?.reset();
-    term?.write(`\x1b[33m[puppetterm] connecting to ${host}...\x1b[0m\r\n`);
+
+    const id = nextTabId++;
+    tabs = [...tabs, { id, host, sessionId: null, connecting: false }];
+    activeTabId = id;
+    showHostMenu = false;
+    await tick();
+
+    const el = viewports[id];
+    if (!el) return;
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily: "'JetBrains Mono','Fira Code',monospace",
+      theme,
+      scrollback: 10000,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(el);
+    fit.fit();
+
+    term.onData((data) => {
+      const t = tabById(id);
+      if (t?.sessionId != null) invoke("write_ssh_input", { id: t.sessionId, data });
+    });
+
+    termByTab.set(id, { term, fit });
+    startSession(id, host);
+  }
+
+  async function startSession(id: number, host: string) {
+    const t = tabById(id);
+    if (!t) return;
+    t.connecting = true;
+    termByTab.get(id)?.term.write(`\x1b[33m[puppetterm] connecting to ${host}...\x1b[0m\r\n`);
     try {
-      const id = await invoke<number>("start_ssh_session", { host });
-      sessionId = id;
-      fitTerminal();
+      const sessionId = await invoke<number>("start_ssh_session", { host });
+      t.sessionId = sessionId;
+      fitTab(id);
     } catch (e) {
-      term?.write(`\r\n\x1b[31m[puppetterm] failed to connect: ${e}\x1b[0m\r\n`);
-      activeHost = null;
+      termByTab
+        .get(id)
+        ?.term.write(`\r\n\x1b[31m[puppetterm] failed to connect: ${e}\x1b[0m\r\n`);
     } finally {
-      busy = false;
+      t.connecting = false;
     }
   }
 
-  async function closeSession() {
-    if (sessionId !== null) {
-      await invoke("stop_ssh_session", { id: sessionId });
-      sessionId = null;
-    }
-    activeHost = null;
-    term?.reset();
+  async function activateTab(id: number) {
+    if (activeTabId === id) return;
+    activeTabId = id;
+    await tick();
+    fitTab(id);
   }
 
-  function fitTerminal() {
-    fit?.fit();
-    if (sessionId !== null && term) {
+  function fitTab(id: number) {
+    const entry = termByTab.get(id);
+    if (!entry) return;
+    entry.fit.fit();
+    const t = tabById(id);
+    if (t?.sessionId != null) {
       invoke("resize_ssh_pty", {
-        id: sessionId,
-        cols: term.cols,
-        rows: term.rows,
+        id: t.sessionId,
+        cols: entry.term.cols,
+        rows: entry.term.rows,
       });
+    }
+  }
+
+  async function closeTab(id: number) {
+    const t = tabById(id);
+    if (t?.sessionId != null) await invoke("stop_ssh_session", { id: t.sessionId });
+    termByTab.get(id)?.term.dispose();
+    termByTab.delete(id);
+    delete viewports[id];
+
+    const idx = tabs.findIndex((x) => x.id === id);
+    tabs = tabs.filter((x) => x.id !== id);
+
+    if (activeTabId === id) {
+      const next = tabs[idx] ?? tabs[idx - 1] ?? null;
+      activeTabId = next ? next.id : null;
+      if (next) {
+        await tick();
+        fitTab(next.id);
+      }
     }
   }
 
@@ -128,26 +196,10 @@
   }
 
   onMount(() => {
-    term = new Terminal({
-      cursorBlink: true,
-      fontSize: 13,
-      fontFamily: "'JetBrains Mono','Fira Code',monospace",
-      theme,
-      scrollback: 10000,
+    resizeObserver = new ResizeObserver(() => {
+      if (activeTabId != null) fitTab(activeTabId);
     });
-    fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(container);
-    fit.fit();
-
-    term.onData((data) => {
-      if (sessionId !== null) {
-        invoke("write_ssh_input", { id: sessionId, data });
-      }
-    });
-
-    resizeObserver = new ResizeObserver(() => fitTerminal());
-    resizeObserver.observe(container);
+    if (terminalArea) resizeObserver.observe(terminalArea);
 
     // Async setup (listeners + host discovery) — kicked off, not awaited, so
     // the onMount cleanup can stay synchronous.
@@ -155,12 +207,16 @@
       try {
         unlisteners = [
           await listen<{ id: number; data: string }>("pty-output", (e) => {
-            if (e.payload.id === sessionId) term?.write(e.payload.data);
+            const t = tabs.find((x) => x.sessionId === e.payload.id);
+            if (t) termByTab.get(t.id)?.term.write(e.payload.data);
           }),
           await listen<{ id: number }>("pty-exit", (e) => {
-            if (e.payload.id === sessionId) {
-              term?.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");
-              sessionId = null;
+            const t = tabs.find((x) => x.sessionId === e.payload.id);
+            if (t) {
+              t.sessionId = null;
+              termByTab
+                .get(t.id)
+                ?.term.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");
             }
           }),
         ];
@@ -173,116 +229,319 @@
     return () => {
       unlisteners.forEach((u) => u());
       resizeObserver?.disconnect();
-      if (sessionId !== null) {
-        invoke("stop_ssh_session", { id: sessionId });
-        sessionId = null;
+      for (const t of tabs) {
+        if (t.sessionId != null) invoke("stop_ssh_session", { id: t.sessionId });
+        termByTab.get(t.id)?.term.dispose();
       }
-      term?.dispose();
+      termByTab.clear();
     };
   });
 </script>
 
-<div class="shell">
-  <!-- Left: agent list -->
-  <aside class="pane agents">
-    <div class="pane-title">
-      <span>Agents</span>
-      <button class="icon-btn" onclick={loadHosts} title="Refresh hosts">↻</button>
-    </div>
-    <div class="agent-list">
-      {#if hosts.length === 0}
-        <p class="muted">No hosts found in<br />~/.ssh/config</p>
-      {:else}
-        {#each hosts as h (h)}
+<div class="app">
+  <header class="topbar">
+    <div class="brand">puppetterm</div>
+    <nav class="tabs">
+      {#each tabs as t (t.id)}
+        <div
+          class="tab {t.id === activeTabId ? 'active' : ''}"
+          role="button"
+          tabindex="0"
+          title={t.host}
+          onclick={() => activateTab(t.id)}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              activateTab(t.id);
+            }
+          }}
+        >
+          <span class="dot {t.connecting ? 'busy' : t.sessionId != null ? 'up' : 'down'}"></span>
+          <span class="tab-host">{t.host}</span>
           <button
-            class="agent {activeHost === h ? 'active' : ''}"
-            onclick={() => openSession(h)}
-            title={statuses[h] ? 'reachable' : 'unreachable'}
-          >
-            <span class="dot {statuses[h] ? 'up' : 'down'}"></span>
-            <span class="host">{h}</span>
-          </button>
-        {/each}
-      {/if}
-    </div>
-  </aside>
-
-  <!-- Center: terminal -->
-  <section class="pane terminal">
-    <div class="term-bar">
-      {#if activeHost}
-        <span class="term-host-label">
-          <span class="dot up"></span>{activeHost}
-          {#if busy}<span class="busy">connecting…</span>{/if}
-        </span>
-        <button class="close-btn" onclick={closeSession}>✕</button>
-      {:else}
-        <span class="muted">Select an agent to connect</span>
-      {/if}
-    </div>
-    <div class="term-host" bind:this={container}></div>
-  </section>
-
-  <!-- Right: AI panel -->
-  <aside class="pane ai">
-    <div class="pane-title">AI</div>
-    <div class="ai-opts">
-      <label>
-        Model
-        <select bind:value={model}>
-          <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
-          <option value="claude-opus-4-1">Claude Opus 4.1</option>
-          <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
-        </select>
-      </label>
-      <label>
-        Autonomy
-        <select bind:value={autonomy}>
-          <option value="ask-first">Ask first (default)</option>
-          <option value="read-only-auto">Read-only auto</option>
-        </select>
-      </label>
-    </div>
-    <div class="chat-log">
-      {#if chatLog.length === 0}
-        <p class="muted">Chat is wired up in Phase 5.</p>
-      {/if}
-      {#each chatLog as m, i (i)}
-        <div class="msg {m.role}">{m.text}</div>
+            class="tab-close"
+            type="button"
+            aria-label={`close ${t.host}`}
+            onclick={(e) => {
+              e.stopPropagation();
+              closeTab(t.id);
+            }}
+          >×</button>
+        </div>
       {/each}
-    </div>
-    <div class="chat-input">
-      <input
-        placeholder="Ask the AI to act on {activeHost ?? 'the active host'}…"
-        bind:value={chatText}
-        onkeydown={(e) => {
-          if (e.key === "Enter") sendChat();
-        }}
-      />
-      <button onclick={sendChat} disabled={!chatText.trim()}>Send</button>
-    </div>
-  </aside>
+
+      <span class="new-wrap">
+        <button class="new-host" onclick={() => (showHostMenu = !showHostMenu)}>+ New</button>
+        {#if showHostMenu}
+          <div class="host-menu">
+            {#if hosts.length === 0}
+              <div class="menu-item muted">No hosts in ~/.ssh/config</div>
+            {:else}
+              {#each hosts as h (h)}
+                <button class="menu-item" onclick={() => openTab(h)}>
+                  <span class="dot {statuses[h] ? 'up' : 'down'}"></span>{h}
+                </button>
+              {/each}
+            {/if}
+          </div>
+        {/if}
+      </span>
+
+      <button class="refresh" onclick={loadHosts} title="Refresh hosts">↻</button>
+    </nav>
+  </header>
+
+  <main class="body">
+    <section class="term-area" bind:this={terminalArea}>
+      {#if tabs.length === 0}
+        <div class="placeholder">
+          No open sessions — click <b>+ New</b> to connect.
+        </div>
+      {/if}
+      {#each tabs as t (t.id)}
+        <div
+          class="term-viewport {t.id === activeTabId ? 'active' : ''}"
+          bind:this={viewports[t.id]}
+        ></div>
+      {/each}
+    </section>
+
+    <aside class="ai-panel">
+      <div class="pane-title">AI</div>
+      <div class="ai-opts">
+        <label>
+          Model
+          <select bind:value={model}>
+            <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
+            <option value="claude-opus-4-1">Claude Opus 4.1</option>
+            <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+          </select>
+        </label>
+        <label>
+          Autonomy
+          <select bind:value={autonomy}>
+            <option value="ask-first">Ask first (default)</option>
+            <option value="read-only-auto">Read-only auto</option>
+          </select>
+        </label>
+      </div>
+      <div class="chat-log">
+        {#if chatLog.length === 0}
+          <p class="muted">Chat is wired up in Phase 5.</p>
+        {/if}
+        {#each chatLog as m, i (i)}
+          <div class="msg {m.role}">{m.text}</div>
+        {/each}
+      </div>
+      <div class="chat-input">
+        <input
+          placeholder="Ask the AI to act on the active host…"
+          bind:value={chatText}
+          onkeydown={(e) => {
+            if (e.key === "Enter") sendChat();
+          }}
+        />
+        <button onclick={sendChat} disabled={!chatText.trim()}>Send</button>
+      </div>
+    </aside>
+  </main>
 </div>
 
 <style>
-  .shell {
-    display: grid;
-    grid-template-columns: 220px 1fr 320px;
-    height: 100vh;
-    background: #0d1117;
-  }
-
-  .pane {
+  .app {
     display: flex;
     flex-direction: column;
+    height: 100vh;
+    background: #0d1117;
+    color: #e6edf3;
+  }
+
+  /* ---- top bar with tabs ---- */
+  .topbar {
+    display: flex;
+    align-items: stretch;
+    height: 40px;
+    background: #010409;
+    border-bottom: 1px solid #21262d;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    color: #58a6ff;
+    border-right: 1px solid #21262d;
+    white-space: nowrap;
+  }
+  .tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 8px;
+    overflow-x: auto;
+    flex: 1;
     min-width: 0;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    height: 26px;
+    padding: 0 8px 0 10px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: #8b949e;
+    font-size: 12.5px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .tab:hover {
+    background: #161b22;
+    color: #e6edf3;
+  }
+  .tab.active {
+    background: #161b22;
+    border-color: #30363d;
+    color: #e6edf3;
+  }
+  .tab-host {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tab-close {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 0 4px;
+    font-size: 14px;
+    line-height: 1;
+    color: #8b949e;
+  }
+  .tab-close:hover {
+    background: #da3633;
+    color: #fff;
+  }
+  .new-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .new-host,
+  .refresh {
+    height: 26px;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    background: #0d1117;
+    color: #e6edf3;
+    font-size: 12.5px;
+    cursor: pointer;
+    padding: 0 10px;
+  }
+  .new-host:hover,
+  .refresh:hover {
+    background: #21262d;
+  }
+  .host-menu {
+    position: absolute;
+    top: 30px;
+    left: 0;
+    min-width: 200px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    z-index: 20;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+  }
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: #e6edf3;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .menu-item:hover {
+    background: #1f6feb;
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+  }
+  .dot.up {
+    background: #3fb950;
+  }
+  .dot.down {
+    background: #484f58;
+  }
+  .dot.busy {
+    background: #d29922;
+    animation: pulse 1s infinite alternate;
+  }
+  @keyframes pulse {
+    from {
+      opacity: 0.4;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  /* ---- body: terminal + AI ---- */
+  .body {
+    display: flex;
+    flex: 1;
     min-height: 0;
   }
 
-  .pane-title {
+  .term-area {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    background: #0d1117;
+  }
+  .term-viewport {
+    position: absolute;
+    inset: 0;
+    display: none;
+    padding: 6px;
+  }
+  .term-viewport.active {
+    display: block;
+  }
+  .placeholder {
+    position: absolute;
+    inset: 0;
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    justify-content: center;
+    color: #8b949e;
+    font-size: 14px;
+  }
+
+  /* ---- AI panel (right) ---- */
+  .ai-panel {
+    display: flex;
+    flex-direction: column;
+    width: 300px;
+    min-width: 260px;
+    border-left: 1px solid #21262d;
+    background: #010409;
+  }
+  .pane-title {
     padding: 10px 12px;
     font-size: 12px;
     font-weight: 700;
@@ -291,113 +550,6 @@
     color: #8b949e;
     border-bottom: 1px solid #21262d;
   }
-
-  .agents {
-    border-right: 1px solid #21262d;
-    background: #010409;
-  }
-
-  .agent-list {
-    flex: 1;
-    overflow-y: auto;
-    padding: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .agent {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 8px 10px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: #e6edf3;
-    font-size: 13px;
-    text-align: left;
-    cursor: pointer;
-  }
-  .agent:hover {
-    background: #161b22;
-  }
-  .agent.active {
-    background: #1f6feb26;
-    outline: 1px solid #1f6feb;
-  }
-  .host {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .dot {
-    width: 9px;
-    height: 9px;
-    border-radius: 50%;
-    flex: none;
-  }
-  .dot.up {
-    background: #3fb950;
-    box-shadow: 0 0 6px #3fb95088;
-  }
-  .dot.down {
-    background: #484f58;
-  }
-
-  .icon-btn,
-  .close-btn {
-    border: none;
-    background: transparent;
-    color: #8b949e;
-    cursor: pointer;
-    font-size: 14px;
-    border-radius: 4px;
-    padding: 2px 6px;
-  }
-  .icon-btn:hover,
-  .close-btn:hover {
-    background: #21262d;
-    color: #e6edf3;
-  }
-
-  .terminal {
-    background: #0d1117;
-  }
-
-  .term-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    height: 38px;
-    padding: 0 12px;
-    border-bottom: 1px solid #21262d;
-    font-size: 13px;
-    background: #010409;
-  }
-  .term-host-label {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: #e6edf3;
-  }
-  .busy {
-    color: #d29922;
-    font-size: 12px;
-  }
-  .term-host {
-    flex: 1;
-    min-height: 0;
-    padding: 4px 6px;
-  }
-
-  .ai {
-    border-left: 1px solid #21262d;
-    background: #010409;
-  }
-
   .ai-opts {
     padding: 10px 12px;
     display: flex;
@@ -427,7 +579,6 @@
   .chat-input input:focus {
     border-color: #1f6feb;
   }
-
   .chat-log {
     flex: 1;
     overflow-y: auto;
@@ -453,7 +604,6 @@
     align-self: flex-start;
     max-width: 90%;
   }
-
   .chat-input {
     display: flex;
     gap: 6px;
@@ -476,7 +626,6 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
-
   .muted {
     color: #8b949e;
     font-size: 12px;

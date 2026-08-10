@@ -293,6 +293,7 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
     - Mock backend (`backend.ts`) gained `start_local_session`.
   - **AC:** clicking "+ New" opens a local shell at `~` with no SSH; typing `ssh -p 2222 user@host` + Enter updates the tab title to `user@host`; the AI chat targets that host; saved-host quick connect still works.
   - ✅ Verified in browser mock: + New → tab `local` + `(local shell)` prompt; `ssh server1` → tab becomes `server1` (AI placeholder updates); `ssh -p 2222 ubuntu@192.168.5.50` → tab `ubuntu@192.168.5.50`; chevron lists saved hosts; svelte-check 0/0, build + cargo check OK.
+  - 🛡️ **AI targeting safety:** the AI executes against the **active tab's** detected host (never "types" into a random terminal). The target is **pinned at send time** (`chatTarget` = host + tabId) so switching tabs mid-task cannot redirect a running task to another server; output streams into the pinned terminal. A persistent "acting on \<host\>" banner in the AI panel shows the current target, each task opens with "(acting on \<host\> — this terminal)", the approval prompt shows "on \<host\>", and switching tabs mid-task shows "(pinned — you switched tabs)".
 
 ---
 

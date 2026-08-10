@@ -5,10 +5,22 @@ import (
 	"io"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/puppetterm/agent/internal/protocol"
 )
+
+// activeCmdPID is the PID of the command currently running in this agent
+// (0 if none). The signal handler in main uses it to kill the command's
+// process group when the agent is asked to stop (Abort / disconnect).
+var activeCmdPID atomic.Int64
+
+// ActiveCommandPID returns the PID of the running command's process-group
+// leader, or 0 if no command is running.
+func ActiveCommandPID() int {
+	return int(activeCmdPID.Load())
+}
 
 // execStream runs cmd, streaming its stdout/stderr as output events, and
 // returns the process exit code. If stdin is non-nil it is fed to the command.
@@ -44,6 +56,8 @@ func execStream(
 		_ = out.Errorf(reqID, "start: %v", err)
 		return 1
 	}
+	activeCmdPID.Store(int64(cmd.Process.Pid))
+	defer activeCmdPID.Store(0)
 
 	stop := context.AfterFunc(ctx, func() {
 		if cmd.Process != nil {

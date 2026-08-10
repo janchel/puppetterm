@@ -219,11 +219,27 @@ async fn run_agent_action(
     result
 }
 
-/// Abort a running agent action (kills its ssh process group — the remote
-/// agent command dies too). This is the "take back control" escape hatch.
+/// Abort a running agent action: kills the local ssh process group AND tells
+/// the remote host to kill the user's agent processes. Killing the local ssh
+/// alone does NOT stop the remote command — sshd keeps the session's process
+/// running after the connection drops (verified), so we issue an explicit
+/// remote `pkill` over a fresh connection. This is the "take back control"
+/// escape hatch.
 #[tauri::command]
-fn stop_agent_action(request_id: String) -> bool {
-    agent::kill_action(&request_id)
+fn stop_agent_action(request_id: String, host: Option<String>) -> bool {
+    let killed = agent::kill_action(&request_id);
+    if let Some(h) = host {
+        let user = h.split('@').next().unwrap_or_default();
+        let mut cmd = std::process::Command::new("ssh");
+        cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]).arg(&h).arg("pkill");
+        if !user.is_empty() {
+            cmd.args(["-TERM", "-u", user, "-f", "puppetterm-agent"]);
+        } else {
+            cmd.args(["-TERM", "-f", "puppetterm-agent"]);
+        }
+        let _ = cmd.output(); // best-effort; SIGTERM lets the agent clean up its command group
+    }
+    killed
 }
 
 /// Whether the puppetterm agent is already present on the host.

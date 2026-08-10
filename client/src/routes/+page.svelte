@@ -548,7 +548,12 @@
     currentRequestId = null;
     if (rid) {
       try {
-        await call("stop_agent_action", { requestId: rid });
+        // The backend kills the local ssh AND issues a remote `pkill` so the
+        // actual command on the server stops too (sshd alone won't).
+        await call("stop_agent_action", {
+          requestId: rid,
+          host: chatTarget?.host ?? activeHost,
+        });
       } catch (e) {
         console.error("stop_agent_action", e);
       }

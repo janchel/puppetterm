@@ -60,12 +60,50 @@
     id: string;
     tool: string;
     args: Record<string, unknown>;
+    danger?: boolean;
     resolve: (ok: boolean) => void;
   } | null>(null);
+  let abortRequested = $state(false); // user hit Abort — stop starting new tool calls
+  let currentRequestId = $state<string | null>(null); // in-flight agent request (for abort)
+  let activity = $state<any[]>([]); // recent audit entries (what the AI did)
+  let showActivity = $state(false);
 
   $effect(() => {
     localStorage.setItem("pp.autonomy", autonomy);
   });
+
+  // Guardrails: destructive commands get a red-flagged approval and are never
+  // auto-run. The AI still CAN run them, but only with an explicit Approve.
+  const DANGEROUS_PATTERNS = [
+    // rm ... --no-preserve-root (anywhere in the command)
+    /\brm\b[^;&|]*--?no-preserve-root\b/,
+    // rm -rf / or rm -rf /*
+    /\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(?:\/|\/\*)\s*$/,
+    // mkfs / mkfs.ext4
+    /\bmkfs(\.\w+)?\b/,
+    // dd of=/dev/...
+    /\bdd\b[^;&|]*\bof=\/dev\//,
+    // write directly to a block device
+    /\b>\s*\/dev\/(?:sd|vd|nvme)/,
+    // power state changes
+    /\b(?:shutdown|reboot|halt|poweroff)\b/,
+    // fork bomb
+    /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:&\s*\}/,
+    // chmod -R 777 /
+    /\bchmod\b[^;&|]*-R\s+777\s+\//,
+    // mv /
+    /\bmv\s+\/\s+/,
+    // init 0 / init 6
+    /\binit\s+[06]\b/,
+  ];
+
+  function isDangerous(tool: string, args: Record<string, unknown>): boolean {
+    if (tool === "run_command") {
+      const cmd = String(args.cmd ?? "");
+      return DANGEROUS_PATTERNS.some((re) => re.test(cmd));
+    }
+    return false;
+  }
 
   const SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
@@ -446,6 +484,7 @@
     // into THIS terminal, even if the user switches tabs mid-task.
     const target = { host: activeHost, tabId: activeTabId ?? -1 };
     chatTarget = target;
+    abortRequested = false;
     chatText = "";
     pushChat("user", text);
     pushChat("ai", `(acting on ${target.host} — this terminal)`);
@@ -456,6 +495,31 @@
     } finally {
       chatBusy = false;
       chatTarget = null;
+      currentRequestId = null;
+      loadActivity();
+    }
+  }
+
+  /** Take back control: stop the AI loop and kill the in-flight remote action. */
+  async function abortAi() {
+    abortRequested = true;
+    const rid = currentRequestId;
+    currentRequestId = null;
+    if (rid) {
+      try {
+        await call("stop_agent_action", { requestId: rid });
+      } catch (e) {
+        console.error("stop_agent_action", e);
+      }
+    }
+  }
+
+  /** Load the recent audit log (what the AI/user did on each host). */
+  async function loadActivity() {
+    try {
+      activity = await call<any[]>("audit_recent", { limit: 20 });
+    } catch {
+      /* audit may be unavailable in the browser mock — leave empty */
     }
   }
 
@@ -488,6 +552,10 @@
     try {
       let guard = 0;
     while (guard++ < 25) {
+      if (abortRequested) {
+        pushChat("ai", "(aborted by user)");
+        return;
+      }
       history = compactHistory(history);
       const resp = await call<any>("ai_chat", { messages: history, tools: AGENT_TOOLS });
       const msg = resp?.choices?.[0]?.message;
@@ -524,11 +592,17 @@
   function requestApproval(tc: { id: string; function: { name: string; arguments: string } }): Promise<boolean> {
     const name = tc.function.name;
     const args = safeParse(tc.function.arguments);
-    if (autonomy === "read-only-auto" || toolReadOnly(name, args)) {
-      return Promise.resolve(true);
+    // Read-only tools always auto-run.
+    if (toolReadOnly(name, args)) return Promise.resolve(true);
+    // Read-only mode: state-changing actions are blocked, not silently approved.
+    if (autonomy === "read-only-auto") {
+      pushChat("ai", `(blocked in read-only mode: ${name} would change state)`);
+      return Promise.resolve(false);
     }
+    // Ask-first: prompt, flagging dangerous commands so the user can't miss them.
+    const danger = isDangerous(name, args);
     return new Promise((resolve) => {
-      pendingApproval = { id: tc.id, tool: name, args, resolve };
+      pendingApproval = { id: tc.id, tool: name, args, danger, resolve };
     });
   }
 
@@ -581,12 +655,18 @@
       term.write(`\r\n\x1b[36m[puppetterm] AI → ${name} ${JSON.stringify(args)}\x1b[0m\r\n`);
     }
     const request = { action, params: args, request_id: tc.id };
-    const res = await call<any>("run_agent_action", {
-      host,
-      request: JSON.stringify(request),
-      source: "ai",
-      approved: true,
-    });
+    currentRequestId = tc.id;
+    let res: any;
+    try {
+      res = await call<any>("run_agent_action", {
+        host,
+        request: JSON.stringify(request),
+        source: "ai",
+        approved: true,
+      });
+    } finally {
+      currentRequestId = null;
+    }
     for (const ev of res?.events ?? []) {
       if (ev?.type === "output" && term) term.write(ev.data ?? "");
     }
@@ -637,6 +717,7 @@
         console.warn("event listeners unavailable:", e);
       }
       await loadHosts();
+      loadActivity();
       try {
         const v = await call<any>("get_ai_config");
         aiBaseUrl = v.base_url;
@@ -784,11 +865,15 @@
       </div>
 
       {#if pendingApproval}
-        <div class="approval">
-          <div class="approval-label">Approve action?</div>
+        <div class="approval {pendingApproval.danger ? 'danger' : ''}">
+          <div class="approval-label">
+            {pendingApproval.danger ? '⚠ Dangerous action' : 'Approve action?'}
+          </div>
           <div class="approval-cmd">
             {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
-            <div class="approval-host">on {chatTarget?.host ?? activeHost}</div>
+            <div class="approval-host">
+              {pendingApproval.danger ? 'on ' : 'on '}{chatTarget?.host ?? activeHost}
+            </div>
           </div>
           <div class="approval-btns">
             <button onclick={reject}>Reject</button>
@@ -808,6 +893,28 @@
           local — ssh to a remote first
         {/if}
       </div>
+
+      <button class="activity-toggle" onclick={() => (showActivity = !showActivity)}>
+        Activity ({activity.length}) {showActivity ? '▾' : '▸'}
+      </button>
+      {#if showActivity}
+        <div class="activity">
+          {#if activity.length === 0}
+            <p class="muted">No recorded actions yet.</p>
+          {:else}
+            {#each activity as a (a.id)}
+              <div class="activity-row">
+                <span class="a-time">{a.ts.slice(11, 19)}</span>
+                <span class="a-host">{a.host}</span>
+                <span class="a-action">{a.action}</span>
+                <span class="a-exit {a.exit === 0 ? 'ok' : 'bad'}">
+                  {a.exit == null ? '-' : 'exit ' + a.exit}
+                </span>
+              </div>
+            {/each}
+          {/if}
+        </div>
+      {/if}
 
       <div class="chat-log">
         {#if chatLog.length === 0}
@@ -830,6 +937,11 @@
         <button onclick={sendChat} disabled={!chatText.trim() || chatBusy}>
           {chatBusy ? "…" : "Send"}
         </button>
+        {#if chatBusy}
+          <button class="abort-btn" onclick={abortAi} title="Stop the AI and kill the running command">
+            Abort
+          </button>
+        {/if}
       </div>
     </aside>
   </main>
@@ -1148,6 +1260,91 @@
     margin-top: 6px;
     color: #d29922;
     font-weight: 600;
+  }
+  .approval.danger {
+    border-color: #f85149;
+    background: #2d1517;
+  }
+  .approval.danger .approval-label {
+    color: #f85149;
+  }
+  .approval.danger .approval-host {
+    color: #f85149;
+  }
+  .activity-toggle {
+    margin: 0 12px 8px;
+    padding: 5px 10px;
+    border: 1px solid #21262d;
+    background: #161b22;
+    color: #8b949e;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: left;
+    flex: none;
+  }
+  .activity-toggle:hover {
+    background: #21262d;
+    color: #e6edf3;
+  }
+  .activity {
+    margin: 0 12px 8px;
+    padding: 6px;
+    max-height: 160px;
+    overflow-y: auto;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    background: #0d1117;
+    font-size: 11.5px;
+    flex: none;
+  }
+  .activity-row {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    padding: 3px 4px;
+    border-bottom: 1px solid #161b22;
+    font-family: monospace;
+  }
+  .activity-row:last-child {
+    border-bottom: none;
+  }
+  .a-time {
+    color: #484f58;
+  }
+  .a-host {
+    color: #58a6ff;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .a-action {
+    color: #e6edf3;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .a-exit.ok {
+    color: #3fb950;
+  }
+  .a-exit.bad {
+    color: #f85149;
+  }
+  .abort-btn {
+    border: 1px solid #f85149;
+    background: transparent;
+    color: #f85149;
+    border-radius: 6px;
+    padding: 0 10px;
+    cursor: pointer;
+    font-weight: 700;
+    flex: none;
+  }
+  .abort-btn:hover {
+    background: #f85149;
+    color: #fff;
   }
   .ai-target {
     display: flex;

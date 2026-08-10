@@ -5,9 +5,11 @@
 //! If a ControlMaster socket exists (see client/scripts/ssh-mux.sh) it is
 //! reused for the connection, otherwise a fresh one is opened.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
 
@@ -26,12 +28,30 @@ pub struct AgentRunResult {
     pub events: Vec<serde_json::Value>,
 }
 
+/// Running agent actions: request_id → ssh child pid. Lets the UI abort an
+/// in-flight action ("take back control") by killing the ssh process group,
+/// which drops the connection and kills the remote agent command.
+pub static ACTIVE_ACTIONS: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Kill a running agent action by request id (kills its ssh process group).
+pub fn kill_action(request_id: &str) -> bool {
+    let pid = match ACTIVE_ACTIONS.lock().unwrap().get(request_id) {
+        Some(&p) => p as i32,
+        None => return false,
+    };
+    // Negative pid = the whole process group (ssh is its own group leader).
+    unsafe { libc::kill(-pid, libc::SIGKILL) == 0 }
+}
+
 /// Run one agent action on `host`. `emit` is called for each streamed event.
 ///
 /// Blocking — call from a worker thread (e.g. `spawn_blocking`) in the app.
+/// `request_id` registers the ssh child so `kill_action` can abort it.
 pub fn run_action(
     host: &str,
     request: &str,
+    request_id: &str,
     emit: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<AgentRunResult, String> {
     let agent = std::env::var("PUPPETTERM_AGENT_BIN")
@@ -44,9 +64,31 @@ pub fn run_action(
     }
     cmd.arg(host).arg(agent);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // own group so kill_action can kill the whole tree
+    }
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn ssh: {e}"))?;
+    let registered = !request_id.is_empty();
+    if registered {
+        ACTIVE_ACTIONS.lock().unwrap().insert(request_id.to_string(), child.id());
+    }
+    let outcome = run_action_io(&mut child, host, request, emit);
+    if registered {
+        ACTIVE_ACTIONS.lock().unwrap().remove(request_id);
+    }
+    outcome
+}
 
+/// The IO half of `run_action` (stdin request, NDJSON stream, wait, exit).
+fn run_action_io(
+    child: &mut Child,
+    host: &str,
+    request: &str,
+    emit: impl Fn(AgentEvent) + Send + Sync,
+) -> Result<AgentRunResult, String> {
     // Send the single request, then close stdin so the agent runs and exits.
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -125,7 +167,7 @@ mod tests {
             return;
         }
 
-        let res = run_action("localhost", r#"{"action":"snapshot","request_id":"s-1"}"#, |_| {})
+        let res = run_action("localhost", r#"{"action":"snapshot","request_id":"s-1"}"#, "s-1", |_| {})
             .expect("single action");
         assert_eq!(res.exit, 0, "single action exit");
         assert!(!res.events.is_empty(), "expected events");
@@ -136,8 +178,9 @@ mod tests {
             let req = format!(
                 r#"{{"action":"run","params":{{"cmd":"echo run-{i}"}},"request_id":"p-{i}"}}"#
             );
+            let rid = format!("p-{i}");
             handles.push(std::thread::spawn(move || {
-                run_action("localhost", &req, |_| {}).expect("parallel action")
+                run_action("localhost", &req, &rid, |_| {}).expect("parallel action")
             }));
         }
         for (i, h) in handles.into_iter().enumerate() {

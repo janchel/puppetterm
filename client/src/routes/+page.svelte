@@ -21,6 +21,17 @@
   // The host the AI chat binds to (the active session's host).
   let activeHost = $derived(tabs.find((t) => t.id === activeTabId)?.host ?? null);
 
+  // AI panel width (persisted; draggable splitter).
+  let aiWidth = $state(
+    typeof localStorage !== "undefined"
+      ? (Number(localStorage.getItem("pp.aiWidth")) || 320)
+      : 320,
+  );
+  $effect(() => {
+    localStorage.setItem("pp.aiWidth", String(aiWidth));
+  });
+  let resizing = $state(false);
+
   // ---- AI integration (OpenAI-compatible) --------------------------------
   let aiBaseUrl = $state("");
   let aiModel = $state("");
@@ -158,6 +169,7 @@
     });
 
     termByTab.set(id, { term, fit });
+    wireCopyPaste(term);
     startSession(id, host);
   }
 
@@ -218,6 +230,89 @@
         fitTab(next.id);
       }
     }
+  }
+
+  // ---- clipboard helpers (terminal copy/paste) -----------------------------
+  async function copyText(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  async function readClipboard(): Promise<string> {
+    try {
+      return await navigator.clipboard.readText();
+    } catch {
+      return "";
+    }
+  }
+
+  async function pasteIntoTerminal(t: Terminal) {
+    const text = await readClipboard();
+    if (text) t.paste(text);
+  }
+
+  function wireCopyPaste(term: Terminal) {
+    term.attachCustomKeyEventHandler((e) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.shiftKey && (e.key === "C" || e.key === "c")) {
+        const sel = term.getSelection();
+        if (sel) copyText(sel);
+        return false;
+      }
+      if (mod && e.shiftKey && (e.key === "V" || e.key === "v")) {
+        pasteIntoTerminal(term);
+        return false;
+      }
+      if (mod && e.key === "Insert") {
+        const sel = term.getSelection();
+        if (sel) copyText(sel);
+        return false;
+      }
+      if (e.shiftKey && e.key === "Insert") {
+        pasteIntoTerminal(term);
+        return false;
+      }
+      return true;
+    });
+    term.onSelectionChange(() => {
+      const sel = term.getSelection();
+      if (sel) copyText(sel); // auto-copy on selection (best-effort)
+    });
+    term.element?.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const sel = term.getSelection();
+      if (sel) copyText(sel);
+      else pasteIntoTerminal(term);
+    });
+  }
+
+  // ---- splitter (resizable AI panel) ---------------------------------------
+  function startResize(e: PointerEvent) {
+    resizing = true;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  function onResizeMove(e: PointerEvent) {
+    if (!resizing) return;
+    const w = Math.min(
+      Math.max(window.innerWidth - e.clientX, 260),
+      Math.round(window.innerWidth * 0.5),
+    );
+    aiWidth = w;
+  }
+  function endResize() {
+    resizing = false;
   }
 
   function pushChat(role: string, text: string) {
@@ -311,7 +406,8 @@
   }
 
   async function runAiLoop() {
-    let guard = 0;
+    try {
+      let guard = 0;
     while (guard++ < 25) {
       history = compactHistory(history);
       const resp = await call<any>("ai_chat", { messages: history, tools: AGENT_TOOLS });
@@ -339,7 +435,11 @@
       history = [...history, { role: "assistant", content: text }];
       return;
     }
-    pushChat("ai", "(stopped after too many tool steps)");
+      pushChat("ai", "(stopped after too many tool steps)");
+    } catch (e) {
+      pushChat("ai", `(AI error: ${e})`);
+      console.error("ai_chat", e);
+    }
   }
 
   function requestApproval(tc: { id: string; function: { name: string; arguments: string } }): Promise<boolean> {
@@ -476,7 +576,7 @@
   });
 </script>
 
-<div class="app">
+<div class="app" class:resizing={resizing}>
   <header class="topbar">
     <div class="brand">puppetterm</div>
     <nav class="tabs">
@@ -544,7 +644,18 @@
       {/each}
     </section>
 
-    <aside class="ai-panel">
+    <div
+      class="splitter"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize AI panel"
+      onpointerdown={startResize}
+      onpointermove={onResizeMove}
+      onpointerup={endResize}
+      onpointercancel={endResize}
+    ></div>
+
+    <aside class="ai-panel" style={`width: ${aiWidth}px`}>
       <div class="pane-title">AI</div>
       <div class="ai-opts">
         <label>
@@ -781,6 +892,22 @@
     position: relative;
   }
 
+  .splitter {
+    width: 5px;
+    flex: none;
+    cursor: col-resize;
+    background: #21262d;
+    touch-action: none;
+  }
+  .splitter:hover,
+  .splitter:active {
+    background: #1f6feb;
+  }
+  .app.resizing {
+    user-select: none;
+    cursor: col-resize;
+  }
+
   .term-area {
     position: relative;
     flex: 1;
@@ -814,7 +941,6 @@
     flex-direction: column;
     position: relative;
     z-index: 5;
-    width: 300px;
     min-width: 260px;
     border-left: 1px solid #21262d;
     background: #010409;

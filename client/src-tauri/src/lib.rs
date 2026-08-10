@@ -267,25 +267,27 @@ async fn install_agent_on_host(
     // Make sure ControlMaster sharing is enabled so install works over the
     // user's interactive (possibly password-only) connection.
     let _ = ensure_ssh_control_master();
-    // Resolve the agent binary dir: explicit param → env → bundled resource →
-    // source-tree dev fallback (<repo>/agent/bin) → home default.
+    // Resolve the agent binary dir: explicit param → env → source-tree
+    // agent/bin (dev: `make cross` output) → bundled resource dir (packaged
+    // builds) → home default.
     let agent_dir = agent_dir
         .or_else(|| std::env::var("PUPPETTERM_AGENT_DIR").ok().filter(|d| !d.is_empty()))
         .or_else(|| {
-            app.path()
-                .resource_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        })
-        .or_else(|| {
-            // dev: agent/bin sits next to the source tree (repo root)
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agent/bin");
-            if dir.join("puppetterm-agent-linux-amd64").exists()
-                || dir.join("puppetterm-agent-linux-arm64").exists()
+            // Dev: prefer the source-tree agent/bin (repo/agent/bin, built with
+            // `make cross`). In `tauri dev` the resource dir is target/debug,
+            // which NEVER contains the agent binary — picking it first made
+            // installs fail with "agent binary not found".
+            let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agent/bin");
+            if dev.join("puppetterm-agent-linux-amd64").exists()
+                || dev.join("puppetterm-agent-linux-arm64").exists()
             {
-                Some(dir.to_string_lossy().into_owned())
+                Some(dev.to_string_lossy().into_owned())
             } else {
-                None
+                // Packaged build: the binaries are bundled into the app resources.
+                app.path()
+                    .resource_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
             }
         });
     let app2 = app.clone();

@@ -3,7 +3,10 @@
   import { Terminal } from "xterm";
   import "xterm/css/xterm.css";
   import { FitAddon } from "@xterm/addon-fit";
+  import { writeText as tauriWriteText, readText as tauriReadText } from "@tauri-apps/plugin-clipboard-manager";
   import { onMount, tick } from "svelte";
+
+  const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
   type Tab = {
     id: number;
@@ -235,6 +238,14 @@
 
   // ---- clipboard helpers (terminal copy/paste) -----------------------------
   async function copyText(text: string) {
+    if (isTauri) {
+      try {
+        await tauriWriteText(text);
+        return;
+      } catch (e) {
+        console.error("tauri clipboard write failed", e);
+      }
+    }
     try {
       await navigator.clipboard.writeText(text);
     } catch {
@@ -252,6 +263,13 @@
   }
 
   async function readClipboard(): Promise<string> {
+    if (isTauri) {
+      try {
+        return await tauriReadText();
+      } catch (e) {
+        console.error("tauri clipboard read failed", e);
+      }
+    }
     try {
       return await navigator.clipboard.readText();
     } catch {
@@ -291,9 +309,16 @@
       const sel = term.getSelection();
       if (sel) copyText(sel); // auto-copy on selection (best-effort)
     });
+    // Right-click: preserve the selection captured on mousedown, then copy it;
+    // if there is no selection, paste from the clipboard instead.
+    let rightClickSel = "";
+    term.element?.addEventListener("mousedown", (e) => {
+      if (e.button === 2) rightClickSel = term.getSelection();
+    });
     term.element?.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      const sel = term.getSelection();
+      const sel = rightClickSel || term.getSelection();
+      rightClickSel = "";
       if (sel) copyText(sel);
       else pasteIntoTerminal(term);
     });

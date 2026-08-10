@@ -264,6 +264,42 @@
     return t.host || "local";
   }
 
+  /** Reconstruct the visible text a user actually typed. `term.onData` gives
+   *  RAW keystrokes — including backspaces and arrow-key escape sequences — so
+   *  a corrected typo would otherwise leave a stray character in the buffer
+   *  (e.g. `ssh ubuntu2<BS>@host` must parse as `ubuntu@host`, NOT `ubuntu2@host`). */
+  function cleanTyped(line: string): string {
+    const out: string[] = [];
+    let i = 0;
+    while (i < line.length) {
+      const c = line[i];
+      if (c === "\x7f" || c === "\x08") {
+        out.pop(); // backspace: erase the previous character
+        i++;
+      } else if (c === "\x1b") {
+        // Skip an ANSI escape sequence (arrow keys etc.): CSI `ESC [ ... final`,
+        // otherwise the two-char form `ESC X`.
+        i++;
+        if (line[i] === "[") {
+          i++;
+          while (i < line.length && !/[A-Za-z@~]/.test(line[i])) i++;
+          if (i < line.length) i++; // final byte
+        } else {
+          i++;
+        }
+      } else if (c === "\t") {
+        out.push(" "); // keep tabs as a separator (the target regex needs \s)
+        i++;
+      } else if (c >= " " && c < "\x7f") {
+        out.push(c); // printable ASCII
+        i++;
+      } else {
+        i++; // drop other control bytes
+      }
+    }
+    return out.join("");
+  }
+
   /** Extract the target host from a line like `ssh -p 2222 user@host`. */
   function parseSshTarget(line: string): string | null {
     const m = line.trim().match(/^ssh(?:2)?\s+(.+)$/i);
@@ -345,7 +381,9 @@
         if (nl >= 0) {
           const line = t.buf.slice(0, nl).trim();
           t.buf = t.buf.slice(nl + 1);
-          const target = parseSshTarget(line);
+          // Apply backspaces / drop arrow-key sequences BEFORE parsing, so a
+          // corrected typo (e.g. `ubuntu2<BS>@host`) detects as `ubuntu@host`.
+          const target = parseSshTarget(cleanTyped(line));
           if (target && target !== t.host) {
             t.host = target;
             checkAndHintAgent(id, target);

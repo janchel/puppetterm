@@ -57,13 +57,19 @@ func Config(ctx context.Context, req protocol.Request, out *protocol.Encoder) in
 			_ = out.Result(0, map[string]any{"path": p.Path, "op": "write", "method": "direct"}, req.RequestID)
 			return 0
 		}
-		// Fall back to sudo -n tee (requires the scoped sudoers grant).
-		cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", p.Path)
+		// Fall back to the scoped write helper (installed by the installer's
+		// preset and granted NOPASSWD via sudoers). The helper enforces its
+		// own path allow-list, so sudoers needs no wildcards.
+		helper := os.Getenv("PUPPETTERM_WRITE_HELPER")
+		if helper == "" {
+			helper = "/usr/local/lib/puppetterm/write-file"
+		}
+		cmd := exec.CommandContext(ctx, "sudo", "-n", helper, p.Path)
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
 		code := execStream(ctx, req.RequestID, out, cmd, strings.NewReader(p.Content))
 		_ = out.Result(0, map[string]any{
-			"path": p.Path, "op": "write", "method": "sudo-tee", "exit": code,
+			"path": p.Path, "op": "write", "method": "sudo-helper", "exit": code,
 		}, req.RequestID)
 		return 0
 	}

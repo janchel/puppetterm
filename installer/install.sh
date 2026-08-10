@@ -91,11 +91,27 @@ echo "    installed: $AGENT_PATH"
 # --- capability preset --------------------------------------------------------
 case "$PRESET" in
   web-server)
-    mkdir -p /etc/puppetterm
+    mkdir -p /etc/puppetterm /usr/local/lib/puppetterm
     cat > /etc/puppetterm/config.json <<'EOF'
 {"log_prefixes":["/var/log/"],"config_prefixes":["/etc/nginx/"]}
 EOF
-    echo "    preset web-server: allow-list (/etc/nginx/) written"
+    cat > /usr/local/lib/puppetterm/write-file <<'EOF'
+#!/bin/sh
+# puppetterm write-file helper — writes stdin to an allow-listed path.
+# Granted NOPASSWD via sudoers; enforces its own path allow-list.
+set -eu
+ALLOWED_PREFIXES="/etc/nginx/"
+[ "$#" -eq 1 ] || { echo "usage: write-file <path>" >&2; exit 2; }
+path="$1"
+case "$path" in
+  ${ALLOWED_PREFIXES}*) ;;
+  *) echo "write-file: path not allowed: $path" >&2; exit 1 ;;
+esac
+mkdir -p "$(dirname "$path")" 2>/dev/null || true
+cat > "$path"
+EOF
+    chmod 0755 /usr/local/lib/puppetterm/write-file
+    echo "    preset web-server: allow-list (/etc/nginx/) + write helper installed"
     ;;
 esac
 
@@ -109,10 +125,10 @@ SUDOERS_FILE="/etc/sudoers.d/puppetterm-agent"
 SUDOERS_CURRENT=""
 if [ -f "$SUDOERS_FILE" ] && grep -q "^$SSH_USER " "$SUDOERS_FILE"; then
   SUDOERS_CURRENT=1
-  # A preset may require extra aliases the existing file lacks — rewrite then.
+  # A preset may require extra grants the existing file lacks — rewrite then.
   case "$PRESET" in
     web-server)
-      grep -q "PUPPETTERM_WEB_CFG" "$SUDOERS_FILE" || SUDOERS_CURRENT=""
+      grep -q "/usr/local/lib/puppetterm/write-file" "$SUDOERS_FILE" || SUDOERS_CURRENT=""
       ;;
   esac
 fi
@@ -120,6 +136,7 @@ if [ -n "$SUDOERS_CURRENT" ]; then
   echo "    sudoers already configured for $SSH_USER (skipping)"
 else
   if confirm "install scoped sudoers for user '$SSH_USER'?"; then
+    tmpfile="$(mktemp "${SUDOERS_FILE}.XXXXXX")"
     {
       echo "# puppetterm-agent — scoped privileges (managed by install.sh)"
       echo "Cmnd_Alias PUPPETTERM_SYSTEMCTL = /usr/bin/systemctl status *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl restart *, /usr/bin/systemctl enable *, /usr/bin/systemctl disable *, /usr/bin/systemctl is-active *, /usr/bin/systemctl is-enabled *"
@@ -127,26 +144,23 @@ else
       echo "Cmnd_Alias PUPPETTERM_DEPLOY = /usr/bin/git pull, /usr/bin/systemctl restart *"
       echo "# No cat/tail/journalctl aliases: arbitrary file reads (e.g. /etc/shadow) must"
       echo "# stay denied. Log reads rely on group access (user in 'adm') instead."
-      EXTRA=""
+      echo "$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_DEPLOY"
       case "$PRESET" in
         web-server)
-          echo "Cmnd_Alias PUPPETTERM_WEB_CFG = /usr/bin/tee /etc/nginx/*"
-          EXTRA="PUPPETTERM_WEB_CFG"
+          echo "# web-server preset: config writes via the scoped helper (no wildcards)"
+          echo "$SSH_USER ALL=(root) NOPASSWD: /usr/local/lib/puppetterm/write-file"
           ;;
       esac
-      if [ -n "$EXTRA" ]; then
-        echo "$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_DEPLOY, $EXTRA"
-      else
-        echo "$SSH_USER ALL=(root) NOPASSWD: PUPPETTERM_SYSTEMCTL, PUPPETTERM_APT, PUPPETTERM_DEPLOY"
-      fi
-    } > "$SUDOERS_FILE"
-    chmod 0440 "$SUDOERS_FILE"
-    if ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
-      rm -f "$SUDOERS_FILE"
-      echo "error: sudoers validation failed; no changes made" >&2
+    } > "$tmpfile"
+    chmod 0440 "$tmpfile"
+    if visudo -cf "$tmpfile" >/dev/null 2>&1; then
+      mv "$tmpfile" "$SUDOERS_FILE"
+      echo "    wrote $SUDOERS_FILE"
+    else
+      rm -f "$tmpfile"
+      echo "error: sudoers validation failed; existing file left untouched" >&2
       exit 1
     fi
-    echo "    wrote $SUDOERS_FILE"
   else
     echo "    skipped sudoers"
   fi

@@ -50,8 +50,11 @@
   const SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
     "using the provided tools. Prefer the structured tools (service/log/config/snapshot) over " +
-    "run_command. State-changing actions are approved by the user before execution; you will be " +
-    "told if one is rejected. Be concise and summarize tool results for the user.";
+    "run_command. To see what is currently on the terminal screen, use read_terminal — this is " +
+    "the live view of the active session, NOT the shell history file (~/.bash_history is a " +
+    "separate concern and does not reflect the current terminal). State-changing actions are " +
+    "approved by the user before execution; you will be told if one is rejected. Be concise " +
+    "and summarize tool results for the user.";
 
   const AGENT_TOOLS = [
     { type: "function", function: { name: "run_command", description: "Run an arbitrary shell command on the active host (always approved first).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
@@ -59,6 +62,7 @@
     { type: "function", function: { name: "service", description: "Control a systemd service on the active host.", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
     { type: "function", function: { name: "log", description: "Tail a log file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
     { type: "function", function: { name: "config", description: "Read or write a config file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
+    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
   ];
 
   const TOOL_TO_ACTION: Record<string, string> = {
@@ -235,7 +239,7 @@
   }
 
   function toolReadOnly(tool: string, args: Record<string, unknown>): boolean {
-    if (tool === "snapshot" || tool === "log") return true;
+    if (tool === "snapshot" || tool === "log" || tool === "read_terminal") return true;
     if (tool === "service") {
       const op = String(args.op ?? "");
       return op === "status" || op === "is-active" || op === "is-enabled";
@@ -333,11 +337,35 @@
     pendingApproval = null;
   }
 
+  function terminalText(term: Terminal, maxLines = 200): string {
+    const buf = term.buffer.active;
+    const total = buf.length;
+    const start = Math.max(0, total - maxLines);
+    const lines: string[] = [];
+    for (let y = start; y < total; y++) {
+      lines.push(buf.getLine(y)?.translateToString(true) ?? "");
+    }
+    return lines.join("\n");
+  }
+
   async function executeTool(tc: { id: string; function: { name: string; arguments: string } }) {
     const name = tc.function.name;
     const args = safeParse(tc.function.arguments);
-    const action = TOOL_TO_ACTION[name] ?? "run";
     const term = activeTerm();
+
+    // Client-local tools (no SSH round-trip).
+    if (name === "read_terminal") {
+      if (!term) return { error: "no active terminal" };
+      const text = terminalText(term, 200);
+      term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
+      return {
+        host: activeHost,
+        note: "live terminal screen (not shell history)",
+        terminal: text.slice(-8000),
+      };
+    }
+
+    const action = TOOL_TO_ACTION[name] ?? "run";
     if (term) {
       term.write(`\r\n\x1b[36m[puppetterm] AI → ${name} ${JSON.stringify(args)}\x1b[0m\r\n`);
     }

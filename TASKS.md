@@ -127,26 +127,32 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
 ## Phase 3 — Tauri Client Shell
 **Goal:** the app is a working terminal you can SSH out of, with the three-pane layout.
 **DoD:** you can open a session to a VPS and use it like a normal terminal; switching hosts works.
+> ⚠️ **Blocker**: building the Tauri app needs system libs (`webkit2gtk-4.1`, gtk3, …) — install with:
+> `sudo apt update && sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`
 
-- [ ] **T3.1 — Terminal pane (xterm.js + ssh pty)**
+- [~] **T3.1 — Terminal pane (xterm.js + ssh pty)**
   - Depends on: T0.4, T2.1
   - Spawn system `ssh` pty, wire stdout/stdin to xterm.js, `@xterm/addon-fit`.
-  - **AC:** interactive shell works (typing, output, `Ctrl+C`); resizing the window re-flows correctly; output colors render.
+  - Implemented: Rust `portable-pty` spawns `ssh -tt <host>`; pty bytes bridged to xterm.js via `pty-output`/`pty-exit` events; input via `write_ssh_input`; resize via `resize_ssh_pty`.
+  - **AC:** interactive shell works (typing, output, `Ctrl+C`); resizing the window re-flows correctly; output colors render. ⚠️ Pending full build + run (blocked on system deps).
 
-- [ ] **T3.2 — Agent list pane**
+- [~] **T3.2 — Agent list pane**
   - Depends on: T3.1, T2.3
   - Hosts from `~/.ssh/config`; status dot (reachable/unreachable); click to switch active host.
-  - **AC:** hosts appear as aliases; status dot reflects live reachability; clicking switches the active session/host; an unreachable host shows clearly.
+  - Implemented: Rust `list_ssh_hosts` (parses `Host` aliases, skips wildcards) + `check_host` probe; frontend list with up/down dots, click to switch.
+  - **AC:** hosts appear as aliases; status dot reflects live reachability; clicking switches the active session/host; an unreachable host shows clearly. ⚠️ Pending full build + run.
 
-- [ ] **T3.3 — Chat + AI options pane (layout)**
+- [~] **T3.3 — Chat + AI options pane (layout)**
   - Depends on: T3.1
   - Chat box; model picker; autonomy selector (read-only auto / ask-first).
-  - **AC:** three-pane layout renders and is resizable; selections persist across restarts.
+  - Implemented: three-pane grid (verified rendering in browser preview); model + autonomy selects persist via localStorage; chat box present (logic in Phase 5).
+  - **AC:** three-pane layout renders and is resizable; selections persist across restarts. ⚠️ Persistence + resize pending full build.
 
-- [ ] **T3.4 — Session lifecycle**
+- [~] **T3.4 — Session lifecycle**
   - Depends on: T3.1, T2.1
   - Open/close/reconnect; mux cleanup.
-  - **AC:** closing a session kills the master and removes the control socket; reconnect works; `pgrep -f 'ssh -M'` shows no orphaned processes after closing.
+  - Implemented: `start_ssh_session`/`stop_ssh_session` (kills child on close + on app teardown); `pty-exit` event updates state; switching hosts closes the previous session.
+  - **AC:** closing a session kills the master and removes the control socket; reconnect works; `pgrep -f 'ssh -M'` shows no orphaned processes after closing. ⚠️ Pending full build + run.
 
 ---
 

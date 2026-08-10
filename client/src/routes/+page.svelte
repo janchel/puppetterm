@@ -54,6 +54,10 @@
   let aiKey = $state("");
   let aiHasKey = $state(false);
   let aiReady = $state(false);
+  // The user's own OpenAI-compatible endpoint (the `openai` provider has no
+  // preset URL). Remembered so switching to DeepSeek/Claude and back restores
+  // it — otherwise the model switcher leaves a stale preset URL behind.
+  let customBaseUrl = $state("");
 
   // Provider presets: predefined endpoint + default models.
   const AI_PROVIDERS: Record<
@@ -84,6 +88,7 @@
     aiProvider = p;
     const preset = AI_PROVIDERS[p];
     if (preset && preset.baseUrl) aiBaseUrl = preset.baseUrl;
+    else if (p === "openai") aiBaseUrl = customBaseUrl; // restore the custom endpoint
     if (preset?.model) aiModel = preset.model;
   }
 
@@ -96,13 +101,15 @@
   });
 
   /** Pick a model in the chat panel. If it belongs to a provider preset,
-   *  switch the provider + endpoint too; then persist. */
+   *  switch the provider + endpoint too (the custom/openai preset restores the
+   *  remembered custom endpoint); then persist. */
   function applyAiModel(m: string) {
     aiModel = m;
     for (const [key, p] of Object.entries(AI_PROVIDERS)) {
       if (p.models.includes(m)) {
         aiProvider = key;
         if (p.baseUrl) aiBaseUrl = p.baseUrl;
+        else if (key === "openai") aiBaseUrl = customBaseUrl;
         break;
       }
     }
@@ -591,6 +598,7 @@
 
   async function saveAiConfig() {
     try {
+      if (aiProvider === "openai") customBaseUrl = aiBaseUrl; // remember the custom endpoint
       await call("set_ai_config", {
         baseUrl: aiBaseUrl,
         model: aiModel,
@@ -604,6 +612,7 @@
       aiProvider = v.provider ?? "openai";
       aiHasKey = v.has_api_key;
       aiReady = true;
+      if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
       pushChat("ai", "(AI settings saved)");
     } catch (e) {
       pushChat("ai", `(failed to save AI settings: ${e})`);
@@ -950,6 +959,7 @@
         aiProvider = v.provider ?? "openai";
         aiHasKey = v.has_api_key;
         aiReady = true;
+        if (aiProvider === "openai") customBaseUrl = v.base_url || "";
         history = [{ role: "system", content: SYSTEM_PROMPT }];
       } catch (e) {
         console.warn("ai config unavailable:", e);
@@ -1216,7 +1226,13 @@
         </label>
         <label class="modal-field">
           Endpoint
-          <input bind:value={aiBaseUrl} placeholder="http://host:port/v1" />
+          <input
+            bind:value={aiBaseUrl}
+            placeholder="http://host:port/v1"
+            oninput={() => {
+              if (aiProvider === "openai") customBaseUrl = aiBaseUrl;
+            }}
+          />
         </label>
         <label class="modal-field">
           Model

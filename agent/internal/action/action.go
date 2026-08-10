@@ -22,6 +22,9 @@ func NewRegistry() *Registry {
 	r := &Registry{handlers: make(map[string]Handler)}
 	r.Register("run", Run)
 	r.Register("snapshot", Snapshot)
+	r.Register("service", Service)
+	r.Register("log", Log)
+	r.Register("config", Config)
 	return r
 }
 

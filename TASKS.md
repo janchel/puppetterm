@@ -158,20 +158,26 @@ Tracking doc for the SSH-native, agentic remote terminal (see `agentic-remote-te
 **Goal:** typed actions beyond raw exec, driven from the client over the SSH mux.
 **DoD:** service/log/config actions work against the hardened agent; allow-lists and presets enforced.
 
-- [ ] **T4.1 — `service` action (systemctl)**
+- [x] **T4.1 — `service` action (systemctl)**
   - Depends on: T1.6, T2.5
   - `status/start/stop/restart` for systemd units, structured JSON result.
-  - **AC:** `status` returns `{state, since, ...}`; start/stop/restart change real state and report exit; unknown unit returns a clean error.
+  - Delivered: `agent/internal/action/service.go` (ops: status/is-active/is-enabled/start/stop/restart/enable/disable; read-only as user, state-changing via `sudo -n`).
+  - **AC:** `status` returns structured state; start/stop/restart change real state and report exit; unknown unit returns a clean error.
+  - ✅ Verified on **192.168.5.50**: `status ssh` → `active/enabled, exit 0`; real `restart systemd-logind` → `active, exit 0` (sudo grant works, no password prompt); nonexistent unit → clean `not found` with `exit 5`; bad unit/op → validation error. Unit tests green (validation + local systemd status).
 
-- [ ] **T4.2 — `log` action (tail + follow)**
+- [x] **T4.2 — `log` action (tail + follow)**
   - Depends on: T1.6, T2.5
   - Tail N lines; follow streams new lines.
+  - Delivered: `agent/internal/action/log.go` (path allow-list via `internal/allow`, default `/var/log/`; `lines` clamp 1–5000; `follow` = `tail -f`).
   - **AC:** tail returns exactly N lines; `follow` streams appended lines until cancelled; path outside the allow-list is rejected.
+  - ✅ Verified: tail of `/var/log/dpkg.log` on **192.168.5.50** → exactly N lines streamed, `exit 0`; `follow` uses `tail -f` (killed with the session); `/etc/shadow` → `path ... is not in the allow-list`. Unit tests green (tail + denial).
 
-- [ ] **T4.3 — `config` action (allow-listed paths)**
+- [x] **T4.3 — `config` action (allow-listed paths)**
   - Depends on: T1.6, T2.5
   - Read/write scoped to allow-listed paths.
+  - Delivered: `agent/internal/action/config.go` (`read`/`write`; write tries direct then `sudo -n tee`; allow-list from `/etc/puppetterm/config.json`, override via `PUPPETTERM_CONFIG`).
   - **AC:** read works inside the allow-list; write updates the file; read/write of a path outside the allow-list is rejected with a clear error.
+  - ✅ Verified on **192.168.5.50** with a temp allow-list: read streamed file + `bytes` in result; write via `direct` updated the file; denied path → clear allow-list error. Unit tests green (read/write + denial).
 
 - [ ] **T4.4 — Client action runner (parallel over mux)**
   - Depends on: T3.1, T2.1

@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// One live SSH session backed by a pty.
 struct Session {
@@ -242,10 +242,31 @@ async fn install_agent_on_host(
     agent_dir: Option<String>,
     pubkey_path: Option<String>,
 ) -> Result<install::InstallResult, String> {
+    // Resolve the agent binary dir: explicit param → env → bundled resource →
+    // source-tree dev fallback (<repo>/agent/bin) → home default.
+    let agent_dir = agent_dir
+        .or_else(|| std::env::var("PUPPETTERM_AGENT_DIR").ok().filter(|d| !d.is_empty()))
+        .or_else(|| {
+            app.path()
+                .resource_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .or_else(|| {
+            // dev: agent/bin sits next to the source tree (repo root)
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agent/bin");
+            if dir.join("puppetterm-agent-linux-amd64").exists()
+                || dir.join("puppetterm-agent-linux-arm64").exists()
+            {
+                Some(dir.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
     let app2 = app.clone();
     let host2 = host.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        install::install_agent(&host2, agent_dir, pubkey_path, &|line| {
+        install::install_agent(&host2, agent_dir.as_deref(), pubkey_path, &|line| {
             let _ = app2.emit(
                 "install-output",
                 InstallOutput { host: host2.clone(), data: line.to_string() },

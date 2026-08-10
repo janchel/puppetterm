@@ -587,8 +587,9 @@
     try {
       const res = await call<any>("install_agent_on_host", { host });
       term?.write(
-        `\r\n\x1b[32m[puppetterm install] done — ${res?.mode ?? "user"} install at ` +
-          `${res?.agent_path ?? "~/.puppetterm/bin/puppetterm-agent"}\x1b[0m\r\n`,
+        `\r\n\x1b[32m[puppetterm install] ${res?.already ? "already present —" : "done —"} ` +
+          `${res?.mode ?? "user"} agent at ${res?.agent_path ?? "~/.puppetterm/bin/puppetterm-agent"}` +
+          `\x1b[0m\r\n`,
       );
       loadActivity();
     } catch (e) {

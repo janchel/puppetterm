@@ -22,6 +22,7 @@ pub struct InstallResult {
     pub agent_path: String,
     pub mode: String, // "user" | "root"
     pub sudoers: bool,
+    pub already: bool, // agent was already present (idempotent re-run)
 }
 
 /// True if the agent binary is already reachable on the host (either the
@@ -120,7 +121,7 @@ fn resolve_installer(agent_dir: &Path) -> Option<PathBuf> {
 /// Install (or upgrade) the agent on `host`, streaming progress via `emit`.
 pub fn install_agent(
     host: &str,
-    agent_dir: Option<String>,
+    agent_dir: Option<&str>,
     pubkey_path: Option<String>,
     emit: &dyn Fn(&str),
 ) -> Result<InstallResult, String> {
@@ -134,9 +135,32 @@ pub fn install_agent(
     };
     emit(&format!("==> puppetterm-agent install on {host} ({machine})"));
 
+    // 1b) idempotency: if a full (root) agent is already installed, nothing to do.
+    let root_agent = "/usr/local/bin/puppetterm-agent";
+    if ssh_ok(host, &["test", "-x", root_agent]) {
+        emit(&format!(
+            "==> agent already installed at {root_agent} (root install) — nothing to do"
+        ));
+        return Ok(InstallResult {
+            host: host.to_string(),
+            arch: arch.to_string(),
+            agent_path: root_agent.into(),
+            mode: "root".into(),
+            sudoers: true,
+            already: true,
+        });
+    }
+    // If only the user-space agent exists, refresh it in place (idempotent).
+    let mut already = false;
+    if ssh_ok(host, &["test", "-x", "~/.puppetterm/bin/puppetterm-agent"]) {
+        already = true;
+        emit("==> agent already installed (user-space) — refreshing binary + config (idempotent)");
+    }
+
     // 2) local agent binary
     let home = std::env::var("HOME").unwrap_or_default();
     let dir = agent_dir
+        .map(|d| d.to_string())
         .or_else(|| std::env::var("PUPPETTERM_AGENT_DIR").ok())
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| format!("{home}/.puppetterm/agents"));
@@ -165,8 +189,12 @@ pub fn install_agent(
     let r_home = home_of(host)?;
     let user_agent = format!("{r_home}/.puppetterm/bin/puppetterm-agent");
 
-    // 4) install binary (user-space)
-    emit("==> installing binary (user-space)");
+    // 4) install/refresh binary (user-space)
+    emit(if already {
+        "==> refreshing binary (user-space)"
+    } else {
+        "==> installing binary (user-space)"
+    });
     ssh_io(host, &["mkdir", "-p", "~/.puppetterm/bin"], None, emit)?;
     ssh_io(host, &["cat", ">", "~/.puppetterm/bin/puppetterm-agent"], Some(&bin), &|_| {})?;
     ssh_io(host, &["chmod", "0755", "~/.puppetterm/bin/puppetterm-agent"], None, emit)?;
@@ -246,6 +274,7 @@ pub fn install_agent(
         },
         mode,
         sudoers,
+        already,
     })
 }
 

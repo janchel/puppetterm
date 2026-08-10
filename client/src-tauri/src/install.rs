@@ -291,7 +291,7 @@ mod tests {
             return;
         }
         let host = std::env::var("PUPPETTERM_TEST_HOST")
-            .unwrap_or_else(|_| "ubuntu@192.168.5.50".to_string());
+            .unwrap_or_else(|_| "user@host".to_string());
         let lines = std::cell::RefCell::new(Vec::<String>::new());
         let res = install_agent(&host, None, None, &|l| lines.borrow_mut().push(l.to_string()))
             .expect("install_agent");
@@ -309,7 +309,7 @@ mod tests {
             return;
         }
         let host = std::env::var("PUPPETTERM_TEST_HOST")
-            .unwrap_or_else(|_| "ubuntu@192.168.5.50".to_string());
+            .unwrap_or_else(|_| "user@host".to_string());
         assert!(check_agent(&host), "agent should be present after install");
     }
 }

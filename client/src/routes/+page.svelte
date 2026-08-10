@@ -289,7 +289,7 @@
   /** Reconstruct the visible text a user actually typed. `term.onData` gives
    *  RAW keystrokes — including backspaces and arrow-key escape sequences — so
    *  a corrected typo would otherwise leave a stray character in the buffer
-   *  (e.g. `ssh ubuntu2<BS>@host` must parse as `ubuntu@host`, NOT `ubuntu2@host`). */
+   *  (e.g. `ssh user2<BS>@host` must parse as `user@host`, NOT `user2@host`). */
   function cleanTyped(line: string): string {
     const out: string[] = [];
     let i = 0;
@@ -404,7 +404,7 @@
           const line = t.buf.slice(0, nl).trim();
           t.buf = t.buf.slice(nl + 1);
           // Apply backspaces / drop arrow-key sequences BEFORE parsing, so a
-          // corrected typo (e.g. `ubuntu2<BS>@host`) detects as `ubuntu@host`.
+          // corrected typo (e.g. `user2<BS>@host`) detects as `user@host`.
           const target = parseSshTarget(cleanTyped(line));
           if (target && target !== t.host) {
             // Set the host immediately, but DON'T check for the agent here —
@@ -782,7 +782,7 @@
   }
 
   /** Find an `ssh <target>` inside a DISPLAYED terminal line, e.g. the echo of
-   *  a command recalled from history: `devops@host:~$ ssh user@host`.
+   *  a command recalled from history: `user@box:~$ ssh user@host`.
    *  Returns the last match so the most recent command wins.
    *  `ssh` must appear right after a shell prompt ($, #, >) or at line start —
    *  prose like "…close the ssh connection…" must NOT be parsed as a target

@@ -37,10 +37,10 @@ function emitMock(event: string, payload: unknown) {
 function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
   switch (cmd) {
     case "list_ssh_hosts":
-      return Promise.resolve(["server1", "local-lab", "staging"] as T);
+      return Promise.resolve(["host-a", "host-b", "host-c"] as T);
     case "check_host":
-      // server1 + local-lab up, "staging" down (shows both dot states)
-      return Promise.resolve((args.host !== "staging") as T);
+      // host-a + host-b up, "host-c" down (shows both dot states)
+      return Promise.resolve((args.host !== "host-c") as T);
     case "start_ssh_session": {
       const id = mockNextId++;
       const host = String(args.host);
@@ -87,8 +87,8 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
     case "stop_agent_action":
       return Promise.resolve(true as T);
     case "check_agent":
-      // server1 has the agent; others don't (demo the install hint)
-      return Promise.resolve((args.host === "server1") as T);
+      // host-a has the agent; others don't (demo the install hint)
+      return Promise.resolve((args.host === "host-a") as T);
     case "install_agent_on_host": {
       const host = String(args.host ?? "");
       const steps = [
@@ -118,7 +118,7 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
         {
           id: 1,
           ts: "2026-08-10T10:00:01Z",
-          host: "server1",
+          host: "host-a",
           source: "ai",
           action: "snapshot",
           params: "{}",
@@ -129,7 +129,7 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
         {
           id: 2,
           ts: "2026-08-10T10:01:33Z",
-          host: "server1",
+          host: "host-a",
           source: "ai",
           action: "service",
           params: '{"unit":"nginx","op":"restart"}',
@@ -140,7 +140,7 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
         {
           id: 3,
           ts: "2026-08-10T10:02:10Z",
-          host: "server1",
+          host: "host-a",
           source: "user",
           action: "run",
           params: '{"cmd":"whoami"}',

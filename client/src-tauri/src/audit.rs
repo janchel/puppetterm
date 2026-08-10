@@ -135,8 +135,8 @@ mod tests {
         let db = dir.join("audit.db");
         std::env::set_var("PUPPETTERM_AUDIT_DB", &db);
 
-        record("server1", "ai", "service", Some("{\"unit\":\"nginx\",\"op\":\"restart\"}"), "approved", Some(0), Some("{\"exit\":0}")).unwrap();
-        record("server1", "user", "run", Some("{\"cmd\":\"ls\"}"), "auto", Some(0), Some("{\"exit\":0}")).unwrap();
+        record("host-a", "ai", "service", Some("{\"unit\":\"nginx\",\"op\":\"restart\"}"), "approved", Some(0), Some("{\"exit\":0}")).unwrap();
+        record("host-a", "user", "run", Some("{\"cmd\":\"ls\"}"), "auto", Some(0), Some("{\"exit\":0}")).unwrap();
 
         let rows = recent(10).unwrap();
         assert_eq!(rows.len(), 2);

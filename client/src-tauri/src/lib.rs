@@ -404,10 +404,12 @@ fn ensure_ssh_control_master() -> Result<(), String> {
 # the interactive `ssh user@host` you type here becomes the master socket;
 # puppetterm's automated ssh calls attach to it. Safe to edit or delete.
 Host *
-    # `yes` (not `auto`): the FIRST connection creates the master — that's the
-    # user's interactive ssh with the password. `auto` would only reuse, never
-    # create, so password remotes would never get a socket.
-    ControlMaster yes
+    # `auto`: create the master on the first connection (your interactive ssh
+    # with the password), ATTACH to it on later connections (no re-prompt), and
+    # fall back to a normal connection when the socket is stale — so repeated
+    # interactive ssh to a host never breaks. (`yes` instead DISABLES
+    # multiplexing when a socket exists and can break the next ssh.)
+    ControlMaster auto
     ControlPath ~/.ssh/puppetterm-mux/%r@%h:%p
     ControlPersist 600
     ServerAliveInterval 30
@@ -461,7 +463,7 @@ mod tests {
         );
 
         let ctl = std::fs::read_to_string(dir.join(".ssh/puppetterm-control")).unwrap();
-        assert!(ctl.contains("ControlMaster yes"), "master must be `yes` (auto only reuses)");
+        assert!(ctl.contains("ControlMaster auto"), "must be `auto` (create on first, attach on later, fall back on stale)");
         assert!(ctl.contains("ControlPath ~/.ssh/puppetterm-mux/%r@%h:%p"));
         assert!(
             dir.join(".ssh/puppetterm-mux").is_dir(),

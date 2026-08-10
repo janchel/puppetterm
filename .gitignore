@@ -1,19 +1,60 @@
-# Go
+# --- Go (agent) ---
 agent/bin/
 agent/dist/
+agent/coverage.out
 *.test
 *.out
 
-# Node / Tauri
+# --- Node / Svelte / Vite ---
 client/node_modules/
 client/dist/
-client/src-tauri/target/
+client/build/
+.svelte-kit/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
 
-# SSH mux control sockets
+# --- Rust / Tauri ---
+client/src-tauri/target/
+client/src-tauri/gen/schemas/
+client/src-tauri/gen/android/
+client/src-tauri/gen/apple/
+
+# --- Build artifacts / misc ---
+*.log
+*.tmp
+*.pid
+.DS_Store
+Thumbs.db
+
+# --- Editor / IDE ---
+.idea/
+*.swp
+*~
+
+# --- Secrets & config — NEVER commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+*.ppk
+id_rsa
+id_ed25519
+# AI provider config — the app stores it outside the repo at
+# ~/.config/puppetterm/ai.json (key encrypted at rest). If a copy ever ends
+# up in the tree, ignore it.
+ai.json
+puppetterm-ai.json
+
+# --- Local databases (audit log, etc.) ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# --- SSH control sockets ---
 *.control
 puppetterm-*.sock
 
-# Local db / secrets
-*.db
-*.db-journal
-.env

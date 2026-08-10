@@ -1,0 +1,195 @@
+AGENTIC REMOTE TERMINAL — SOLO DEVOPS/SYSADMIN TOOL
+Development Plan
+=====================================================
+
+OVERVIEW
+--------
+A lightweight desktop terminal app (like Warp) with a built-in AI chat panel
+that can manage remote Ubuntu servers over your existing SSH setup. The AI
+can read logs, check status, and install/configure software on your behalf —
+every state-changing action runs only after you approve it in the app.
+Built for a single operator (you), not a multi-user team tool.
+
+
+ARCHITECTURE — SSH-NATIVE, NO CUSTOM LISTENER
+-----------------------------------------------
+No central control-plane server is needed. Two components only:
+
+1. Desktop client (your machine)
+   - Terminal UI + chat box + AI options
+   - Reuses your existing SSH keys and ~/.ssh/config
+   - Connects to each managed server over native OpenSSH (port 22)
+   - Calls the Claude API directly to power the AI chat panel
+   - Orchestrates the agentic loop — all AI reasoning happens here
+
+2. Remote agent (installed on each managed Ubuntu server)
+   - Single small Go binary, e.g. /usr/local/bin/puppetterm-agent
+   - NO network listener, NO daemon — a CLI invoked through SSH
+   - Runs exactly one validated action per invocation, then exits
+   - Installed via .deb or static binary; no systemd unit needed
+
+Trust model is exactly SSH's — nothing custom to manage:
+   - Host trust:   known_hosts (trust-on-first-use, like SSH)
+   - Client auth:  your existing ~/.ssh keys / ssh-agent + authorized_keys
+   - Bootstrap:    ssh-copy-id
+
+This removes the custom TLS/mTLS, enrollment tokens, and certificate
+management entirely — the biggest source of custom security code is gone.
+
+Fits the use case because VPS/cloud instances almost always have a
+public/reachable IP and already run OpenSSH. Trade-off to remember: a
+machine behind NAT/firewall with no SSH reachability can't be managed —
+that would require a relay/control-plane server instead. Not a concern
+for the current VPS-based use case.
+
+
+AGENTIC AI MODEL — SESSION-BOUND, APPROVAL-GATED
+-------------------------------------------------
+The AI (Claude) never talks to the server directly. The desktop client is
+the orchestrator:
+
+   - Chat requests apply to the ACTIVE (focused) SSH session/host only.
+     The AI acts on the machine you are looking at — it never guesses a host.
+   - Claude sees the agent's typed actions as tools and decides which to call.
+   - The client opens an SSH exec channel and invokes:
+         puppetterm-agent <action> <json payload>
+   - The agent validates, executes, and streams output back as NDJSON events.
+   - Every action's output renders into the terminal pane, so nothing the AI
+     does happens invisibly.
+
+The loop:  user request → Claude plans tool calls → client gates
+state-changing calls behind an in-app approval → SSH exec → results stream
+to the terminal → fed back to Claude → next step or final answer.
+
+Approval model (your only interaction is Approve/Reject):
+   - Read-only actions (snapshot, log tail, status) → auto-run.
+   - State-changing actions (install, config write, start/restart) → ask
+     first: show the exact command, target host, and a live preview.
+   - Plan-then-approve: Claude proposes the whole multi-step plan up front;
+     you can approve the plan or switch to per-step approval. Per-step is
+     the default for anything touching state.
+
+Capability presets & extension:
+   - Enrollment picks a preset (e.g. a web-server preset grants /etc/nginx/
+     config writes plus scoped sudoers for apt/systemctl).
+   - If the AI needs a path/command outside current grants, the approval
+     prompt becomes "extend capability for this session?" — session-scoped
+     and logged, never a permanent widening.
+
+Two-layer safety:
+   - Client layer enforces autonomy (what may auto-run vs. what must be
+     approved).
+   - Server layer enforces capability (the agent only knows whitelisted
+     actions, only touches allow-listed paths, runs under scoped sudoers,
+     and its authorized_keys entry is locked via restrict,command=).
+
+Local audit log (SQLite) on the client records every action: timestamp,
+target agent, source (you or the AI), approval state, and result.
+
+
+AGENT CAPABILITIES (DEVOPS-SPECIFIC)
+--------------------------------------
+Rather than only exposing raw "run any shell command," the agent should
+expose a few typed, structured actions. This is safer and makes it much
+easier for the AI to reason about what it's doing:
+
+- Run command       — arbitrary shell exec, streamed output (gated escape
+                      hatch — never auto-run)
+- Log tail/stream    — chunked live log following, not a blind exec
+- Service control    — start/stop/restart/status for systemd units
+- Config file read/write — scoped to allow-listed paths only
+- System snapshot    — CPU/mem/disk/uptime on demand
+- Deploy hook (optional) — pull latest + restart a service
+
+
+CLIENT APP DESIGN
+-------------------
+Three-pane layout:
+
+  Left (narrow)   — Agent list: status dot + hostname per machine, click to
+                     switch which agent is active. This is also the host the
+                     AI chat binds to.
+  Center (wide)   — Real terminal (xterm.js), shows raw output whether typed
+                     by you or run by the AI. Approvals mirror here too.
+  Right (fixed)   — AI options (model picker, autonomy level) stacked above
+                     a chat box; approvals render inline next to the exact
+                     command being proposed.
+
+Transport — native OpenSSH (port 22), reusing your existing keys:
+  - Terminal pane: spawn the system ssh binary and wire its pty into xterm.js.
+  - Actions: SSH exec channels invoking puppetterm-agent per action; use
+    OpenSSH ControlMaster (or one persistent Go SSH client) so parallel
+    actions ride the same connection with near-zero overhead.
+  - Host key verification comes from known_hosts; if using Go's
+    golang.org/x/crypto/ssh, use the knownhosts package — never disable it.
+  - Parse ~/.ssh/config so host aliases, ProxyJump, and custom ports work
+    exactly as you already use them.
+
+Recommended tech stack:
+  - Client shell:     Tauri (Rust + web frontend) — lightweight vs Electron
+  - Terminal render:  xterm.js — themeable, well supported
+  - Remote agent:     Go — single static binary, easy cross-compile for
+                       linux/amd64 + linux/arm64 (Ubuntu target)
+  - SSH:               system ssh for the terminal pty; golang.org/x/crypto/ssh
+                       (or ControlMaster) for structured actions
+  - AI:                Claude API called directly from the client, with
+                       the agent's structured actions exposed as tools
+  - Local storage:    SQLite for audit log and agent registry
+
+Autonomy default (important safety decision):
+  - Read-only actions (log tail, status, snapshot) → auto-run
+  - State-changing actions (restart, deploy, file write, install) → ask first
+  - Run command (arbitrary shell) → always ask
+
+Ubuntu hardening:
+  - Scoped sudoers NOPASSWD for exactly the commands the agent needs
+    (apt, systemctl, tail, ...) — never blanket root.
+  - Dedicated authorized_keys entry: restrict,command="puppetterm-agent ..."
+    so a leaked key can only invoke the agent, never a shell.
+  - Agent install via .deb or static binary; no daemon, no open ports.
+  - Agent-side append-only log of executed actions, so a compromised client
+    cannot rewrite history.
+
+
+BUILD ROADMAP
+---------------
+1. Go agent MVP
+   CLI-style binary (no listener): reads one action + JSON from stdin,
+   streams NDJSON results to stdout. "Run command" + "system snapshot"
+   first. Test manually against one VPS before scripting provisioning.
+
+2. Provisioning & distribution
+   Bootstrap via ssh-copy-id; install puppetterm-agent from a .deb or static
+   binary; apply scoped sudoers + restrict,command= authorized_keys.
+   Cross-compile for linux/amd64 and linux/arm64.
+
+3. Tauri client shell
+   Terminal pane (xterm.js) wired to the system ssh pty; parse ~/.ssh/config
+   so hosts appear as aliases; agent list with status dots. Add a host by
+   alias and confirm the full pipe works manually before adding any AI.
+
+4. Structured agent actions
+   Add service control, log tail, and system snapshot as distinct typed
+   actions alongside raw exec; invoke over SSH exec channels with
+   ControlMaster connection reuse.
+
+5. Agentic AI chat panel
+   Session-bound tool loop: Claude plans → client gates → approvals inline
+   (plan-then-approve, per-step default) → results stream into the terminal.
+   Add autonomy level and capability presets.
+
+6. Local audit log and polish
+   SQLite log of every action (source, agent, timestamp, approval). Terminal
+   themes, status indicators, and general UI polish.
+
+
+NOTES FOR LATER (NOT NEEDED NOW)
+-----------------------------------
+- A shared control-plane server would only become necessary if this ever
+  needs to support more than one operator/device managing the same fleet.
+- A resident (long-running) agent process on the server — instead of the
+  stateless per-action CLI — is possible over a persistent SSH session, but
+  unnecessary for a solo tool: stateless is simpler, safer, and debuggable
+  by running the agent manually on the box.
+- Everything in this plan intentionally avoids that complexity for the
+  current solo-operator use case.

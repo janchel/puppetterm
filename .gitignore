@@ -1,0 +1,19 @@
+# Go
+agent/bin/
+agent/dist/
+*.test
+*.out
+
+# Node / Tauri
+client/node_modules/
+client/dist/
+client/src-tauri/target/
+
+# SSH mux control sockets
+*.control
+puppetterm-*.sock
+
+# Local db / secrets
+*.db
+*.db-journal
+.env

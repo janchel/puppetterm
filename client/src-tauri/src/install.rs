@@ -29,11 +29,7 @@ pub struct InstallResult {
 /// user-space or the system-wide path).
 pub fn check_agent(host: &str) -> bool {
     let out = Command::new("ssh")
-        .args([
-            "-o", "BatchMode=yes",
-            "-o", "ControlMaster=auto",
-            "-o", "ConnectTimeout=8",
-        ])
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
         .arg(host)
         .args([
             "test", "-x", "~/.puppetterm/bin/puppetterm-agent", "-o", "-x",
@@ -52,13 +48,7 @@ fn ssh_io(
     emit: &dyn Fn(&str),
 ) -> Result<(i32, String), String> {
     let mut cmd = Command::new("ssh");
-    // ControlMaster=auto: reuse the user's interactive (possibly password-only)
-    // connection when a master socket exists.
-    cmd.args([
-        "-o", "BatchMode=yes",
-        "-o", "ControlMaster=auto",
-        "-o", "ConnectTimeout=10",
-    ]);
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
     cmd.arg(host).args(remote);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn ssh: {e}"))?;

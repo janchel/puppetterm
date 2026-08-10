@@ -193,8 +193,11 @@
   ];
 
   function isDangerous(tool: string, args: Record<string, unknown>): boolean {
-    if (tool === "run_command") {
-      const cmd = String(args.cmd ?? "");
+    if (tool === "run_command" || tool === "terminal") {
+      const cmd =
+        tool === "run_command"
+          ? String(args.cmd ?? "")
+          : String(args.command ?? "");
       return DANGEROUS_PATTERNS.some((re) => re.test(cmd));
     }
     return false;
@@ -202,15 +205,19 @@
 
   const SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
-    "using the provided tools. Prefer the structured tools (service/log/config/snapshot) over " +
-    "run_command. To see what is currently on the terminal screen, use read_terminal — this is " +
-    "the live view of the active session, NOT the shell history file (~/.bash_history is a " +
-    "separate concern and does not reflect the current terminal). State-changing actions are " +
-    "approved by the user before execution; you will be told if one is rejected. Be concise " +
-    "and summarize tool results for the user.";
+    "using the provided tools. To RUN a command, prefer the `terminal` tool: it types the " +
+    "command into the live terminal (the user sees exactly what runs) and returns the output — " +
+    "this works on ANY host, including password-only ones. The structured tools " +
+    "(service/log/config/snapshot) give cleaner results on key-based hosts when available. " +
+    "Use `read_terminal` to see the current terminal screen — this is the live view of the " +
+    "active session, NOT the shell history file (~/.bash_history is a separate concern and does " +
+    "not reflect the current terminal). State-changing actions are approved by the user before " +
+    "execution; you will be told if one is rejected. Be concise and summarize tool results for " +
+    "the user.";
 
   const AGENT_TOOLS = [
     { type: "function", function: { name: "run_command", description: "Run an arbitrary shell command on the active host (always approved first).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
+    { type: "function", function: { name: "terminal", description: "Run a command directly in the current terminal by typing it (like a human) and wait for the output to settle. Works on ANY host, including password-only ones; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
     { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "service", description: "Control a systemd service on the active host.", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
     { type: "function", function: { name: "log", description: "Tail a log file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
@@ -605,8 +612,20 @@
       return op === "status" || op === "is-active" || op === "is-enabled";
     }
     if (tool === "config") return args.op === "read";
+    if (tool === "terminal") {
+      const cmd = String(args.command ?? "").trim().replace(/^sudo\s+/, "");
+      const first = cmd.split(/\s+/)[0] ?? "";
+      return READONLY_CMDS.includes(first);
+    }
     return false; // run_command and anything else asks
   }
+
+  // Commands that don't change state — the `terminal` tool auto-runs these.
+  const READONLY_CMDS = [
+    "ls", "cat", "pwd", "whoami", "echo", "head", "tail", "grep", "df", "free",
+    "ps", "uptime", "uname", "hostname", "date", "id", "which", "find", "stat",
+    "du", "env", "printenv", "true", "ip", "ss", "mount", "history",
+  ];
 
   async function saveAiConfig() {
     try {
@@ -903,6 +922,43 @@
     return lines.join("\n");
   }
 
+  /** Type a command into the LIVE terminal (like a human) and wait for the
+   *  output to settle, then hand the visible result back to the AI. Works on
+   *  any connection — key or password — because it rides the user's real pty. */
+  async function runInTerminal(host: string | null, term: Terminal | null, cmd: string) {
+    const tabId = chatTarget?.tabId ?? activeTabId;
+    const t = tabId != null ? tabs.find((x) => x.id === tabId) : null;
+    if (!term || !t || t.sessionId == null) {
+      return { error: "no active terminal session to type into" };
+    }
+    // Show what the AI is doing, then type the command + Enter into the pty.
+    term.write(`\r\n\x1b[36m[puppetterm] AI types: ${cmd}\x1b[0m\r\n`);
+    await call("write_ssh_input", { id: t.sessionId, data: cmd });
+    await call("write_ssh_input", { id: t.sessionId, data: "\r" });
+    // Wait for output to stop changing (or a 30s cap), then return the tail.
+    const deadline = Date.now() + 30000;
+    let last = terminalText(term, 2000);
+    let stableSince = Date.now();
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      const nowText = terminalText(term, 2000);
+      if (nowText === last) {
+        if (Date.now() - stableSince > 800) break;
+      } else {
+        last = nowText;
+        stableSince = Date.now();
+      }
+    }
+    const lines = terminalText(term, 2000).split("\n");
+    const output = lines.slice(-60).join("\n").slice(-6000);
+    return {
+      host: host || null,
+      note: "typed into the live terminal and waited for the output to settle",
+      command: cmd,
+      output,
+    };
+  }
+
   async function executeTool(tc: { id: string; function: { name: string; arguments: string } }) {
     const name = tc.function.name;
     const args = safeParse(tc.function.arguments);
@@ -924,6 +980,14 @@
         note: "live terminal screen (not shell history)",
         terminal: text.slice(-8000),
       };
+    }
+
+    // Type a command into the live terminal and wait for output. Works on any
+    // host (key OR password) because it uses the user's actual pty session.
+    if (name === "terminal") {
+      const cmd = String(args.command ?? "").trim();
+      if (!cmd) return { error: "no command given" };
+      return await runInTerminal(host, term, cmd);
     }
 
     // Tools that run on the remote host need an ssh target.

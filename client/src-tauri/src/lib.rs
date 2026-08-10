@@ -231,13 +231,9 @@ fn stop_agent_action(request_id: String, host: Option<String>) -> bool {
     if let Some(h) = host {
         let user = h.split('@').next().unwrap_or_default();
         let mut cmd = std::process::Command::new("ssh");
-        cmd.args([
-            "-o", "BatchMode=yes",
-            "-o", "ControlMaster=auto",
-            "-o", "ConnectTimeout=5",
-        ])
-        .arg(&h)
-        .arg("pkill");
+        cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+            .arg(&h)
+            .arg("pkill");
         if !user.is_empty() {
             cmd.args(["-TERM", "-u", user, "-f", "puppetterm-agent"]);
         } else {
@@ -264,9 +260,6 @@ async fn install_agent_on_host(
     agent_dir: Option<String>,
     pubkey_path: Option<String>,
 ) -> Result<install::InstallResult, String> {
-    // Make sure ControlMaster sharing is enabled so install works over the
-    // user's interactive (possibly password-only) connection.
-    let _ = ensure_ssh_control_master();
     // Resolve the agent binary dir: explicit param → env → source-tree
     // agent/bin (dev: `make cross` output) → bundled resource dir (packaged
     // builds) → home default.
@@ -381,61 +374,6 @@ async fn ai_chat(
     ai::chat_completion(&cfg, messages, tools, Some(4096)).await
 }
 
-/// Idempotently enable ssh ControlMaster sharing so password-only remotes work:
-/// the user's interactive `ssh user@host` (password typed in the terminal)
-/// becomes the multiplexed master connection; puppetterm's automated ssh calls
-/// attach to it and skip re-authentication (no key needed).
-///
-/// Writes `~/.ssh/puppetterm-control` and `Include`s it from `~/.ssh/config`
-/// (creating both if missing). Best-effort; safe to edit/delete either file.
-fn ensure_ssh_control_master() -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME unset".to_string())?;
-    let ssh_dir = std::path::Path::new(&home).join(".ssh");
-    let extra = ssh_dir.join("puppetterm-control");
-    let main = ssh_dir.join("config");
-    std::fs::create_dir_all(&ssh_dir).map_err(|e| e.to_string())?;
-    // ssh does NOT create the ControlPath parent dir; the master would fail to
-    // listen without it.
-    std::fs::create_dir_all(ssh_dir.join("puppetterm-mux")).map_err(|e| e.to_string())?;
-    std::fs::write(
-        &extra,
-        r#"# puppetterm: share one authenticated connection per host (ControlMaster).
-# Lets password-only remotes (no local key) work for agent install/actions:
-# the interactive `ssh user@host` you type here becomes the master socket;
-# puppetterm's automated ssh calls attach to it. Safe to edit or delete.
-Host *
-    # `auto`: create the master on the first connection (your interactive ssh
-    # with the password), ATTACH to it on later connections (no re-prompt), and
-    # fall back to a normal connection when the socket is stale — so repeated
-    # interactive ssh to a host never breaks. (`yes` instead DISABLES
-    # multiplexing when a socket exists and can break the next ssh.)
-    ControlMaster auto
-    ControlPath ~/.ssh/puppetterm-mux/%r@%h:%p
-    ControlPersist 600
-    ServerAliveInterval 30
-"#,
-    )
-    .map_err(|e| e.to_string())?;
-    let include = format!("Include {}", extra.display());
-    let body = std::fs::read_to_string(&main).unwrap_or_default();
-    // The Include MUST be at the TOP of the main config: OpenSSH has a quirk
-    // where an Include placed after a `Host` block makes the included `Host *`
-    // stop matching non-alias targets (e.g. `isr@192.168.150.22` got
-    // controlmaster=false while the `server1` alias got true). Drop any
-    // existing (possibly mis-positioned) occurrence, then prepend once.
-    let filtered: Vec<&str> = body.lines().filter(|l| l.trim() != include.trim()).collect();
-    let merged = if filtered.is_empty() {
-        format!("{include}\n")
-    } else {
-        format!("{include}\n{}\n", filtered.join("\n").trim_end())
-    };
-    std::fs::write(&main, merged).map_err(|e| e.to_string())?;
-    // Clean up stale/broken master sockets in the background — never blocks
-    // startup or install.
-    std::thread::spawn(cleanup_stale_masters);
-    Ok(())
-}
-
 /// Run a command; return true if it exits 0 within `ms` (killed on timeout).
 fn run_with_timeout(args: &[&str], ms: u64) -> bool {
     use std::time::{Duration, Instant};
@@ -525,49 +463,6 @@ fn cleanup_stale_masters() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// ensure_ssh_control_master is idempotent and writes the expected layout.
-    #[test]
-    fn ssh_control_master_config_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!("puppetterm-ctl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("HOME", &dir);
-
-        // Existing user config should be preserved, Include appended once.
-        let main = dir.join(".ssh/config");
-        std::fs::create_dir_all(dir.join(".ssh")).unwrap();
-        std::fs::write(&main, "Host server1\n    User ubuntu\n").unwrap();
-
-        ensure_ssh_control_master().unwrap();
-        ensure_ssh_control_master().unwrap(); // second run must not duplicate
-
-
-        let body = std::fs::read_to_string(&main).unwrap();
-        let inc = format!("Include {}/.ssh/puppetterm-control", dir.display());
-        assert!(body.contains("Host server1"), "existing config preserved");
-        assert_eq!(body.matches(&inc).count(), 1, "Include added exactly once");
-        assert!(
-            body.trim_start().starts_with(&inc),
-            "Include must be at the TOP (a trailing Include breaks `Host *` matching)"
-        );
-
-        let ctl = std::fs::read_to_string(dir.join(".ssh/puppetterm-control")).unwrap();
-        assert!(ctl.contains("ControlMaster auto"), "must be `auto` (create on first, attach on later, fall back on stale)");
-        assert!(ctl.contains("ControlPath ~/.ssh/puppetterm-mux/%r@%h:%p"));
-        assert!(
-            dir.join(".ssh/puppetterm-mux").is_dir(),
-            "ControlPath parent dir must exist (ssh won't create it)"
-        );
-
-        std::env::remove_var("HOME");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -575,9 +470,8 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::default())
         .setup(|_app| {
-            // Best-effort: enable ControlMaster sharing up-front so a
-            // password-authenticated interactive ssh can back agent actions.
-            let _ = ensure_ssh_control_master();
+            // Clean up any leftover ControlMaster sockets from the old approach.
+            std::thread::spawn(cleanup_stale_masters);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

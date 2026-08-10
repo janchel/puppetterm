@@ -1601,6 +1601,16 @@
     padding: 7px 10px;
     font-size: 13px;
   }
+  /* Force dark form controls + dark dropdown panel. Without `color-scheme`
+     WebKitGTK renders the native <select> popup with the LIGHT system theme,
+     so the white option text becomes invisible on a white panel. */
+  .modal-field select {
+    color-scheme: dark;
+  }
+  .modal-field option {
+    background-color: #0d1117;
+    color: #e6edf3;
+  }
   .modal-field input:focus,
   .modal-field select:focus {
     outline: 1px solid #1f6feb;

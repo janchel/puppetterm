@@ -47,12 +47,45 @@
   });
   let resizing = $state(false);
 
-  // ---- AI integration (OpenAI-compatible) --------------------------------
+  // ---- AI integration (multi-provider) ----------------------------------
   let aiBaseUrl = $state("");
   let aiModel = $state("");
+  let aiProvider = $state("openai");
   let aiKey = $state("");
   let aiHasKey = $state(false);
   let aiReady = $state(false);
+
+  // Provider presets: predefined endpoint + default models.
+  const AI_PROVIDERS: Record<
+    string,
+    { label: string; baseUrl: string; model: string; models: string[] }
+  > = {
+    openai: {
+      label: "Custom (OpenAI-compatible)",
+      baseUrl: "",
+      model: "",
+      models: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "jandelcombo"],
+    },
+    deepseek: {
+      label: "DeepSeek",
+      baseUrl: "https://api.deepseek.com/v1",
+      model: "deepseek-chat",
+      models: ["deepseek-chat", "deepseek-reasoner"],
+    },
+    anthropic: {
+      label: "Claude (Anthropic)",
+      baseUrl: "https://api.anthropic.com/v1",
+      model: "claude-sonnet-4-20250514",
+      models: ["claude-sonnet-4-20250514", "claude-3-5-haiku-latest", "claude-opus-4-20250514"],
+    },
+  };
+
+  function applyAiProvider(p: string) {
+    aiProvider = p;
+    const preset = AI_PROVIDERS[p];
+    if (preset && preset.baseUrl) aiBaseUrl = preset.baseUrl;
+    if (preset?.model) aiModel = preset.model;
+  }
   let chatBusy = $state(false);
   let aiThinking = $state(false);
   let chatText = $state("");
@@ -493,11 +526,17 @@
 
   async function saveAiConfig() {
     try {
-      await call("set_ai_config", { baseUrl: aiBaseUrl, model: aiModel, apiKey: aiKey });
+      await call("set_ai_config", {
+        baseUrl: aiBaseUrl,
+        model: aiModel,
+        provider: aiProvider,
+        apiKey: aiKey,
+      });
       aiKey = "";
       const v = await call<any>("get_ai_config");
       aiBaseUrl = v.base_url;
       aiModel = v.model;
+      aiProvider = v.provider ?? "openai";
       aiHasKey = v.has_api_key;
       aiReady = true;
       pushChat("ai", "(AI settings saved)");
@@ -843,6 +882,7 @@
         const v = await call<any>("get_ai_config");
         aiBaseUrl = v.base_url;
         aiModel = v.model;
+        aiProvider = v.provider ?? "openai";
         aiHasKey = v.has_api_key;
         aiReady = true;
         history = [{ role: "system", content: SYSTEM_PROMPT }];
@@ -1083,19 +1123,35 @@
 
         <div class="modal-section">AI model</div>
         <label class="modal-field">
+          AI provider
+          <select
+            value={aiProvider}
+            onchange={(e) => applyAiProvider((e.currentTarget as HTMLSelectElement).value)}
+          >
+            {#each Object.entries(AI_PROVIDERS) as [key, p] (key)}
+              <option value={key}>{p.label}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="modal-field">
           Endpoint
           <input bind:value={aiBaseUrl} placeholder="http://host:port/v1" />
         </label>
         <label class="modal-field">
           Model
-          <input bind:value={aiModel} placeholder="model-name" />
+          <input bind:value={aiModel} placeholder="model-name" list="ai-model-list" />
+          <datalist id="ai-model-list">
+            {#each AI_PROVIDERS[aiProvider]?.models ?? [] as m (m)}
+              <option value={m}></option>
+            {/each}
+          </datalist>
         </label>
         <label class="modal-field">
           API key
           <input
             bind:value={aiKey}
             type="password"
-            placeholder={aiHasKey ? "••• (set) — type to replace" : "sk-…"}
+            placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
           />
         </label>
         <label class="modal-field">

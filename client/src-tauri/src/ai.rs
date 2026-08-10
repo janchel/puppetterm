@@ -1,19 +1,44 @@
-//! AI client — OpenAI-compatible chat completions with tool/function calling.
+//! AI client — multi-provider chat completions with tool/function calling.
 //!
-//! Config (base_url, api_key, model) lives in `~/.config/puppetterm/ai.json`
-//! (outside the repo) or in the PUPPETTERM_AI_* environment variables. The API
-//! key never crosses into the frontend.
+//! Providers:
+//!   openai    — custom OpenAI-compatible endpoint (any provider/model)
+//!   deepseek  — DeepSeek's OpenAI-compatible endpoint
+//!   anthropic — Claude via the Anthropic Messages API
+//!
+//! Config (provider, base_url, model, encrypted api_key) lives in
+//! `~/.config/puppetterm/ai.json` (outside the repo) or in the PUPPETTERM_AI_*
+//! environment variables. The API key is **encrypted at rest** (ChaCha20-Poly1305
+//! keyed from the machine id) and never crosses into the frontend.
 
 use std::path::PathBuf;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
 use serde::{Deserialize, Serialize};
 
-/// AI provider config, stored on disk (never committed).
+pub const PROVIDER_OPENAI: &str = "openai"; // custom OpenAI-compatible
+pub const PROVIDER_DEEPSEEK: &str = "deepseek";
+pub const PROVIDER_ANTHROPIC: &str = "anthropic";
+
+fn default_provider() -> String {
+    PROVIDER_OPENAI.to_string()
+}
+
+/// AI provider config, stored on disk (never committed). `api_key` is the
+/// decrypted key in memory only; `api_key_enc` is what lives on disk.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AiConfig {
     pub base_url: String,
-    pub api_key: String,
     pub model: String,
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(skip_serializing, default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_key_enc: Option<String>,
 }
 
 /// Non-secret view of the config for the settings UI.
@@ -21,8 +46,55 @@ pub struct AiConfig {
 pub struct AiConfigView {
     pub base_url: String,
     pub model: String,
+    pub provider: String,
     pub has_api_key: bool,
 }
+
+// ---- encrypted key storage -------------------------------------------------
+
+/// 32-byte key derived from the machine identity (protects the key file at
+/// rest; a fully compromised machine is out of scope).
+fn machine_key() -> Result<[u8; 32], String> {
+    let id = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()))
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .ok_or_else(|| "cannot derive machine key (no machine-id)".to_string())?;
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"puppetterm-ai-key-v1");
+    h.update(id.as_bytes());
+    Ok(h.finalize().into())
+}
+
+fn encrypt_key(plain: &str) -> Result<String, String> {
+    let key = machine_key()?;
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("rng: {e}"))?;
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plain.as_bytes())
+        .map_err(|_| "encryption failed".to_string())?;
+    let mut out = nonce_bytes.to_vec();
+    out.extend_from_slice(&ct);
+    Ok(B64.encode(&out))
+}
+
+fn decrypt_key(enc: &str) -> Result<String, String> {
+    let data = B64.decode(enc).map_err(|e| format!("bad encoded key: {e}"))?;
+    if data.len() < 12 {
+        return Err("key too short".into());
+    }
+    let (nonce, ct) = data.split_at(12);
+    let key = machine_key()?;
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
+    let pt = cipher
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|_| "cannot decrypt api key".to_string())?;
+    String::from_utf8(pt).map_err(|_| "key is not utf8".into())
+}
+
+// ---- config load/save ------------------------------------------------------
 
 pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("PUPPETTERM_AI_CONFIG") {
@@ -36,20 +108,37 @@ pub fn load_config() -> Result<AiConfig, String> {
     let env_key = std::env::var("PUPPETTERM_AI_API_KEY").ok();
     let env_base = std::env::var("PUPPETTERM_AI_BASE_URL").ok();
     let env_model = std::env::var("PUPPETTERM_AI_MODEL").ok();
+    let env_provider = std::env::var("PUPPETTERM_AI_PROVIDER").ok();
     if let (Some(base_url), Some(api_key), Some(model)) = (&env_base, &env_key, &env_model) {
-        return Ok(AiConfig { base_url: base_url.clone(), api_key: api_key.clone(), model: model.clone() });
+        return Ok(AiConfig {
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            model: model.clone(),
+            provider: env_provider.unwrap_or_else(default_provider),
+            api_key_enc: None,
+        });
     }
     let data = std::fs::read_to_string(config_path())
         .map_err(|e| format!("AI config not found: {e} (set PUPPETTERM_AI_* or create {})", config_path().display()))?;
-    serde_json::from_str(&data).map_err(|e| format!("invalid AI config: {e}"))
+    let mut cfg: AiConfig = serde_json::from_str(&data).map_err(|e| format!("invalid AI config: {e}"))?;
+    // Decrypt the stored key; legacy plaintext `api_key` field also loads.
+    if let Some(enc) = &cfg.api_key_enc {
+        cfg.api_key = decrypt_key(enc).unwrap_or_default();
+    }
+    Ok(cfg)
 }
 
 pub fn save_config(cfg: &AiConfig) -> Result<(), String> {
+    let mut out = cfg.clone();
+    if !out.api_key.is_empty() {
+        out.api_key_enc = Some(encrypt_key(&out.api_key)?);
+    }
+    out.api_key = String::new(); // never write the plaintext key to disk
     let path = config_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let data = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let data = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
     std::fs::write(&path, data).map_err(|e| e.to_string())
 }
 
@@ -130,8 +219,23 @@ struct ChatRequest {
     max_tokens: Option<u32>,
 }
 
-/// Call the OpenAI-compatible chat completions endpoint.
+/// Call the configured provider's chat completions endpoint (OpenAI-compatible
+/// for openai/deepseek, Anthropic Messages for anthropic/claude).
 pub async fn chat_completion(
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<ToolDef>>,
+    max_tokens: Option<u32>,
+) -> Result<ChatResponse, String> {
+    if cfg.provider == PROVIDER_ANTHROPIC {
+        anthropic_completion(cfg, messages, tools, max_tokens).await
+    } else {
+        openai_completion(cfg, messages, tools, max_tokens).await
+    }
+}
+
+/// Call an OpenAI-compatible `/chat/completions` endpoint (custom + DeepSeek).
+async fn openai_completion(
     cfg: &AiConfig,
     messages: Vec<ChatMessage>,
     tools: Option<Vec<ToolDef>>,
@@ -171,9 +275,252 @@ pub async fn chat_completion(
     })
 }
 
+// ---- Anthropic (Claude) Messages API ---------------------------------------
+
+#[derive(Serialize)]
+struct AnthropicRequest {
+    model: String,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    messages: Vec<AnthropicMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicTool>>,
+}
+
+#[derive(Serialize)]
+struct AnthropicMessage {
+    role: String, // "user" | "assistant"
+    content: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct AnthropicBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicBlock>,
+    stop_reason: Option<String>,
+}
+
+/// Convert the app's OpenAI-style history into Anthropic messages + system.
+/// Tool results are grouped into a single trailing `user` message with
+/// `tool_result` blocks (Anthropic requires this right after tool_use).
+fn to_anthropic(messages: &[ChatMessage]) -> (Option<String>, Vec<AnthropicMessage>) {
+    let mut system: Vec<String> = Vec::new();
+    let mut out: Vec<AnthropicMessage> = Vec::new();
+    let mut pending_results: Vec<serde_json::Value> = Vec::new();
+
+    let flush_results = |out: &mut Vec<AnthropicMessage>, pending: &mut Vec<serde_json::Value>| {
+        if !pending.is_empty() {
+            let blocks = std::mem::take(pending);
+            out.push(AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!(blocks),
+            });
+        }
+    };
+
+    for m in messages {
+        match m.role {
+            Role::System => {
+                if let Some(c) = &m.content {
+                    system.push(c.clone());
+                }
+            }
+            Role::User => {
+                flush_results(&mut out, &mut pending_results);
+                if let Some(c) = &m.content {
+                    out.push(AnthropicMessage {
+                        role: "user".into(),
+                        content: serde_json::Value::String(c.clone()),
+                    });
+                }
+            }
+            Role::Assistant => {
+                flush_results(&mut out, &mut pending_results);
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                if let Some(c) = &m.content {
+                    blocks.push(serde_json::json!({"type": "text", "text": c}));
+                }
+                if let Some(tcs) = &m.tool_calls {
+                    for tc in tcs {
+                        let input = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                            .unwrap_or(serde_json::Value::Null);
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "input": input,
+                        }));
+                    }
+                }
+                if !blocks.is_empty() {
+                    out.push(AnthropicMessage {
+                        role: "assistant".into(),
+                        content: serde_json::Value::Array(blocks),
+                    });
+                }
+            }
+            Role::Tool => {
+                pending_results.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.content.clone().unwrap_or_default(),
+                }));
+            }
+        }
+    }
+    flush_results(&mut out, &mut pending_results);
+
+    let system = if system.is_empty() {
+        None
+    } else {
+        Some(system.join("\n\n"))
+    };
+    (system, out)
+}
+
+/// Call the Anthropic Messages API and normalize the response to the shared
+/// OpenAI-style ChatResponse so the frontend is provider-agnostic.
+async fn anthropic_completion(
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<ToolDef>>,
+    max_tokens: Option<u32>,
+) -> Result<ChatResponse, String> {
+    let url = format!("{}/messages", cfg.base_url.trim_end_matches('/'));
+    let (system, amessages) = to_anthropic(&messages);
+    let atools = tools.map(|ts| {
+        ts.into_iter()
+            .map(|t| AnthropicTool {
+                name: t.function.name,
+                description: t.function.description,
+                input_schema: t.function.parameters,
+            })
+            .collect::<Vec<_>>()
+    });
+    let body = AnthropicRequest {
+        model: cfg.model.clone(),
+        max_tokens: max_tokens.unwrap_or(4096),
+        system,
+        messages: amessages,
+        tools: atools,
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .post(&url)
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("AI request failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let snippet = text.chars().take(500).collect::<String>();
+        return Err(format!("AI API {status}: {snippet}"));
+    }
+    let parsed: AnthropicResponse = serde_json::from_str(&text).map_err(|e| {
+        let snippet = text.chars().take(300).collect::<String>();
+        format!("Anthropic response parse error: {e}: {snippet}")
+    })?;
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    for b in parsed.content {
+        if b.kind == "text" {
+            if let Some(t) = b.text {
+                content.push_str(&t);
+            }
+        } else if b.kind == "tool_use" {
+            if let (Some(id), Some(name)) = (b.id, b.name) {
+                let args = b
+                    .input
+                    .map(|i| serde_json::to_string(&i).unwrap_or_default())
+                    .unwrap_or_default();
+                tool_calls.push(ToolCall {
+                    id,
+                    kind: "function".into(),
+                    function: ToolCallFunction { name, arguments: args },
+                });
+            }
+        }
+    }
+    let finish_reason = match parsed.stop_reason.as_deref() {
+        Some("tool_use") => Some("tool_calls".into()),
+        _ => Some("stop".into()),
+    };
+    Ok(ChatResponse {
+        id: None,
+        choices: vec![ChatChoice {
+            index: Some(0),
+            finish_reason,
+            message: Some(ChatMessage {
+                role: Role::Assistant,
+                content: if content.is_empty() { None } else { Some(content) },
+                tool_call_id: None,
+                tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            }),
+        }],
+        usage: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypt_roundtrip() {
+        let plain = "sk-test-12345-abcdef";
+        let enc = encrypt_key(plain).expect("encrypt");
+        assert_ne!(enc, plain, "encrypted value must differ from plaintext");
+        assert_eq!(decrypt_key(&enc).expect("decrypt"), plain);
+    }
+
+    #[test]
+    fn config_encrypts_key_at_rest() {
+        let path = std::env::temp_dir().join(format!("puppetterm-ai-test-{}.json", std::process::id()));
+        std::env::set_var("PUPPETTERM_AI_CONFIG", path.to_string_lossy().into_owned());
+        let cfg = AiConfig {
+            base_url: "http://example/v1".into(),
+            model: "m".into(),
+            provider: PROVIDER_OPENAI.into(),
+            api_key: "sk-super-secret-xyz".into(),
+            api_key_enc: None,
+        };
+        save_config(&cfg).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read file");
+        assert!(!raw.contains("sk-super-secret-xyz"), "plaintext key leaked into file: {raw}");
+        assert!(raw.contains("api_key_enc"), "encrypted key missing from file: {raw}");
+        let loaded = load_config().expect("load");
+        assert_eq!(loaded.api_key, "sk-super-secret-xyz", "decrypted key mismatch");
+        let _ = std::fs::remove_file(&path);
+        std::env::remove_var("PUPPETTERM_AI_CONFIG");
+    }
 
     // Live test against the configured endpoint. Skipped unless
     // PUPPETTERM_TEST_AI=1.

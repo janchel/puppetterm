@@ -299,34 +299,56 @@ fn audit_recent(limit: Option<i64>) -> Result<Vec<audit::AuditRow>, String> {
     audit::recent(limit.unwrap_or(50))
 }
 
-/// Return the AI provider config (endpoint + model + whether a key is set).
-/// The API key itself is never returned to the frontend.
+/// Return the AI provider config (provider + endpoint + model + whether a key
+/// is set). The API key itself is never returned to the frontend.
 #[tauri::command]
 fn get_ai_config() -> Result<ai::AiConfigView, String> {
     let cfg = ai::load_config()?;
     Ok(ai::AiConfigView {
         base_url: cfg.base_url,
         model: cfg.model,
+        provider: cfg.provider,
         has_api_key: !cfg.api_key.is_empty(),
     })
 }
 
 /// Update the AI provider config on disk (key optional — kept if blank).
+/// The key is encrypted at rest (ChaCha20-Poly1305, machine-bound).
 #[tauri::command]
 fn set_ai_config(
     base_url: String,
     model: String,
+    provider: Option<String>,
     api_key: Option<String>,
 ) -> Result<(), String> {
     let mut cfg = match ai::load_config() {
         Ok(c) => c,
-        Err(_) => ai::AiConfig { base_url: String::new(), api_key: String::new(), model: String::new() },
+        Err(_) => ai::AiConfig {
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            provider: ai::PROVIDER_OPENAI.into(),
+            api_key_enc: None,
+        },
     };
     if !base_url.trim().is_empty() {
         cfg.base_url = base_url.trim().to_string();
     }
     if !model.trim().is_empty() {
         cfg.model = model.trim().to_string();
+    }
+    if let Some(p) = provider {
+        let p = p.trim().to_string();
+        if !p.is_empty() {
+            cfg.provider = if p == ai::PROVIDER_ANTHROPIC
+                || p == ai::PROVIDER_DEEPSEEK
+                || p == ai::PROVIDER_OPENAI
+            {
+                p
+            } else {
+                ai::PROVIDER_OPENAI.into()
+            };
+        }
     }
     if let Some(k) = api_key {
         let k = k.trim();

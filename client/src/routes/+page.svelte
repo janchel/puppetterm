@@ -1334,13 +1334,15 @@
     // Client-local tools (no SSH round-trip) — work on local OR remote tabs.
     if (name === "read_terminal") {
       if (!term) return { error: "no active terminal" };
-      const raw = terminalText(term, 400);
-      const { text, truncated, lines } = buildOutputDigest(raw);
+      const raw = terminalText(term, 1000);
+      // Full-content mode: read_terminal is often used to inspect a file or
+      // long output that is on screen — don't collapse it to a head/tail digest.
+      const { text, truncated, lines } = buildOutputDigest(raw, 8000, "read");
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
         host: host || null,
         note: truncated
-          ? `terminal screen was ${lines} lines — trimmed to a digest (run grep/tail/head to narrow it)`
+          ? `terminal screen was ${lines} lines — long, returned as much as fits (run grep/tail/head to narrow it)`
           : "live terminal screen (not shell history)",
         terminal: text,
         truncated,

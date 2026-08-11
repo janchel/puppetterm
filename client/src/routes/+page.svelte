@@ -798,6 +798,17 @@
           `${res?.mode ?? "user"} agent at ${res?.agent_path ?? "~/.puppetterm/bin/puppetterm-agent"}` +
           `\x1b[0m\r\n`,
       );
+      // The agent is installed now — clear the "not detected" hint state and
+      // re-verify so the UI reflects reality (and stops offering to install).
+      agentChecked.delete(host);
+      try {
+        const ok = await call<boolean>("check_agent", { host });
+        if (ok) {
+          term?.write(`\r\n\x1b[32m[puppetterm] agent detected on ${host} ✓\x1b[0m\r\n`);
+        }
+      } catch {
+        /* best-effort re-check */
+      }
       loadActivity();
     } catch (e) {
       term?.write(`\r\n\x1b[31m[puppetterm install] failed: ${e}\x1b[0m\r\n`);
@@ -838,7 +849,12 @@
     while ((m = re.exec(line)) !== null) {
       const rest = line.slice(m.index + m[0].length).split(/[;|&]/)[0].trim();
       const t = parseSshTarget("ssh " + rest);
-      if (t) target = t;
+      // Only accept plausible hosts: alphanumerics plus @ . : - . A wrapped
+      // prose line (e.g. the install banner "…your SSH connection)? [y/N]")
+      // can START with "ssh " and would otherwise parse as the garbage host
+      // "connection)?" — which then fails check_agent and prints a bogus
+      // "agent not detected on connection)?" hint.
+      if (t && /^[A-Za-z0-9@._:\-]+$/.test(t)) target = t;
     }
     return target;
   }

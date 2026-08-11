@@ -993,15 +993,34 @@
     return lines.join("\n");
   }
 
+  /** Read the buffer from a given line to the end (used to capture everything
+   *  from where the AI's command started, so long outputs aren't cut to the
+   *  last few lines). Clamps to a max number of lines. */
+  function terminalTextFrom(term: Terminal, startLine: number, maxLines = 600): string {
+    const buf = term.buffer.active;
+    const total = buf.length;
+    const start = Math.max(startLine, total - maxLines);
+    const lines: string[] = [];
+    for (let y = start; y < total; y++) {
+      lines.push(buf.getLine(y)?.translateToString(true) ?? "");
+    }
+    return lines.join("\n");
+  }
+
   /** Type a command into the LIVE terminal (like a human) and wait for the
-   *  output to settle, then hand the visible result back to the AI. Works on
-   *  any connection — key or password — because it rides the user's real pty. */
+   *  output to settle, then hand the result back to the AI. Works on any
+   *  connection — key or password — because it rides the user's real pty. */
   async function runInTerminal(host: string | null, term: Terminal | null, cmd: string) {
     const tabId = chatTarget?.tabId ?? activeTabId;
     const t = tabId != null ? tabs.find((x) => x.id === tabId) : null;
     if (!term || !t || t.sessionId == null) {
       return { error: "no active terminal session to type into" };
     }
+    // Remember where the AI's command starts in the buffer (captured while the
+    // terminal is stable, BEFORE we write anything) so we can hand back the
+    // command's FULL output — the banner, the echo, the output, the prompt —
+    // not just the last few lines that happen to be on screen.
+    const startLine = term.buffer.active.length;
     // Show what the AI is doing, then type the command + Enter into the pty.
     term.write(`\r\n\x1b[36m[puppetterm] AI types: ${cmd}\x1b[0m\r\n`);
     await call("write_ssh_input", { id: t.sessionId, data: cmd });
@@ -1020,8 +1039,8 @@
         stableSince = Date.now();
       }
     }
-    const lines = terminalText(term, 2000).split("\n");
-    const output = lines.slice(-60).join("\n").slice(-6000);
+    // From the command start to the current end of the buffer — full output.
+    const output = terminalTextFrom(term, startLine, 600).slice(-18000);
     return {
       host: host || null,
       note: "typed into the live terminal and waited for the output to settle",
@@ -1044,12 +1063,12 @@
     // Client-local tools (no SSH round-trip) — work on local OR remote tabs.
     if (name === "read_terminal") {
       if (!term) return { error: "no active terminal" };
-      const text = terminalText(term, 200);
+      const text = terminalText(term, 400);
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
         host: host || null,
         note: "live terminal screen (not shell history)",
-        terminal: text.slice(-8000),
+        terminal: text.slice(-12000),
       };
     }
 

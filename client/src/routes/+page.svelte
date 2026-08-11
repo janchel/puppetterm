@@ -1274,21 +1274,45 @@
    *   - "read": file contents → keep the FULL file, only capped at a much
    *     higher limit. When the AI reads a config/compose file it needs the
    *     whole thing, not just the first/last lines. */
+  /** Real UTF-8 byte length of a string. The file on disk is bytes, but JS
+   *  `.length` counts UTF-16 units — for non-ASCII content that under-reports
+   *  (e.g. a 4929-byte compose file with multi-byte chars shows as 4639), so
+   *  `[file: N bytes]` mismatches `ls -la` and the AI thinks the file was
+   *  trimmed. Use this everywhere a byte count is shown to the model. */
+  function utf8Bytes(s: string): number {
+    return new TextEncoder().encode(s).length;
+  }
+
+  /** Index of the LAST buffer line whose visible text starts with `prefix`, or
+   *  -1. Used to locate the AI-command banner so output is read from there —
+   *  robust even when the scrollback is FULL: once the cap is hit,
+   *  buffer.active.length stops growing (old lines scroll off the top), so an
+   *  absolute start-line captured earlier goes stale and the capture returns
+   *  0 bytes even though the output is on screen. */
+  function lastLineStartingWith(term: Terminal, prefix: string): number {
+    const buf = term.buffer.active;
+    for (let y = buf.length - 1; y >= 0; y--) {
+      if ((buf.getLine(y)?.translateToString(true) ?? "").startsWith(prefix)) return y;
+    }
+    return -1;
+  }
+
   function buildOutputDigest(raw: string, capChars = 8000, mode: "output" | "read" = "output") {
     if (mode === "read") {
-      const readCap = 100000; // full file up to ~100k chars — a large compose/env/config set fits
-      if (raw.length <= readCap) {
+      const readCap = 100000; // full file up to ~100k bytes — a large compose/env/config set fits
+      const bytes = utf8Bytes(raw);
+      if (bytes <= readCap) {
         // Explicitly tell the model this is the COMPLETE file — otherwise a
         // long config can look "cut off" and the AI wastes turns re-reading it.
         // A closing [end of file] marker makes completeness unambiguous.
         return {
-          text: `[file: ${raw.length} bytes — COMPLETE, full content below]\n${raw}\n[end of file]`,
+          text: `[file: ${bytes} bytes — COMPLETE, full content below]\n${raw}\n[end of file]`,
           truncated: false,
           lines: raw.split("\n").length,
         };
       }
       return {
-        text: `[file: ${raw.length} bytes — TRUNCATED at ${readCap} chars — content is INCOMPLETE]\n` + raw.slice(0, readCap) + "\n[end of truncated output]",
+        text: `[file: ${bytes} bytes — TRUNCATED at ${readCap} bytes — content is INCOMPLETE]\n` + raw.slice(0, readCap) + "\n[end of truncated output]",
         truncated: true,
         lines: raw.split("\n").length,
       };
@@ -1360,19 +1384,20 @@
     if (!term || !t || t.sessionId == null) {
       return { error: "no active terminal session to type into" };
     }
-    // Remember where the AI's command starts in the buffer (captured while the
-    // terminal is stable, BEFORE we write anything) so we can hand back the
-    // command's FULL output — the banner, the echo, the output, the prompt —
-    // not just the last few lines that happen to be on screen.
-    const startLine = term.buffer.active.length;
-    // Show what the AI is doing, then type the command + Enter into the pty.
-    term.write(`\r\n\x1b[36m[puppetterm] AI types: ${cmd}\x1b[0m\r\n`);
+    // Write a unique banner, then type the command + Enter into the pty. We do
+    // NOT rely on an absolute buffer index as the "start": once the terminal's
+    // scrollback is full, buffer.active.length stops growing (old lines scroll
+    // off the top), so an index captured here goes stale and the capture below
+    // returns 0 bytes even though the output is on screen. Instead we locate
+    // this banner line after the command and read from it.
+    const markerPrefix = "[puppetterm] AI types: ";
+    term.write(`\r\n\x1b[36m${markerPrefix}${cmd}\x1b[0m\r\n`);
     await call("write_ssh_input", { id: t.sessionId, data: cmd });
     await call("write_ssh_input", { id: t.sessionId, data: "\r" });
     // Wait for the command to finish. For file reads the reliable "done" signal
     // is the shell prompt returning AFTER the output (a large file over a slow
     // link can pause >1s between chunks, which a pure stable-window check would
-    // mistake for completion). We require: buffer has grown past the echo AND
+    // mistake for completion). We require: the command banner has rendered AND
     // the last line looks like a prompt ($/#/>). Non-reads keep the shorter
     // stable-window approach (fast commands, no giant streams).
     const isRead = isFileReadCommand(cmd);
@@ -1382,13 +1407,14 @@
     const isPromptLine = (s: string) => /[$#>]\s*$/.test(s);
     let last = terminalText(term, 2000);
     let stableSince = Date.now();
+    let markerLine = -1;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 250));
       const nowText = terminalText(term, 2000);
       const line = lastLine(nowText);
+      markerLine = lastLineStartingWith(term, markerPrefix);
       // Prompt returned after the echo + output → command is done.
-      const grew = term.buffer.active.length > startLine + 2;
-      if (isRead && grew && isPromptLine(line)) break;
+      if (isRead && markerLine >= 0 && isPromptLine(line)) break;
       if (nowText === last) {
         if (Date.now() - stableSince > stableMs) break;
       } else {
@@ -1396,17 +1422,21 @@
         stableSince = Date.now();
       }
     }
-    // From the command start to the current end of the buffer — full output,
+    // From the command banner to the current end of the buffer — full output,
     // then trimmed to a compact digest if it's large (see buildOutputDigest).
     // File reads (cat/sed/awk/head/tail of a file) keep the FULL content so the
     // AI can actually review config/compose files instead of a head/tail digest.
-    const raw = terminalTextFrom(term, startLine, isRead ? 9000 : 3000);
+    const raw = terminalTextFrom(
+      term,
+      markerLine >= 0 ? markerLine : term.buffer.active.length,
+      isRead ? 9000 : 3000,
+    );
     const mode = isRead ? "read" : "output";
     const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
     // DEBUG: show the AI exactly what we're handing back, so truncation (if
     // any) is visible in the terminal instead of mysterious.
     term.write(
-      `\r\n\x1b[90m[puppetterm] returned ${raw.length} bytes / ${lines} lines ` +
+      `\r\n\x1b[90m[puppetterm] returned ${utf8Bytes(raw)} bytes / ${lines} lines ` +
         `(mode=${mode}, truncated=${truncated})\x1b[0m\r\n`,
     );
     return {
@@ -1443,11 +1473,12 @@
       // it, which is exactly how "the output looks truncated" reports started).
       // Keep as much as fits so on-screen file views are still usable.
       const screenCap = 100000;
-      const truncated = raw.length > screenCap;
+      const bytes = utf8Bytes(raw);
+      const truncated = bytes > screenCap;
       const body = truncated ? raw.slice(0, screenCap) : raw;
       const text = truncated
-        ? `[terminal screen: ${raw.length} bytes — TRUNCATED at ${screenCap} chars; the screen is bounded by scrollback, this is NOT a complete file]\n${body}`
-        : `[terminal screen: ${raw.length} bytes — what is on the user's screen right now, bounded by scrollback (NOT a file, NOT full command output)]\n${body}`;
+        ? `[terminal screen: ${bytes} bytes — TRUNCATED at ${screenCap} bytes; the screen is bounded by scrollback, this is NOT a complete file]\n${body}`
+        : `[terminal screen: ${bytes} bytes — what is on the user's screen right now, bounded by scrollback (NOT a file, NOT full command output)]\n${body}`;
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
         host: host || null,
@@ -1535,7 +1566,7 @@
             const rawOut = String(cap.stdout ?? "");
             const { text, truncated, lines } = buildOutputDigest(rawOut, 8000, "read");
             term?.write(
-              `\r\n\x1b[90m[puppetterm] read ${lines} lines / ${rawOut.length} bytes over ssh\x1b[0m\r\n`,
+              `\r\n\x1b[90m[puppetterm] read ${lines} lines / ${utf8Bytes(rawOut)} bytes over ssh\x1b[0m\r\n`,
             );
             return {
               host,

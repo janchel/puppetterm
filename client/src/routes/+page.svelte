@@ -275,8 +275,12 @@
     "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
     "(first/last lines + any error/warning lines) to save tokens, but FILE READS (`cat`, `sed`, " +
     "`head`, `tail` of a file) return the FULL content — so the AI can inspect config/compose " +
-    "files completely. If output is trimmed, run a follow-up like `grep`, `tail -n`, `head -n` " +
-    "or `wc -l` via the `terminal` tool to narrow it.\n\n" +
+    "files completely. A file read result starts with `[file: N bytes — COMPLETE, full content " +
+    "below]` and ends with `[end of file]`: that means the ENTIRE file is included and NOTHING " +
+    "was cut — do NOT tell the user the output was truncated, cut off, or needs re-reading when " +
+    "you see those markers. Only treat a result as truncated if it explicitly says `TRUNCATED` or " +
+    "`… N lines omitted …`. If output is trimmed, run a follow-up like `grep`, `tail -n`, " +
+    "`head -n` or `wc -l` via the `terminal` tool to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -306,7 +310,11 @@
     "Before running anything, explain in text what you'll run and why — the user sees your " +
     "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
     "(first/last lines + any error/warning lines) to save tokens, but FILE READS (via `config` " +
-    "read, `log`, or `cat`/`sed`/`head`/`tail` of a file) return the FULL content. If output is " +
+    "read, `log`, or `cat`/`sed`/`head`/`tail` of a file) return the FULL content. A file read " +
+    "result starts with `[file: N bytes — COMPLETE, full content below]` and ends with `[end of " +
+    "file]`: the ENTIRE file is included and NOTHING was cut — do NOT tell the user the output " +
+    "was truncated, cut off, or needs re-reading when you see those markers. Only treat a result " +
+    "as truncated if it explicitly says `TRUNCATED` or `… N lines omitted …`. If output is " +
     "trimmed, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
@@ -1224,15 +1232,15 @@
       if (raw.length <= readCap) {
         // Explicitly tell the model this is the COMPLETE file — otherwise a
         // long config can look "cut off" and the AI wastes turns re-reading it.
+        // A closing [end of file] marker makes completeness unambiguous.
         return {
-          text: `[file: ${raw.length} bytes — full content below]\n${raw}`,
+          text: `[file: ${raw.length} bytes — COMPLETE, full content below]\n${raw}\n[end of file]`,
           truncated: false,
           lines: raw.split("\n").length,
         };
       }
       return {
-        text: `[file: ${raw.length} bytes — truncated at ${readCap} chars]
-` + raw.slice(0, readCap),
+        text: `[file: ${raw.length} bytes — TRUNCATED at ${readCap} chars — content is INCOMPLETE]\n` + raw.slice(0, readCap) + "\n[end of truncated output]",
         truncated: true,
         lines: raw.split("\n").length,
       };

@@ -143,6 +143,7 @@
     tool: string;
     args: Record<string, unknown>;
     danger?: boolean;
+    explain?: string;
     resolve: (ok: boolean) => void;
   } | null>(null);
   let abortRequested = $state(false); // user hit Abort — stop starting new tool calls
@@ -205,24 +206,36 @@
 
   const SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
-    "using the provided tools. To RUN a command, prefer the `terminal` tool: it types the " +
-    "command into the live terminal (the user sees exactly what runs) and returns the output — " +
-    "this works on ANY host, including password-only ones. The structured tools " +
-    "(service/log/config/snapshot) give cleaner results on key-based hosts when available. " +
-    "Use `read_terminal` to see the current terminal screen — this is the live view of the " +
-    "active session, NOT the shell history file (~/.bash_history is a separate concern and does " +
-    "not reflect the current terminal). State-changing actions are approved by the user before " +
-    "execution; you will be told if one is rejected. Be concise and summarize tool results for " +
-    "the user.";
+    "using the provided tools.\n\n" +
+    "ANSWER QUESTIONS FIRST. When the user asks a question, answer it directly from your own " +
+    "knowledge in text BEFORE calling any tool. Only run a command when you genuinely need LIVE " +
+    "system state (current disk/memory, a service's real status, today's logs) or when the user " +
+    "asked you to take an action. For general-knowledge questions, just give the answer and DO " +
+    "NOT run a command at all.\n\n" +
+    "TO RUN A COMMAND, ALWAYS use the `terminal` tool first: it types the command into the user's " +
+    "LIVE terminal (which is already logged in) and returns the output — it works on ANY host, " +
+    "including password-only ones, and needs no key or agent. The structured tools " +
+    "(run_command/snapshot/service/log/config) open a SEPARATE ssh connection and only work on " +
+    "key-based hosts with the puppetterm-agent installed; if one fails with an SSH permission " +
+    "error, the app retries in the live terminal automatically.\n\n" +
+    "Before running anything, explain in text what you'll run and why — the user sees your " +
+    "explanation before the approval prompt. Use `read_terminal` to see the current terminal " +
+    "screen — the live view of the active session, NOT the shell history file (~/.bash_history " +
+    "is a separate concern and does not reflect the current terminal). Large tool output is " +
+    "trimmed to a digest (first/last lines + any error/warning lines) to save tokens — if you " +
+    "need more detail, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via the " +
+    "`terminal` tool to narrow it.\n\n" +
+    "State-changing actions are approved by the user before execution; you will be told if one " +
+    "is rejected. Be concise and summarize tool results for the user.";
 
   const AGENT_TOOLS = [
-    { type: "function", function: { name: "run_command", description: "Run an arbitrary shell command on the active host (always approved first).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
-    { type: "function", function: { name: "terminal", description: "Run a command directly in the current terminal by typing it (like a human) and wait for the output to settle. Works on ANY host, including password-only ones; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
+    { type: "function", function: { name: "terminal", description: "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Works on ANY host — key or password — and needs no agent. THIS IS THE PREFERRED WAY to run commands; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
+    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "run_command", description: "Run a command over a SEPARATE ssh connection via the installed puppetterm-agent. ONLY works on key-based hosts with the agent installed; on password-only hosts it FAILS with 'Permission denied'. Prefer `terminal` (works everywhere). Use only when you need structured, audited agent results on a key host.", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
     { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "service", description: "Control a systemd service on the active host.", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
     { type: "function", function: { name: "log", description: "Tail a log file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
     { type: "function", function: { name: "config", description: "Read or write a config file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
-    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
   ];
 
   const TOOL_TO_ACTION: Record<string, string> = {
@@ -632,6 +645,37 @@
     return false; // run_command and anything else asks
   }
 
+  /** Map a structured agent tool call to a plain shell command, used to fall
+   *  back to the live terminal when the agent route is unavailable (e.g. a
+   *  password-only host without the agent). Returns null when there's no clean
+   *  shell equivalent (e.g. config writes). */
+  function structuredToolToShell(name: string, args: Record<string, unknown>): string | null {
+    switch (name) {
+      case "run_command":
+        return String(args.cmd ?? "").trim() || null;
+      case "snapshot":
+        return "df -h; echo; free -h; echo; uptime";
+      case "service": {
+        const unit = String(args.unit ?? "");
+        const op = String(args.op ?? "status");
+        if (!unit) return null;
+        const needsSudo = ["start", "stop", "restart", "enable", "disable"].includes(op);
+        return `${needsSudo ? "sudo " : ""}systemctl ${op} ${unit}`;
+      }
+      case "log": {
+        const path = String(args.path ?? "");
+        if (!path) return null;
+        const lines = Number(args.lines) || 50;
+        return `tail -n ${lines} ${path}`;
+      }
+      case "config":
+        if (args.op === "read") return `cat ${String(args.path ?? "")}`;
+        return null; // writes need the agent's structured path
+      default:
+        return null;
+    }
+  }
+
   // Commands that don't change state — the `terminal` tool auto-runs these.
   const READONLY_CMDS = [
     "ls", "cat", "pwd", "whoami", "echo", "head", "tail", "grep", "df", "free",
@@ -817,6 +861,19 @@
     while (li >= 0 && lines[li].trim() === "") li--;
     const last = (lines[li] ?? "").trim();
     if (!/[\$#>] ?$/.test(last)) return; // only when at a shell prompt
+    // If the remote session has ended (e.g. the user typed `exit`, or ssh
+    // dropped), OpenSSH prints "Connection to <host> closed." — forget the
+    // host so the status dot turns grey and the AI no longer targets it.
+    // (The pty itself stays alive — it's the local shell — so pty-exit never
+    // fires here; this is the reliable signal.)
+    if (t.host) {
+      const recent = lines.slice(Math.max(0, li - 12), li + 1).join("\n");
+      if (/Connection (?:to .+? )?(?:closed|reset)|closed by remote host|Connection reset/i.test(recent)) {
+        agentChecked.delete(t.host);
+        t.host = "";
+        return;
+      }
+    }
     for (let i = li; i >= 0; i--) {
       const target = detectSshFromLine(lines[i]);
       if (target) {
@@ -874,12 +931,16 @@
         return;
       }
       if (msg.tool_calls && msg.tool_calls.length > 0) {
+        // Show the AI's explanation even when it also calls a tool — otherwise
+        // the user only sees the approval dialog and never the answer/plan.
+        const explain = (msg.content ?? "").trim();
+        if (explain) pushChat("ai", explain);
         history = [
           ...history,
           { role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls },
         ];
         for (const tc of msg.tool_calls) {
-          const ok = await requestApproval(tc);
+          const ok = await requestApproval(tc, explain || undefined);
           const content = ok
             ? JSON.stringify(await executeTool(tc))
             : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
@@ -899,20 +960,31 @@
     }
   }
 
-  function requestApproval(tc: { id: string; function: { name: string; arguments: string } }): Promise<boolean> {
+  function requestApproval(
+    tc: { id: string; function: { name: string; arguments: string } },
+    explain?: string,
+  ): Promise<boolean> {
     const name = tc.function.name;
     const args = safeParse(tc.function.arguments);
-    // Read-only tools always auto-run.
-    if (toolReadOnly(name, args)) return Promise.resolve(true);
-    // Read-only mode: state-changing actions are blocked, not silently approved.
-    if (autonomy === "read-only-auto") {
-      pushChat("ai", `(blocked in read-only mode: ${name} would change state)`);
-      return Promise.resolve(false);
+    // Reading the terminal screen is invisible and changes nothing — never prompt.
+    if (name === "read_terminal") return Promise.resolve(true);
+    // Propose-first: the AI answers the question in text, then asks before
+    // executing ANY command (even read-only ones) — full human-in-the-loop.
+    const proposeFirst = autonomy === "propose-first";
+    if (!proposeFirst) {
+      // Read-only tools auto-run in the other modes.
+      if (toolReadOnly(name, args)) return Promise.resolve(true);
+      // Read-only mode: state-changing actions are blocked, not silently approved.
+      if (autonomy === "read-only-auto") {
+        pushChat("ai", `(blocked in read-only mode: ${name} would change state)`);
+        return Promise.resolve(false);
+      }
     }
-    // Ask-first: prompt, flagging dangerous commands so the user can't miss them.
+    // Ask-first / propose-first: prompt, flagging dangerous commands so the
+    // user can't miss them.
     const danger = isDangerous(name, args);
     return new Promise((resolve) => {
-      pendingApproval = { id: tc.id, tool: name, args, danger, resolve };
+      pendingApproval = { id: tc.id, tool: name, args, danger, explain, resolve };
     });
   }
 
@@ -937,15 +1009,64 @@
     return lines.join("\n");
   }
 
+  /** Read the buffer from a given line to the end (used to capture everything
+   *  from where the AI's command started, so long outputs aren't cut to the
+   *  last few lines). Clamps to a max number of lines. */
+  function terminalTextFrom(term: Terminal, startLine: number, maxLines = 600): string {
+    const buf = term.buffer.active;
+    const total = buf.length;
+    const start = Math.max(startLine, total - maxLines);
+    const lines: string[] = [];
+    for (let y = start; y < total; y++) {
+      lines.push(buf.getLine(y)?.translateToString(true) ?? "");
+    }
+    return lines.join("\n");
+  }
+
+  /** Lines worth surfacing when terminal output is trimmed — error / warning /
+   *  failure-ish lines that usually matter for log questions. */
+  const ERRORISH_LINE =
+    /(?:error|errno|failed|failure|fatal|exception|traceback|panic|segfault|denied|timed?\s?out|refused|critical|warn(?:ing)?|out of memory|no space left)/i;
+
+  /** Build a compact digest of large terminal output instead of sending the
+   *  whole buffer (every char costs tokens). Small output passes through as-is;
+   *  large output becomes: first ~25 lines + "… N omitted …" + last ~80 lines,
+   *  plus any error/warning-ish lines found (deduped, capped). Returns the
+   *  text plus whether it was trimmed and the true total line count. */
+  function buildOutputDigest(raw: string, capChars = 8000) {
+    const lines = raw.split("\n");
+    const total = lines.length;
+    if (raw.length <= capChars) {
+      return { text: raw, truncated: false, lines: total };
+    }
+    const head = lines.slice(0, 25).join("\n");
+    const tail = lines.slice(-80).join("\n");
+    const omitted = Math.max(0, total - 25 - 80);
+    const hits = [...new Set(lines.filter((l) => ERRORISH_LINE.test(l)))].slice(0, 20);
+    let digest = `[output: ${total} lines — trimmed to first 25 + last 80]\n`;
+    digest += head;
+    if (omitted > 0) digest += `\n… ${omitted} lines omitted …\n`;
+    digest += tail;
+    if (hits.length > 0) {
+      digest += `\n[matched error/warning lines (${hits.length}):]\n` + hits.join("\n");
+    }
+    return { text: digest.slice(0, capChars + 2000), truncated: true, lines: total };
+  }
+
   /** Type a command into the LIVE terminal (like a human) and wait for the
-   *  output to settle, then hand the visible result back to the AI. Works on
-   *  any connection — key or password — because it rides the user's real pty. */
+   *  output to settle, then hand the result back to the AI. Works on any
+   *  connection — key or password — because it rides the user's real pty. */
   async function runInTerminal(host: string | null, term: Terminal | null, cmd: string) {
     const tabId = chatTarget?.tabId ?? activeTabId;
     const t = tabId != null ? tabs.find((x) => x.id === tabId) : null;
     if (!term || !t || t.sessionId == null) {
       return { error: "no active terminal session to type into" };
     }
+    // Remember where the AI's command starts in the buffer (captured while the
+    // terminal is stable, BEFORE we write anything) so we can hand back the
+    // command's FULL output — the banner, the echo, the output, the prompt —
+    // not just the last few lines that happen to be on screen.
+    const startLine = term.buffer.active.length;
     // Show what the AI is doing, then type the command + Enter into the pty.
     term.write(`\r\n\x1b[36m[puppetterm] AI types: ${cmd}\x1b[0m\r\n`);
     await call("write_ssh_input", { id: t.sessionId, data: cmd });
@@ -964,13 +1085,19 @@
         stableSince = Date.now();
       }
     }
-    const lines = terminalText(term, 2000).split("\n");
-    const output = lines.slice(-60).join("\n").slice(-6000);
+    // From the command start to the current end of the buffer — full output,
+    // then trimmed to a compact digest if it's large (see buildOutputDigest).
+    const raw = terminalTextFrom(term, startLine, 600);
+    const { text, truncated, lines } = buildOutputDigest(raw);
     return {
       host: host || null,
-      note: "typed into the live terminal and waited for the output to settle",
+      note: truncated
+        ? `typed into the live terminal; output was ${lines} lines and is trimmed to a digest (run grep/tail/head/wc to narrow it)`
+        : "typed into the live terminal and waited for the output to settle",
       command: cmd,
-      output,
+      output: text,
+      truncated,
+      total_lines: lines,
     };
   }
 
@@ -988,12 +1115,17 @@
     // Client-local tools (no SSH round-trip) — work on local OR remote tabs.
     if (name === "read_terminal") {
       if (!term) return { error: "no active terminal" };
-      const text = terminalText(term, 200);
+      const raw = terminalText(term, 400);
+      const { text, truncated, lines } = buildOutputDigest(raw);
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
         host: host || null,
-        note: "live terminal screen (not shell history)",
-        terminal: text.slice(-8000),
+        note: truncated
+          ? `terminal screen was ${lines} lines — trimmed to a digest (run grep/tail/head to narrow it)`
+          : "live terminal screen (not shell history)",
+        terminal: text,
+        truncated,
+        total_lines: lines,
       };
     }
 
@@ -1020,6 +1152,7 @@
     const request = { action, params: args, request_id: tc.id };
     currentRequestId = tc.id;
     let res: any;
+    let agentErr: string | null = null;
     try {
       res = await call<any>("run_agent_action", {
         host,
@@ -1027,9 +1160,32 @@
         source: "ai",
         approved: true,
       });
+    } catch (e) {
+      agentErr = String(e ?? "");
     } finally {
       currentRequestId = null;
     }
+    // SSH-layer failure (e.g. password-only host without the agent, or no key
+    // auth) — fall back to typing an equivalent command into the user's live
+    // terminal, which is ALREADY logged in. This is the whole point: the AI
+    // rides the connection the user opened, so password remotes just work.
+    const agentProblem =
+      agentErr != null ||
+      /permission denied|publickey|connection (?:refused|timed out)|no route to host|could not resolve hostname/i.test(
+        res?.error ?? "",
+      );
+    if (agentProblem) {
+      const cmd = structuredToolToShell(name, args);
+      if (cmd) {
+        const why = (agentErr ?? res?.error ?? "ssh failure").slice(0, 140);
+        term?.write(
+          `\r\n\x1b[33m[puppetterm] agent route unavailable (${why}) — running in your live terminal instead\x1b[0m\r\n`,
+        );
+        const fb = await runInTerminal(host, term, cmd);
+        return { ...fb, fallback: true, from: name };
+      }
+    }
+    if (agentErr) throw new Error(agentErr);
     for (const ev of res?.events ?? []) {
       if (ev?.type === "output" && term) term.write(ev.data ?? "");
     }
@@ -1037,15 +1193,19 @@
       term.write(`\r\n\x1b[31m[puppetterm] action error: ${res.error}\x1b[0m\r\n`);
     }
     const resultEvent = [...(res?.events ?? [])].reverse().find((e: any) => e?.type === "result");
-    const outputs = (res?.events ?? [])
+    const rawOutputs = (res?.events ?? [])
       .filter((e: any) => e?.type === "output")
       .map((e: any) => e.data ?? "")
-      .join("")
-      .slice(-4000);
+      .join("");
+    // Same digest as the live-terminal path: large agent output is trimmed to
+    // head + tail + error/warning lines so it doesn't burn tokens.
+    const { text, truncated, lines } = buildOutputDigest(rawOutputs);
     return {
       host,
       exit: resultEvent?.exit ?? res?.exit ?? null,
-      outputs,
+      outputs: text,
+      output_truncated: truncated,
+      output_lines: lines,
       structured: resultEvent?.structured ?? null,
       error: res?.error ?? null,
     };
@@ -1078,6 +1238,8 @@
             const t = tabs.find((x) => x.sessionId === p.id);
             if (t) {
               t.sessionId = null;
+              if (t.host) agentChecked.delete(t.host);
+              t.host = ""; // the session is gone — drop the host so the dot goes grey
               termByTab
                 .get(t.id)
                 ?.term.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");
@@ -1237,21 +1399,6 @@
         </button>
       </div>
 
-      <div class="ai-model-row" title="Switch the AI model (persisted)">
-        <span class="ai-provider-tag">{AI_PROVIDERS[aiProvider]?.label ?? "Custom"}</span>
-        <select
-          value={aiModel}
-          onchange={(e) => applyAiModel((e.currentTarget as HTMLSelectElement).value)}
-        >
-          {#if !aiModel}
-            <option value="">(no model)</option>
-          {/if}
-          {#each allModels as m (m)}
-            <option value={m}>{m}</option>
-          {/each}
-        </select>
-      </div>
-
       {#if !aiReady}
         <div class="ai-unconfigured">
           AI not configured — open <button onclick={() => (showSettings = true)}>⚙ Settings</button> to set the endpoint &amp; model.
@@ -1263,6 +1410,9 @@
           <div class="approval-label">
             {pendingApproval.danger ? '⚠ Dangerous action' : 'Approve action?'}
           </div>
+          {#if pendingApproval.explain}
+            <div class="approval-explain">{pendingApproval.explain}</div>
+          {/if}
           <div class="approval-cmd">
             {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
             <div class="approval-host">
@@ -1351,6 +1501,21 @@
           </button>
         {/if}
       </div>
+
+      <div class="ai-model-row" title="Switch the AI model (persisted)">
+        <span class="ai-provider-tag">{AI_PROVIDERS[aiProvider]?.label ?? "Custom"}</span>
+        <select
+          value={aiModel}
+          onchange={(e) => applyAiModel((e.currentTarget as HTMLSelectElement).value)}
+        >
+          {#if !aiModel}
+            <option value="">(no model)</option>
+          {/if}
+          {#each allModels as m (m)}
+            <option value={m}>{m}</option>
+          {/each}
+        </select>
+      </div>
     </aside>
   </main>
 
@@ -1418,6 +1583,7 @@
           Autonomy
           <select bind:value={autonomy}>
             <option value="ask-first">Ask first (default)</option>
+            <option value="propose-first">Propose first (approve every command)</option>
             <option value="read-only-auto">Read-only auto</option>
           </select>
         </label>
@@ -1582,12 +1748,14 @@
   .ai-model-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin: 0 12px 8px;
+    gap: 6px;
+    margin: 0;
+    padding: 6px 12px 10px;
     flex: none;
+    border-top: 1px solid #21262d;
   }
   .ai-provider-tag {
-    font-size: 11px;
+    font-size: 10px;
     color: #8b949e;
     white-space: nowrap;
     overflow: hidden;
@@ -1600,8 +1768,8 @@
     border: 1px solid #30363d;
     border-radius: 6px;
     color: #e6edf3;
-    padding: 4px 8px;
-    font-size: 12px;
+    padding: 3px 6px;
+    font-size: 11px;
     color-scheme: dark; /* keep the native dropdown dark (WebKitGTK) */
   }
   .ai-model-row select:focus {
@@ -1837,6 +2005,15 @@
     padding: 6px 8px;
     word-break: break-all;
     white-space: pre-wrap;
+  }
+  .approval-explain {
+    font-size: 12px;
+    color: #e6edf3;
+    background: #0d1117;
+    border-radius: 6px;
+    padding: 6px 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .approval-host {
     margin-top: 6px;

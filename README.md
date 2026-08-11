@@ -42,7 +42,8 @@ Both modes share the same **approval gate**:
 - ✅ Read-only actions (`ls`, `cat`, `ps`, `df`, `snapshot`, `status`, …) run automatically.
 - ⚠️ State-changing actions (install, restart, write config, `run_command`) prompt you first.
 - 🚨 Dangerous patterns (`rm -rf /`, `mkfs`, `reboot`, `dd of=/dev/…`) are flagged red.
-- You can also set the chat to **read-only-auto** (never changes state) or **ask-first**.
+- The AI always answers your question in text *before* running anything, so you see *why* it wants to act.
+- Autonomy modes (⚙ Settings): **ask-first** (default), **propose-first** (approve *every* command, even read-only), or **read-only-auto** (never changes state).
 
 ## Features
 

@@ -521,6 +521,11 @@
     activeTabId = id;
     await tick();
     fitTab(id);
+    // Safety net: re-scan the newly-activated tab for an ssh target. The
+    // pty-output scan can miss a session established before the app noticed
+    // (or a recalled command), so re-detecting on activation keeps the host +
+    // agent-mode badge in sync with reality.
+    maybeDetectSshFromBuffer(id);
   }
 
   function fitTab(id: number) {

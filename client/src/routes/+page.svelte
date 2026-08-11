@@ -29,12 +29,21 @@
   // Pinned at send time: the terminal + host a chat task is acting on. Kept so
   // switching tabs mid-task can never redirect the AI to a different server.
   let chatTarget = $state<{ host: string; tabId: number } | null>(null);
+  // The tool set + system prompt chosen for the current task, based on whether
+  // the remote agent is installed (agent mode vs terminal-only mode). Assigned
+  // in sendChat (the prompt/tool constants are defined further down).
+  let chatTools = $state<any[]>([]);
+  let chatPrompt = $state<string>("");
 
   // ---- agent install (in-terminal, approval-style: install the agent on the connected host) ---
-  let installPrompt = $state<{ tabId: number; host: string } | null>(null); // awaiting y/n in the terminal
+  let installPrompt = $state<{ tabId: number; host: string; force?: boolean } | null>(null); // awaiting y/n in the terminal
   let installBusy = $state(false);
   let installTabId = $state<number | null>(null); // route install-output events here
   let agentChecked = $state<Set<string>>(new Set()); // hosts we've already hinted about
+  // Known agent presence per host (true = installed). Populated by check_agent;
+  // the AI's tool set + system prompt depend on this, so the model knows
+  // whether it's in agent mode or terminal-only mode.
+  let agentMap = $state<Record<string, boolean>>({});
 
   // AI panel width (persisted; draggable splitter).
   let aiWidth = $state(
@@ -204,7 +213,43 @@
     return false;
   }
 
-  const SYSTEM_PROMPT =
+  const AGENT_TOOLS = [
+    { type: "function", function: { name: "terminal", description: "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Works on ANY host — key or password — and needs no agent. THE PREFERRED fallback to run commands the structured tools don't cover; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
+    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "run_command", description: "Run a command over a dedicated ssh connection via the installed puppetterm-agent: clean exit code + full output, audited. Only available when the agent is installed on the host.", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
+    { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime (via the installed agent).", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "service", description: "Control a systemd service on the active host (via the installed agent).", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
+    { type: "function", function: { name: "log", description: "Tail a log file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
+    { type: "function", function: { name: "config", description: "Read or write a config file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
+  ];
+
+  // Tools available when the agent is NOT installed on the host: only the ones
+  // that ride the user's live terminal (work on any host, incl. password-only).
+  const TERMINAL_ONLY_TOOLS = AGENT_TOOLS.filter((t) => {
+    const n = t.function.name;
+    return n === "terminal" || n === "read_terminal";
+  });
+
+  /** True when the puppetterm-agent is known to be installed on `host`
+   *  (checked once per host per session; defaults to false while unknown). */
+  function hostHasAgent(host: string | null | undefined): boolean {
+    if (!host) return false;
+    return agentMap[host] === true;
+  }
+
+  /** The tools + system prompt to hand the model for a given host, depending
+   *  on whether the remote agent is installed: agent mode exposes the
+   *  structured tools (agentic), otherwise the AI only gets the terminal tools. */
+  function chatConfigFor(host: string | null | undefined) {
+    const hasAgent = hostHasAgent(host);
+    const tools = hasAgent ? AGENT_TOOLS : TERMINAL_ONLY_TOOLS;
+    const prompt = hasAgent ? AGENT_SYSTEM_PROMPT : TERMINAL_SYSTEM_PROMPT;
+    return { tools, prompt, hasAgent };
+  }
+
+  // Agent-aware system prompts: the AI is told which mode it's in so it uses
+  // the right tools instead of guessing.
+  const TERMINAL_SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
     "using the provided tools.\n\n" +
     "ANSWER QUESTIONS FIRST. When the user asks a question, answer it directly from your own " +
@@ -212,31 +257,42 @@
     "system state (current disk/memory, a service's real status, today's logs) or when the user " +
     "asked you to take an action. For general-knowledge questions, just give the answer and DO " +
     "NOT run a command at all.\n\n" +
-    "TO RUN A COMMAND, ALWAYS use the `terminal` tool first: it types the command into the user's " +
-    "LIVE terminal (which is already logged in) and returns the output — it works on ANY host, " +
-    "including password-only ones, and needs no key or agent. The structured tools " +
-    "(run_command/snapshot/service/log/config) open a SEPARATE ssh connection and only work on " +
-    "key-based hosts with the puppetterm-agent installed; if one fails with an SSH permission " +
-    "error, the app retries in the live terminal automatically.\n\n" +
+    "The puppetterm-agent is NOT installed on this host, so run commands with the `terminal` " +
+    "tool: it types the command into the user's live terminal (already logged in) and returns " +
+    "the output — it works on ANY host, including password-only ones. Use `read_terminal` to " +
+    "see the current terminal screen — the live view of the active session, NOT the shell " +
+    "history file.\n\n" +
     "Before running anything, explain in text what you'll run and why — the user sees your " +
-    "explanation before the approval prompt. Use `read_terminal` to see the current terminal " +
-    "screen — the live view of the active session, NOT the shell history file (~/.bash_history " +
-    "is a separate concern and does not reflect the current terminal). Large tool output is " +
-    "trimmed to a digest (first/last lines + any error/warning lines) to save tokens — if you " +
-    "need more detail, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via the " +
-    "`terminal` tool to narrow it.\n\n" +
+    "explanation before the approval prompt. Large tool output is trimmed to a digest " +
+    "(first/last lines + any error/warning lines) to save tokens — if you need more detail, " +
+    "run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via the `terminal` tool to " +
+    "narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
-  const AGENT_TOOLS = [
-    { type: "function", function: { name: "terminal", description: "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Works on ANY host — key or password — and needs no agent. THIS IS THE PREFERRED WAY to run commands; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
-    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
-    { type: "function", function: { name: "run_command", description: "Run a command over a SEPARATE ssh connection via the installed puppetterm-agent. ONLY works on key-based hosts with the agent installed; on password-only hosts it FAILS with 'Permission denied'. Prefer `terminal` (works everywhere). Use only when you need structured, audited agent results on a key host.", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
-    { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime.", parameters: { type: "object", properties: {} } } },
-    { type: "function", function: { name: "service", description: "Control a systemd service on the active host.", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
-    { type: "function", function: { name: "log", description: "Tail a log file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
-    { type: "function", function: { name: "config", description: "Read or write a config file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
-  ];
+  const AGENT_SYSTEM_PROMPT =
+    "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
+    "using the provided tools.\n\n" +
+    "ANSWER QUESTIONS FIRST. When the user asks a question, answer it directly from your own " +
+    "knowledge in text BEFORE calling any tool. Only run a command when you genuinely need LIVE " +
+    "system state (current disk/memory, a service's real status, today's logs) or when the user " +
+    "asked you to take an action. For general-knowledge questions, just give the answer and DO " +
+    "NOT run a command at all.\n\n" +
+    "The puppetterm-agent IS installed on this host (reachable over its dedicated SSH " +
+    "connection), so PREFER the structured tools for reliable, audited results: `run_command` " +
+    "(clean exit code + full output), `snapshot` (CPU/memory/disk/uptime), `service` (systemd " +
+    "status/control), `log` (tail log files), `config` (read/write allow-listed config). You " +
+    "may also use the `terminal` tool to type a command into the user's live terminal when the " +
+    "structured tools don't cover it (e.g. interactive commands) — it works on any host. Use " +
+    "`read_terminal` to see the current terminal screen.\n\n" +
+    "Before running anything, explain in text what you'll run and why — the user sees your " +
+    "explanation before the approval prompt. Large tool output is trimmed to a digest " +
+    "(first/last lines + any error/warning lines) to save tokens — if you need more detail, " +
+    "run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` to narrow it.\n\n" +
+    "State-changing actions are approved by the user before execution; you will be told if one " +
+    "is rejected. Be concise and summarize tool results for the user.";
+
+  const SYSTEM_PROMPT = TERMINAL_SYSTEM_PROMPT; // default until a host is detected
 
   const TOOL_TO_ACTION: Record<string, string> = {
     run_command: "run",
@@ -398,9 +454,9 @@
       if (installPrompt && installPrompt.tabId === id) {
         const ch = data.trim().toLowerCase();
         if (ch === "y") {
-          const { host } = installPrompt;
+          const { host, force } = installPrompt;
           installPrompt = null;
-          runInstall(id, host);
+          runInstall(id, host, force ?? false);
         } else if (ch === "n" || ch === "\r" || ch === "\u0003") {
           term.write("\r\n\x1b[90m[puppetterm] install cancelled\x1b[0m\r\n");
           installPrompt = null;
@@ -726,11 +782,26 @@
     // be empty (local tab) — read_terminal still works, agent tools will say so.
     const target = { host: activeHost ?? "", tabId: activeTabId ?? -1 };
     chatTarget = target;
+    // Agent-aware: choose the tool set + system prompt based on whether the
+    // remote agent is installed, so the AI knows if it's in agentic mode.
+    const cfg = chatConfigFor(target.host);
+    chatTools = cfg.tools;
+    chatPrompt = cfg.prompt;
     abortRequested = false;
     chatText = "";
     pushChat("user", text);
-    pushChat("ai", `(acting on ${target.host || "the local terminal"})`);
-    history = [...history, { role: "user", content: text }];
+    pushChat(
+      "ai",
+      `(acting on ${target.host || "the local terminal"} — ${cfg.hasAgent ? "agent mode" : "terminal mode"})`,
+    );
+    // Keep the system prompt in the conversation in sync with the current host
+    // (agent vs terminal mode), so a host switch mid-conversation re-frames it.
+    const userMsg = { role: "user", content: text };
+    history = [
+      { role: "system", content: cfg.prompt },
+      ...history.filter((m) => m.role !== "system"),
+      userMsg,
+    ];
     chatBusy = true;
     try {
       await runAiLoop();
@@ -774,30 +845,52 @@
   // ---- agent install (in-terminal, approval-style) --------------------------------
   /** Ask in the terminal: install the agent on the active host? [y/N] */
   function promptInstall() {
+    promptAgentAction("Install", "install");
+  }
+
+  /** Ask in the terminal: update (reinstall) the agent on the active host? */
+  function promptUpdateAgent() {
+    promptAgentAction("Update", "update");
+  }
+
+  function promptAgentAction(verb: string, mode: "install" | "update") {
     const host = activeHost;
     const tabId = activeTabId;
     const term = activeTerm();
     if (!host || !tabId || !term || installBusy) return;
-    installPrompt = { tabId, host };
+    installPrompt = { tabId, host, force: mode === "update" };
     term.write(
-      `\r\n\x1b[33m[puppetterm]\x1b[0m Install puppetterm-agent on \x1b[1m${host}\x1b[0m ` +
-        `(user-space, no sudo — reuses your SSH connection)? [y/N] `,
+      `\r\n\x1b[33m[puppetterm]\x1b[0m ${verb} puppetterm-agent on \x1b[1m${host}\x1b[0m ` +
+        `(reuses your SSH connection)? [y/N] `,
     );
   }
 
   /** Stream the install into the terminal for the given tab. */
-  async function runInstall(id: number, host: string) {
+  async function runInstall(id: number, host: string, force = false) {
     const term = termByTab.get(id)?.term;
     installTabId = id;
     installBusy = true;
-    term?.write(`\r\n\x1b[35m[puppetterm install] starting on ${host}…\x1b[0m\r\n`);
+    term?.write(
+      `\r\n\x1b[35m[puppetterm install] ${force ? "updating" : "starting on"} ${host}…\x1b[0m\r\n`,
+    );
     try {
-      const res = await call<any>("install_agent_on_host", { host });
+      const res = await call<any>("install_agent_on_host", { host, force });
       term?.write(
-        `\r\n\x1b[32m[puppetterm install] ${res?.already ? "already present —" : "done —"} ` +
+        `\r\n\x1b[32m[puppetterm install] ${res?.already && !force ? "already present —" : "done —"} ` +
           `${res?.mode ?? "user"} agent at ${res?.agent_path ?? "~/.puppetterm/bin/puppetterm-agent"}` +
           `\x1b[0m\r\n`,
       );
+      // The agent is installed now — clear the "not detected" hint state and
+      // re-verify so the UI reflects reality (and stops offering to install).
+      agentChecked.delete(host);
+      try {
+        const ok = await call<boolean>("check_agent", { host });
+        if (ok) {
+          term?.write(`\r\n\x1b[32m[puppetterm] agent detected on ${host} ✓\x1b[0m\r\n`);
+        }
+      } catch {
+        /* best-effort re-check */
+      }
       loadActivity();
     } catch (e) {
       term?.write(`\r\n\x1b[31m[puppetterm install] failed: ${e}\x1b[0m\r\n`);
@@ -808,12 +901,14 @@
   }
 
   /** After ssh detection, quietly check whether the agent is present; if not,
-   *  print a one-time hint offering to install it. */
+   *  print a one-time hint offering to install it. Records the result in
+   *  agentMap so the AI knows which mode it's in (agent vs terminal-only). */
   async function checkAndHintAgent(id: number, host: string) {
     if (agentChecked.has(host)) return;
     agentChecked.add(host);
     try {
       const ok = await call<boolean>("check_agent", { host });
+      agentMap[host] = ok;
       if (!ok) {
         termByTab.get(id)?.term.write(
           `\r\n\x1b[90m[puppetterm] agent not detected on ${host} — ` +
@@ -838,7 +933,12 @@
     while ((m = re.exec(line)) !== null) {
       const rest = line.slice(m.index + m[0].length).split(/[;|&]/)[0].trim();
       const t = parseSshTarget("ssh " + rest);
-      if (t) target = t;
+      // Only accept plausible hosts: alphanumerics plus @ . : - . A wrapped
+      // prose line (e.g. the install banner "…your SSH connection)? [y/N]")
+      // can START with "ssh " and would otherwise parse as the garbage host
+      // "connection)?" — which then fails check_agent and prints a bogus
+      // "agent not detected on connection)?" hint.
+      if (t && /^[A-Za-z0-9@._:\-]+$/.test(t)) target = t;
     }
     return target;
   }
@@ -921,7 +1021,7 @@
       aiThinking = true;
       let resp: any;
       try {
-        resp = await call<any>("ai_chat", { messages: history, tools: AGENT_TOOLS });
+        resp = await call<any>("ai_chat", { messages: history, tools: chatTools });
       } finally {
         aiThinking = false;
       }
@@ -1430,19 +1530,33 @@
         <span class="dot {activeHost ? 'up' : 'down'}"></span>
         {#if activeHost}
           acting on <b>{activeHost}</b>
+          {#if hostHasAgent(activeHost)}
+            <span class="mode-badge agent">agent</span>
+          {:else if agentMap[activeHost] === false}
+            <span class="mode-badge terminal">terminal</span>
+          {/if}
           {#if chatBusy && chatTarget && chatTarget.host !== activeHost}
             <span class="warn">(pinned — you switched tabs)</span>
           {/if}
         {:else}
           local — ssh to a remote first
         {/if}
-        {#if activeHost && !installBusy}
+        {#if activeHost && !installBusy && !hostHasAgent(activeHost)}
           <button
             class="install-agent"
             onclick={promptInstall}
             title="Install puppetterm-agent on {activeHost} (no sudo, reuses your SSH connection)"
           >
             Install agent
+          </button>
+        {/if}
+        {#if activeHost && !installBusy && hostHasAgent(activeHost)}
+          <button
+            class="install-agent update"
+            onclick={promptUpdateAgent}
+            title="Update puppetterm-agent on {activeHost} (reinstall from the current build)"
+          >
+            ↻ Update agent
           </button>
         {/if}
       </div>
@@ -2218,6 +2332,25 @@
   .ai-target .warn {
     color: #d29922;
   }
+  .mode-badge {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 1px 6px;
+    border-radius: 999px;
+    margin-left: 2px;
+  }
+  .mode-badge.agent {
+    color: #3fb950;
+    background: #12261b;
+    border: 1px solid #238636;
+  }
+  .mode-badge.terminal {
+    color: #8b949e;
+    background: #161b22;
+    border: 1px solid #30363d;
+  }
   .install-agent {
     margin-left: auto;
     border: 1px solid #238636;
@@ -2232,6 +2365,14 @@
   .install-agent:hover {
     background: #238636;
     color: #fff;
+  }
+  .install-agent.update {
+    border-color: #d29922;
+    color: #d29922;
+  }
+  .install-agent.update:hover {
+    background: #d29922;
+    color: #000;
   }
   .approval-btns {
     display: flex;

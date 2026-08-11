@@ -45,13 +45,24 @@ Both modes share the same **approval gate**:
 - The AI always answers your question in text *before* running anything, so you see *why* it wants to act.
 - Autonomy modes (⚙ Settings): **ask-first** (default), **propose-first** (approve *every* command, even read-only), or **read-only-auto** (never changes state).
 
+> **Agent mode vs terminal mode — why it matters.** The app detects whether
+> `puppetterm-agent` is installed on the host and tells the AI which mode it's
+> in (a small **agent** / **terminal** badge shows next to the host). Agent mode
+> returns **structured, audited results** (clean exit codes, snapshot data,
+> allow-listed config/log access, scoped sudoers) — more reliable and safer than
+> screen-scraping a terminal. Terminal mode needs nothing installed and works on
+> any host, but the AI only sees what's on screen. The two are complementary:
+> agent mode for real management, terminal mode as the universal fallback.
+
 ## Features
 
 - **Tabbed terminals** (xterm.js) — local-first: launch opens a local shell; type
   `ssh user@host` to connect (the tab follows the host, even from shell history).
 - **Resizable AI chat panel** with a **provider/model switcher** (custom
-  OpenAI-compatible, DeepSeek, or Claude), **new chat**, live "acting on \<host\>" banner,
-  and an **Activity** log.
+  OpenAI-compatible, DeepSeek, or Claude), **new chat**, live "acting on \<host\>" banner
+  with an **agent / terminal mode badge**, and an **Activity** log. The AI is
+  **agent-aware**: it detects whether `puppetterm-agent` is installed on the host and
+  adapts its tools + behavior accordingly (structured agent tools vs live-terminal only).
 - **Multi-provider AI** — your API key is **encrypted at rest** (ChaCha20-Poly1305,
   machine-bound); plaintext never touches disk and is never committed.
 - **In-app agent installer** — user-space by default (no sudo); auto-upgrades to root

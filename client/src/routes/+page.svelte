@@ -254,16 +254,16 @@
   // AGENT MODE: the agent is your eyes and hands on the remote host — every
   // tool runs ON THE MACHINE over the agent's own SSH connection and returns
   // full, audited results directly in the conversation. No terminal screen
-  // scraping: `run_command` is PRIMARY (read files, run commands), `snapshot`,
-  // `service`, `log`, `config` cover the rest, and `terminal` is a last resort
-  // for interactive commands only.
+  // scraping AND no typing into the live terminal: `run_command` is PRIMARY
+  // (read files, run commands), `snapshot`, `service`, `log`, `config` cover
+  // the rest. If the agent is unavailable, the app says so and guides you to
+  // install it — it never falls back to typing commands into the user's pty.
   const AGENT_TOOLS = [
     { type: "function", function: { name: "run_command", description: "Run a command on the ACTIVE HOST through the installed puppetterm-agent over its dedicated SSH connection. This is your PRIMARY tool — your eyes and hands on the machine. Use it to inspect (read files with cat/sed/head/tail — full content returned; check state with ps/df/free/uptime/grep) and to change (install, configure, restart). Returns the FULL output and a clean exit code directly to you (audited).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
     { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime (via the installed agent).", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "service", description: "Control a systemd service on the active host (via the installed agent).", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
     { type: "function", function: { name: "log", description: "Tail a log file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
     { type: "function", function: { name: "config", description: "Read or write a config file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
-    TERMINAL_TOOL,
   ];
 
   // TERMINAL MODE (agent not installed on the host): only tools that ride the
@@ -346,8 +346,13 @@
     "`cat`/`sed`/`head`/`tail` — full content returned; check state with `ps`/`df`/`free`/" +
     "`uptime`; grep logs; install and configure). Use `config` (read/write) and `log` (tail) " +
     "for their allow-listed paths, `snapshot` for a system overview, and `service` for systemd " +
-    "units. The `terminal` tool is ONLY for interactive commands the structured tools cannot " +
-    "handle (e.g. `htop`, `vim`, password prompts) — not for regular inspection.\n\n" +
+    "units.\n\n" +
+    "IMPORTANT — YOU NEVER TYPE INTO THE USER'S TERMINAL in agent mode. All your work goes " +
+    "through the agent tools above; the results appear here in the chat, and the terminal only " +
+    "shows a status line. If a tool returns that the puppetterm-agent is not available on the " +
+    "host, do NOT try to work around it by typing into the terminal (you have no such tool) — " +
+    "tell the user the agent isn't installed and that they can click \"Install agent\" in the AI " +
+    "panel to enable agent mode on this host.\n\n" +
     "NOTE: `run_command` runs in the user's HOME directory on the remote host, NOT your shell's " +
     "current folder — always use ABSOLUTE paths (e.g. `cat /opt/docker/mcp-rag/docker-compose." +
     "yml`) when reading files with it.\n\n" +
@@ -1552,12 +1557,11 @@
         agentMap[host] = false;
         agentChecked.delete(host);
       }
-      // File reads (config read / log tail / run_command cat) are much better
-      // served by a DIRECT ssh capture than by typing `cat` into the live
-      // terminal: the terminal path scrapes the xterm buffer, which can cut
-      // large files at scrollback/settle limits and make the AI think the file
-      // is truncated. A dedicated ssh exec returns every byte. Falls back to
-      // the live terminal if direct ssh isn't available (password-only hosts).
+      // File reads (config read / log tail / run_command cat) are served by a
+      // DIRECT ssh capture: a dedicated ssh exec returns every byte, no pty, no
+      // terminal typing. If that ssh route also fails (auth/network), fall
+      // through to the agent-unavailable error below — agent mode never types
+      // into the live terminal.
       const isRead =
         (name === "config" && String(args.op ?? "") === "read") ||
         name === "log" ||
@@ -1589,19 +1593,36 @@
               from: name,
             };
           }
-          // ssh auth failed → fall through to the live-terminal fallback below.
+          // ssh auth failed → fall through to the agent-unavailable error below.
         } catch (e) {
-          // ssh unavailable (password host) → live-terminal fallback below.
-          console.warn("ssh_capture failed, falling back to live terminal:", e);
+          // ssh unavailable → fall through to the agent-unavailable error below.
+          console.warn("ssh_capture failed:", e);
         }
       }
       if (cmd) {
         const why = (agentErr ?? res?.error ?? "ssh failure").slice(0, 140);
+        // AGENT MODE NEVER TYPES INTO THE USER'S TERMINAL. If the remote agent
+        // binary is missing (or the agent route failed), don't silently fall
+        // back to typing the command into the live pty — that is exactly the
+        // confusing "agent mode is writing to my terminal" behaviour. Return a
+        // clear, model-visible error so the AI tells the user to install the
+        // agent (or the user relies on terminal mode, where the `terminal` tool
+        // legitimately types).
         term?.write(
-          `\r\n\x1b[33m[puppetterm] agent route unavailable (${why}) — running in your live terminal instead\x1b[0m\r\n`,
+          `\r\n\x1b[33m[puppetterm] agent unavailable on ${host} (${why}) — NOT typed into your terminal; install the agent to use agent mode\x1b[0m\r\n`,
         );
-        const fb = await runInTerminal(host, term, cmd);
-        return { ...fb, fallback: true, from: name };
+        return {
+          host,
+          command: cmd,
+          via: "agent-unavailable",
+          fallback: false,
+          error:
+            `The puppetterm-agent is not available on ${host}: ${why}. ` +
+            `In agent mode I do NOT type commands into your terminal. ` +
+            `To use agent mode here, install the agent (click "Install agent" in the AI panel). ` +
+            `If you just need a quick check without the agent, the app can switch to terminal mode — ` +
+            `but I will not type into the terminal automatically in agent mode.`,
+        };
       }
     }
     if (agentErr) throw new Error(agentErr);

@@ -764,6 +764,26 @@
     }
   }
 
+  /** Short human-readable description of a structured agent action, shown as a
+   *  single status line in the terminal during agent mode (silent mode: we show
+   *  WHAT the AI ran, not the file contents / output bytes). */
+  function describeAgentAction(name: string, args: Record<string, unknown>): string {
+    switch (name) {
+      case "run_command":
+        return String(args.cmd ?? "").trim() || "run_command";
+      case "snapshot":
+        return "snapshot";
+      case "service":
+        return `service ${String(args.op ?? "status")} ${String(args.unit ?? "")}`.trim();
+      case "log":
+        return `log ${String(args.path ?? "")}${args.lines ? ` (${String(args.lines)} lines)` : ""}`.trim();
+      case "config":
+        return `config ${String(args.op ?? "read")} ${String(args.path ?? "")}`.trim();
+      default:
+        return `${name} ${JSON.stringify(args)}`;
+    }
+  }
+
   // Commands that don't change state — the `terminal` tool auto-runs these.
   const READONLY_CMDS = [
     "ls", "cat", "pwd", "whoami", "echo", "head", "tail", "grep", "df", "free",
@@ -1384,8 +1404,12 @@
     }
 
     const action = TOOL_TO_ACTION[name] ?? "run";
+    // Silent mode: in agent mode we show a single concise status line — WHAT the
+    // AI ran — not the raw args (which can be huge for config writes) and not
+    // the file contents / output bytes. The full result goes to the model via
+    // the tool message; the terminal stays clean.
     if (term) {
-      term.write(`\r\n\x1b[36m[puppetterm] AI → ${name} ${JSON.stringify(args)}\x1b[0m\r\n`);
+      term.write(`\r\n\x1b[36m[puppetterm] AI → ${describeAgentAction(name, args)}\x1b[0m\r\n`);
     }
     const request = { action, params: args, request_id: tc.id };
     currentRequestId = tc.id;
@@ -1439,9 +1463,8 @@
       .join("");
     if (term) {
       const exit = resultEvent?.exit ?? res?.exit ?? null;
-      term.write(
-        `\r\n\x1b[36m[puppetterm] ${name} → exit ${exit ?? "?"}, ${rawOutputs.length} bytes output\x1b[0m\r\n`,
-      );
+      // Silent mode: just confirm it finished — no byte counts, no contents.
+      term.write(`\r\n\x1b[90m[puppetterm] done (exit ${exit ?? "?"})\x1b[0m\r\n`);
     }
     if (res?.error && term) {
       term.write(`\r\n\x1b[31m[puppetterm] action error: ${res.error}\x1b[0m\r\n`);

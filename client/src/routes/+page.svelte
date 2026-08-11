@@ -143,6 +143,7 @@
     tool: string;
     args: Record<string, unknown>;
     danger?: boolean;
+    explain?: string;
     resolve: (ok: boolean) => void;
   } | null>(null);
   let abortRequested = $state(false); // user hit Abort — stop starting new tool calls
@@ -205,15 +206,22 @@
 
   const SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
-    "using the provided tools. To RUN a command, prefer the `terminal` tool: it types the " +
-    "command into the live terminal (the user sees exactly what runs) and returns the output — " +
-    "this works on ANY host, including password-only ones. The structured tools " +
-    "(service/log/config/snapshot) give cleaner results on key-based hosts when available. " +
-    "Use `read_terminal` to see the current terminal screen — this is the live view of the " +
+    "using the provided tools.\n\n" +
+    "ANSWER QUESTIONS FIRST. When the user asks a question, answer it directly from your own " +
+    "knowledge in text BEFORE calling any tool. Only run a command when you genuinely need LIVE " +
+    "system state (current disk/memory, a service's real status, today's logs) or when the user " +
+    "asked you to take an action. For general-knowledge questions, just give the answer and DO " +
+    "NOT run a command at all.\n\n" +
+    "When you do run a command: explain in your text response what you're about to run and why, " +
+    "THEN call the tool — the user sees your explanation before the approval prompt. Prefer the " +
+    "`terminal` tool: it types the command into the live terminal (the user sees exactly what " +
+    "runs) and returns the output — this works on ANY host, including password-only ones. The " +
+    "structured tools (service/log/config/snapshot) give cleaner results on key-based hosts when " +
+    "available. Use `read_terminal` to see the current terminal screen — the live view of the " +
     "active session, NOT the shell history file (~/.bash_history is a separate concern and does " +
-    "not reflect the current terminal). State-changing actions are approved by the user before " +
-    "execution; you will be told if one is rejected. Be concise and summarize tool results for " +
-    "the user.";
+    "not reflect the current terminal).\n\n" +
+    "State-changing actions are approved by the user before execution; you will be told if one " +
+    "is rejected. Be concise and summarize tool results for the user.";
 
   const AGENT_TOOLS = [
     { type: "function", function: { name: "run_command", description: "Run an arbitrary shell command on the active host (always approved first).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
@@ -874,12 +882,16 @@
         return;
       }
       if (msg.tool_calls && msg.tool_calls.length > 0) {
+        // Show the AI's explanation even when it also calls a tool — otherwise
+        // the user only sees the approval dialog and never the answer/plan.
+        const explain = (msg.content ?? "").trim();
+        if (explain) pushChat("ai", explain);
         history = [
           ...history,
           { role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls },
         ];
         for (const tc of msg.tool_calls) {
-          const ok = await requestApproval(tc);
+          const ok = await requestApproval(tc, explain || undefined);
           const content = ok
             ? JSON.stringify(await executeTool(tc))
             : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
@@ -899,20 +911,31 @@
     }
   }
 
-  function requestApproval(tc: { id: string; function: { name: string; arguments: string } }): Promise<boolean> {
+  function requestApproval(
+    tc: { id: string; function: { name: string; arguments: string } },
+    explain?: string,
+  ): Promise<boolean> {
     const name = tc.function.name;
     const args = safeParse(tc.function.arguments);
-    // Read-only tools always auto-run.
-    if (toolReadOnly(name, args)) return Promise.resolve(true);
-    // Read-only mode: state-changing actions are blocked, not silently approved.
-    if (autonomy === "read-only-auto") {
-      pushChat("ai", `(blocked in read-only mode: ${name} would change state)`);
-      return Promise.resolve(false);
+    // Reading the terminal screen is invisible and changes nothing — never prompt.
+    if (name === "read_terminal") return Promise.resolve(true);
+    // Propose-first: the AI answers the question in text, then asks before
+    // executing ANY command (even read-only ones) — full human-in-the-loop.
+    const proposeFirst = autonomy === "propose-first";
+    if (!proposeFirst) {
+      // Read-only tools auto-run in the other modes.
+      if (toolReadOnly(name, args)) return Promise.resolve(true);
+      // Read-only mode: state-changing actions are blocked, not silently approved.
+      if (autonomy === "read-only-auto") {
+        pushChat("ai", `(blocked in read-only mode: ${name} would change state)`);
+        return Promise.resolve(false);
+      }
     }
-    // Ask-first: prompt, flagging dangerous commands so the user can't miss them.
+    // Ask-first / propose-first: prompt, flagging dangerous commands so the
+    // user can't miss them.
     const danger = isDangerous(name, args);
     return new Promise((resolve) => {
-      pendingApproval = { id: tc.id, tool: name, args, danger, resolve };
+      pendingApproval = { id: tc.id, tool: name, args, danger, explain, resolve };
     });
   }
 
@@ -1263,6 +1286,9 @@
           <div class="approval-label">
             {pendingApproval.danger ? '⚠ Dangerous action' : 'Approve action?'}
           </div>
+          {#if pendingApproval.explain}
+            <div class="approval-explain">{pendingApproval.explain}</div>
+          {/if}
           <div class="approval-cmd">
             {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
             <div class="approval-host">
@@ -1418,6 +1444,7 @@
           Autonomy
           <select bind:value={autonomy}>
             <option value="ask-first">Ask first (default)</option>
+            <option value="propose-first">Propose first (approve every command)</option>
             <option value="read-only-auto">Read-only auto</option>
           </select>
         </label>
@@ -1837,6 +1864,15 @@
     padding: 6px 8px;
     word-break: break-all;
     white-space: pre-wrap;
+  }
+  .approval-explain {
+    font-size: 12px;
+    color: #e6edf3;
+    background: #0d1117;
+    border-radius: 6px;
+    padding: 6px 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .approval-host {
     margin-top: 6px;

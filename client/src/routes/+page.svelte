@@ -316,11 +316,12 @@
     "(first/last lines + any error/warning lines) to save tokens, but FILE READS (`cat`, `sed`, " +
     "`head`, `tail` of a file) return the FULL content — so the AI can inspect config/compose " +
     "files completely. A file read result starts with `[file: N bytes — COMPLETE, full content " +
-    "below]` and ends with `[end of file]`: that means the ENTIRE file is included and NOTHING " +
-    "was cut — do NOT tell the user the output was truncated, cut off, or needs re-reading when " +
-    "you see those markers. Only treat a result as truncated if it explicitly says `TRUNCATED` or " +
-    "`… N lines omitted …`. If output is trimmed, run a follow-up like `grep`, `tail -n`, " +
-    "`head -n` or `wc -l` via the `terminal` tool to narrow it.\n\n" +
+    "below]` and ends with `[end of file]`, and carries a structured `complete: true` field: " +
+    "that means the ENTIRE file is included and NOTHING was cut — do NOT tell the user the " +
+    "output was truncated, cut off, or needs re-reading when you see those markers or `complete: " +
+    "true`. Only treat a result as truncated if `complete` is false or it explicitly says " +
+    "`TRUNCATED` or `… N lines omitted …`. If output is trimmed, run a follow-up like `grep`, " +
+    "`tail -n`, `head -n` or `wc -l` via the `terminal` tool to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -359,11 +360,12 @@
     "(first/last lines + any error/warning lines) to save tokens, but FILE READS (via `config` " +
     "read, `log`, or `cat`/`sed`/`head`/`tail` of a file) return the FULL content. A file read " +
     "result starts with `[file: N bytes — COMPLETE, full content below]` and ends with `[end of " +
-    "file]`: the ENTIRE file is included and NOTHING was cut — do NOT tell the user the output " +
-    "was truncated, cut off, or needs re-reading when you see those markers. Only treat a result " +
-    "as truncated if it explicitly says `TRUNCATED` or `… N lines omitted …`. If output is " +
-    "trimmed, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via `run_command` to " +
-    "narrow it.\n\n" +
+    "file]`, and carries a structured `complete: true` field: the ENTIRE file is included and " +
+    "NOTHING was cut — do NOT tell the user the output was truncated, cut off, or needs " +
+    "re-reading when you see those markers or `complete: true`. Only treat a result as truncated " +
+    "if `complete` is false or it explicitly says `TRUNCATED` or `… N lines omitted …`. If " +
+    "output is trimmed, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via " +
+    "`run_command` to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -1301,20 +1303,25 @@
     if (mode === "read") {
       const readCap = 100000; // full file up to ~100k bytes — a large compose/env/config set fits
       const bytes = utf8Bytes(raw);
+      const totalLines = raw.split("\n").length;
       if (bytes <= readCap) {
         // Explicitly tell the model this is the COMPLETE file — otherwise a
         // long config can look "cut off" and the AI wastes turns re-reading it.
-        // A closing [end of file] marker makes completeness unambiguous.
+        // The closing [end of file] marker makes completeness unambiguous, and
+        // the structured `complete: true` field is a machine-checkable signal
+        // even models that skim the prose marker can trust.
         return {
-          text: `[file: ${bytes} bytes — COMPLETE, full content below]\n${raw}\n[end of file]`,
+          text: `[file: ${bytes} bytes, ${totalLines} lines — COMPLETE, full content below; the ENTIRE file is here, NOTHING was cut]\n${raw}\n[end of file]`,
           truncated: false,
-          lines: raw.split("\n").length,
+          lines: totalLines,
+          complete: true,
         };
       }
       return {
         text: `[file: ${bytes} bytes — TRUNCATED at ${readCap} bytes — content is INCOMPLETE]\n` + raw.slice(0, readCap) + "\n[end of truncated output]",
         truncated: true,
-        lines: raw.split("\n").length,
+        lines: totalLines,
+        complete: false,
       };
     }
     const lines = raw.split("\n");
@@ -1432,7 +1439,7 @@
       isRead ? 9000 : 3000,
     );
     const mode = isRead ? "read" : "output";
-    const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
+    const { text, truncated, lines, complete } = buildOutputDigest(raw, 8000, mode);
     // DEBUG: show the AI exactly what we're handing back, so truncation (if
     // any) is visible in the terminal instead of mysterious.
     term.write(
@@ -1447,6 +1454,7 @@
       command: cmd,
       output: text,
       truncated,
+      complete,
       total_lines: lines,
     };
   }
@@ -1485,6 +1493,7 @@
         note: "live terminal screen (not shell history) — a screen snapshot bounded by scrollback. To get a FILE's full contents or a command's full output, run the command via the `terminal` tool (or the agent tools in agent mode) instead of reading the screen.",
         terminal: text,
         truncated,
+        complete: false, // a screen snapshot is NEVER a guaranteed-complete file
         total_lines: raw.split("\n").length,
       };
     }
@@ -1564,7 +1573,7 @@
             );
           if (!authProblem) {
             const rawOut = String(cap.stdout ?? "");
-            const { text, truncated, lines } = buildOutputDigest(rawOut, 8000, "read");
+            const { text, truncated, lines, complete } = buildOutputDigest(rawOut, 8000, "read");
             term?.write(
               `\r\n\x1b[90m[puppetterm] read ${lines} lines / ${utf8Bytes(rawOut)} bytes over ssh\x1b[0m\r\n`,
             );
@@ -1574,6 +1583,7 @@
               outputs: text,
               output_truncated: truncated,
               output_lines: lines,
+              complete,
               via: "ssh-capture",
               fallback: true,
               from: name,
@@ -1622,13 +1632,14 @@
       (name === "config" && String(args.op ?? "") === "read") ||
       name === "log" ||
       (name === "run_command" && isFileReadCommand(String(args.cmd ?? "")));
-    const { text, truncated, lines } = buildOutputDigest(rawOutputs, 8000, isRead ? "read" : "output");
+    const { text, truncated, lines, complete } = buildOutputDigest(rawOutputs, 8000, isRead ? "read" : "output");
     return {
       host,
       exit: resultEvent?.exit ?? res?.exit ?? null,
       outputs: text,
       output_truncated: truncated,
       output_lines: lines,
+      complete,
       structured: resultEvent?.structured ?? null,
       error: res?.error ?? null,
     };

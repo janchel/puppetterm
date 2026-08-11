@@ -1189,25 +1189,36 @@
     return { text: digest.slice(0, capChars + 2000), truncated: true, lines: total };
   }
 
-  /** True when a `terminal` command looks like it's READING a file's contents
-   *  (so we return the full file instead of the head/tail digest). Matches
-   *  common file-viewing invocations; anything with pipes/redirects is treated
-   *  as generic output. */
+  /** True when a `terminal`/`run_command` looks like it's READING a file's
+   *  contents (so we return the full file instead of the head/tail digest).
+   *  Matches common file-viewing invocations — plain `cat file`, numbered
+   *  reads (`cat -n file`, `nl file`, `sed -n '1,50p' file`), `head`/`tail`
+   *  of a file. Pipelines/chains are treated as generic command output. */
   function isFileReadCommand(cmd: string): boolean {
     const c = cmd.trim().replace(/^sudo\s+/, "");
     if (/[|;&]/.test(c)) return false; // pipelines / chains → generic output
     const m = c.match(/^(\S+)\s+(.+)$/);
     if (!m) return false;
-    const tool = m[0].split(/\s+/)[0];
-    const target = m[1]?.trim() ?? "";
-    if (["cat", "sed", "awk", "more", "less", "nl", "od", "xxd"].includes(tool)) {
-      // single file target (no glob is fine — a small set of files is readable)
-      return target.length > 0 && !target.startsWith("-");
+    const tool = m[1];
+    const target = m[2]?.trim() ?? "";
+    // The final (or only) argument must look like a file path, not a flag.
+    const args = target.split(/\s+/);
+    const lastArg = args[args.length - 1] ?? "";
+    const looksLikePath = (a: string) => a.length > 0 && !a.startsWith("-") && /[.\/]/.test(a);
+    if (["cat", "nl", "more", "less", "od", "xxd"].includes(tool)) {
+      return args.some(looksLikePath);
+    }
+    if (tool === "sed") {
+      // sed [-n] 'addr' file — file is the last non-flag arg
+      return args.length >= 2 && looksLikePath(lastArg);
+    }
+    if (tool === "awk") {
+      // awk 'program' file
+      return args.length >= 2 && looksLikePath(lastArg);
     }
     if (tool === "head" || tool === "tail") {
-      // head -n N file, tail -n N file, or tail file
-      const tokens = target.split(/\s+/);
-      return tokens.some((t) => t !== "-n" && !/^\d+$/.test(t) && !t.startsWith("-"));
+      // head/tail [-n N] file — file is the last non-flag arg
+      return args.some((t, i) => t !== "-n" && !/^\d+$/.test(t) && !t.startsWith("-") && looksLikePath(t));
     }
     return false;
   }
@@ -1361,10 +1372,13 @@
       .join("");
     // Same digest as the live-terminal path: large agent output is trimmed to
     // head + tail + error/warning lines so it doesn't burn tokens. EXCEPT for
-    // file/log reads (config read, log tail) — those keep the full content so
-    // the AI can actually review configs and logs instead of a digest.
+    // file/log reads (config read, log tail, or run_command running cat/sed/
+    // head/tail on a file) — those keep the full content so the AI can actually
+    // review configs and logs instead of a digest.
     const isRead =
-      (name === "config" && String(args.op ?? "") === "read") || name === "log";
+      (name === "config" && String(args.op ?? "") === "read") ||
+      name === "log" ||
+      (name === "run_command" && isFileReadCommand(String(args.cmd ?? "")));
     const { text, truncated, lines } = buildOutputDigest(rawOutputs, 8000, isRead ? "read" : "output");
     return {
       host,

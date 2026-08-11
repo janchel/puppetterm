@@ -861,6 +861,19 @@
     while (li >= 0 && lines[li].trim() === "") li--;
     const last = (lines[li] ?? "").trim();
     if (!/[\$#>] ?$/.test(last)) return; // only when at a shell prompt
+    // If the remote session has ended (e.g. the user typed `exit`, or ssh
+    // dropped), OpenSSH prints "Connection to <host> closed." — forget the
+    // host so the status dot turns grey and the AI no longer targets it.
+    // (The pty itself stays alive — it's the local shell — so pty-exit never
+    // fires here; this is the reliable signal.)
+    if (t.host) {
+      const recent = lines.slice(Math.max(0, li - 12), li + 1).join("\n");
+      if (/Connection (?:to .+? )?(?:closed|reset)|closed by remote host|Connection reset/i.test(recent)) {
+        agentChecked.delete(t.host);
+        t.host = "";
+        return;
+      }
+    }
     for (let i = li; i >= 0; i--) {
       const target = detectSshFromLine(lines[i]);
       if (target) {
@@ -1225,6 +1238,8 @@
             const t = tabs.find((x) => x.sessionId === p.id);
             if (t) {
               t.sessionId = null;
+              if (t.host) agentChecked.delete(t.host);
+              t.host = ""; // the session is gone — drop the host so the dot goes grey
               termByTab
                 .get(t.id)
                 ?.term.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");
@@ -1384,21 +1399,6 @@
         </button>
       </div>
 
-      <div class="ai-model-row" title="Switch the AI model (persisted)">
-        <span class="ai-provider-tag">{AI_PROVIDERS[aiProvider]?.label ?? "Custom"}</span>
-        <select
-          value={aiModel}
-          onchange={(e) => applyAiModel((e.currentTarget as HTMLSelectElement).value)}
-        >
-          {#if !aiModel}
-            <option value="">(no model)</option>
-          {/if}
-          {#each allModels as m (m)}
-            <option value={m}>{m}</option>
-          {/each}
-        </select>
-      </div>
-
       {#if !aiReady}
         <div class="ai-unconfigured">
           AI not configured — open <button onclick={() => (showSettings = true)}>⚙ Settings</button> to set the endpoint &amp; model.
@@ -1500,6 +1500,21 @@
             Abort
           </button>
         {/if}
+      </div>
+
+      <div class="ai-model-row" title="Switch the AI model (persisted)">
+        <span class="ai-provider-tag">{AI_PROVIDERS[aiProvider]?.label ?? "Custom"}</span>
+        <select
+          value={aiModel}
+          onchange={(e) => applyAiModel((e.currentTarget as HTMLSelectElement).value)}
+        >
+          {#if !aiModel}
+            <option value="">(no model)</option>
+          {/if}
+          {#each allModels as m (m)}
+            <option value={m}>{m}</option>
+          {/each}
+        </select>
       </div>
     </aside>
   </main>
@@ -1733,12 +1748,14 @@
   .ai-model-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin: 0 12px 8px;
+    gap: 6px;
+    margin: 0;
+    padding: 6px 12px 10px;
     flex: none;
+    border-top: 1px solid #21262d;
   }
   .ai-provider-tag {
-    font-size: 11px;
+    font-size: 10px;
     color: #8b949e;
     white-space: nowrap;
     overflow: hidden;
@@ -1751,8 +1768,8 @@
     border: 1px solid #30363d;
     border-radius: 6px;
     color: #e6edf3;
-    padding: 4px 8px;
-    font-size: 12px;
+    padding: 3px 6px;
+    font-size: 11px;
     color-scheme: dark; /* keep the native dropdown dark (WebKitGTK) */
   }
   .ai-model-row select:focus {

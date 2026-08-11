@@ -829,6 +829,11 @@
       "ai",
       `(acting on ${target.host || "the local terminal"} — ${cfg.hasAgent ? "agent mode" : "terminal mode"})`,
     );
+    call("log_ai_debug", {
+      line: `[puppetterm] sendChat host=${target.host || "(local)"} hasAgent=${cfg.hasAgent} tools=${cfg.tools
+        .map((t) => t.function.name)
+        .join(",")} cwd=${tab?.cwd ?? "(none)"}`,
+    }).catch(() => {});
     // Keep the system prompt in the conversation in sync with the current host
     // (agent vs terminal mode), so a host switch mid-conversation re-frames it.
     const userMsg = { role: "user", content: text };
@@ -1321,10 +1326,9 @@
     const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
     // DEBUG: show the AI exactly what we're handing back, so truncation (if
     // any) is visible in the terminal instead of mysterious.
-    term.write(
-      `\r\n\x1b[90m[puppetterm] returned ${raw.length} bytes / ${lines} lines ` +
-        `(mode=${mode}, truncated=${truncated})\x1b[0m\r\n`,
-    );
+    const dbg = `[puppetterm] returned ${raw.length} bytes / ${lines} lines (mode=${mode}, truncated=${truncated}) cmd=${cmd}`;
+    term.write(`\r\n\x1b[90m${dbg}\x1b[0m\r\n`);
+    call("log_ai_debug", { line: dbg }).catch(() => {});
     return {
       host: host || null,
       note: truncated
@@ -1355,7 +1359,9 @@
       // Full-content mode: read_terminal is often used to inspect a file or
       // long output that is on screen — don't collapse it to a head/tail digest.
       const { text, truncated, lines } = buildOutputDigest(raw, 8000, "read");
+      const dbg = `[puppetterm] read_terminal returned ${raw.length} bytes / ${lines} lines (truncated=${truncated})`;
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
+      call("log_ai_debug", { line: dbg }).catch(() => {});
       return {
         host: host || null,
         note: truncated
@@ -1419,9 +1425,9 @@
       }
       if (cmd) {
         const why = (agentErr ?? res?.error ?? "ssh failure").slice(0, 140);
-        term?.write(
-          `\r\n\x1b[33m[puppetterm] agent route unavailable (${why}) — running in your live terminal instead\x1b[0m\r\n`,
-        );
+        const fbNote = `[puppetterm] agent route unavailable (${why}) — running in your live terminal instead cmd=${cmd}`;
+        term?.write(`\r\n\x1b[33m${fbNote}\x1b[0m\r\n`);
+        call("log_ai_debug", { line: fbNote }).catch(() => {});
         const fb = await runInTerminal(host, term, cmd);
         return { ...fb, fallback: true, from: name };
       }

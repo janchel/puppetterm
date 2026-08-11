@@ -1180,15 +1180,19 @@
       term.write(`\r\n\x1b[31m[puppetterm] action error: ${res.error}\x1b[0m\r\n`);
     }
     const resultEvent = [...(res?.events ?? [])].reverse().find((e: any) => e?.type === "result");
-    const outputs = (res?.events ?? [])
+    const rawOutputs = (res?.events ?? [])
       .filter((e: any) => e?.type === "output")
       .map((e: any) => e.data ?? "")
-      .join("")
-      .slice(-4000);
+      .join("");
+    // Same digest as the live-terminal path: large agent output is trimmed to
+    // head + tail + error/warning lines so it doesn't burn tokens.
+    const { text, truncated, lines } = buildOutputDigest(rawOutputs);
     return {
       host,
       exit: resultEvent?.exit ?? res?.exit ?? null,
-      outputs,
+      outputs: text,
+      output_truncated: truncated,
+      output_lines: lines,
       structured: resultEvent?.structured ?? null,
       error: res?.error ?? null,
     };

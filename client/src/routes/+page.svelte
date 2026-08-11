@@ -212,25 +212,27 @@
     "system state (current disk/memory, a service's real status, today's logs) or when the user " +
     "asked you to take an action. For general-knowledge questions, just give the answer and DO " +
     "NOT run a command at all.\n\n" +
-    "When you do run a command: explain in your text response what you're about to run and why, " +
-    "THEN call the tool — the user sees your explanation before the approval prompt. Prefer the " +
-    "`terminal` tool: it types the command into the live terminal (the user sees exactly what " +
-    "runs) and returns the output — this works on ANY host, including password-only ones. The " +
-    "structured tools (service/log/config/snapshot) give cleaner results on key-based hosts when " +
-    "available. Use `read_terminal` to see the current terminal screen — the live view of the " +
-    "active session, NOT the shell history file (~/.bash_history is a separate concern and does " +
-    "not reflect the current terminal).\n\n" +
+    "TO RUN A COMMAND, ALWAYS use the `terminal` tool first: it types the command into the user's " +
+    "LIVE terminal (which is already logged in) and returns the output — it works on ANY host, " +
+    "including password-only ones, and needs no key or agent. The structured tools " +
+    "(run_command/snapshot/service/log/config) open a SEPARATE ssh connection and only work on " +
+    "key-based hosts with the puppetterm-agent installed; if one fails with an SSH permission " +
+    "error, the app retries in the live terminal automatically.\n\n" +
+    "Before running anything, explain in text what you'll run and why — the user sees your " +
+    "explanation before the approval prompt. Use `read_terminal` to see the current terminal " +
+    "screen — the live view of the active session, NOT the shell history file (~/.bash_history " +
+    "is a separate concern and does not reflect the current terminal).\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
   const AGENT_TOOLS = [
-    { type: "function", function: { name: "run_command", description: "Run an arbitrary shell command on the active host (always approved first).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
-    { type: "function", function: { name: "terminal", description: "Run a command directly in the current terminal by typing it (like a human) and wait for the output to settle. Works on ANY host, including password-only ones; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
+    { type: "function", function: { name: "terminal", description: "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Works on ANY host — key or password — and needs no agent. THIS IS THE PREFERRED WAY to run commands; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
+    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "run_command", description: "Run a command over a SEPARATE ssh connection via the installed puppetterm-agent. ONLY works on key-based hosts with the agent installed; on password-only hosts it FAILS with 'Permission denied'. Prefer `terminal` (works everywhere). Use only when you need structured, audited agent results on a key host.", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
     { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime.", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "service", description: "Control a systemd service on the active host.", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
     { type: "function", function: { name: "log", description: "Tail a log file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
     { type: "function", function: { name: "config", description: "Read or write a config file on the active host (allow-listed paths).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
-    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
   ];
 
   const TOOL_TO_ACTION: Record<string, string> = {
@@ -640,6 +642,37 @@
     return false; // run_command and anything else asks
   }
 
+  /** Map a structured agent tool call to a plain shell command, used to fall
+   *  back to the live terminal when the agent route is unavailable (e.g. a
+   *  password-only host without the agent). Returns null when there's no clean
+   *  shell equivalent (e.g. config writes). */
+  function structuredToolToShell(name: string, args: Record<string, unknown>): string | null {
+    switch (name) {
+      case "run_command":
+        return String(args.cmd ?? "").trim() || null;
+      case "snapshot":
+        return "df -h; echo; free -h; echo; uptime";
+      case "service": {
+        const unit = String(args.unit ?? "");
+        const op = String(args.op ?? "status");
+        if (!unit) return null;
+        const needsSudo = ["start", "stop", "restart", "enable", "disable"].includes(op);
+        return `${needsSudo ? "sudo " : ""}systemctl ${op} ${unit}`;
+      }
+      case "log": {
+        const path = String(args.path ?? "");
+        if (!path) return null;
+        const lines = Number(args.lines) || 50;
+        return `tail -n ${lines} ${path}`;
+      }
+      case "config":
+        if (args.op === "read") return `cat ${String(args.path ?? "")}`;
+        return null; // writes need the agent's structured path
+      default:
+        return null;
+    }
+  }
+
   // Commands that don't change state — the `terminal` tool auto-runs these.
   const READONLY_CMDS = [
     "ls", "cat", "pwd", "whoami", "echo", "head", "tail", "grep", "df", "free",
@@ -1043,6 +1076,7 @@
     const request = { action, params: args, request_id: tc.id };
     currentRequestId = tc.id;
     let res: any;
+    let agentErr: string | null = null;
     try {
       res = await call<any>("run_agent_action", {
         host,
@@ -1050,9 +1084,32 @@
         source: "ai",
         approved: true,
       });
+    } catch (e) {
+      agentErr = String(e ?? "");
     } finally {
       currentRequestId = null;
     }
+    // SSH-layer failure (e.g. password-only host without the agent, or no key
+    // auth) — fall back to typing an equivalent command into the user's live
+    // terminal, which is ALREADY logged in. This is the whole point: the AI
+    // rides the connection the user opened, so password remotes just work.
+    const agentProblem =
+      agentErr != null ||
+      /permission denied|publickey|connection (?:refused|timed out)|no route to host|could not resolve hostname/i.test(
+        res?.error ?? "",
+      );
+    if (agentProblem) {
+      const cmd = structuredToolToShell(name, args);
+      if (cmd) {
+        const why = (agentErr ?? res?.error ?? "ssh failure").slice(0, 140);
+        term?.write(
+          `\r\n\x1b[33m[puppetterm] agent route unavailable (${why}) — running in your live terminal instead\x1b[0m\r\n`,
+        );
+        const fb = await runInTerminal(host, term, cmd);
+        return { ...fb, fallback: true, from: name };
+      }
+    }
+    if (agentErr) throw new Error(agentErr);
     for (const ev of res?.events ?? []) {
       if (ev?.type === "output" && term) term.write(ev.data ?? "");
     }

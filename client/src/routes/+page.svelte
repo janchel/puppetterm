@@ -1202,7 +1202,13 @@
     if (mode === "read") {
       const readCap = 100000; // full file up to ~100k chars — a large compose/env/config set fits
       if (raw.length <= readCap) {
-        return { text: raw, truncated: false, lines: raw.split("\n").length };
+        // Explicitly tell the model this is the COMPLETE file — otherwise a
+        // long config can look "cut off" and the AI wastes turns re-reading it.
+        return {
+          text: `[file: ${raw.length} bytes — full content below]\n${raw}`,
+          truncated: false,
+          lines: raw.split("\n").length,
+        };
       }
       return {
         text: `[file: ${raw.length} bytes — truncated at ${readCap} chars]

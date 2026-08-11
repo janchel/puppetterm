@@ -1398,10 +1398,6 @@
     } finally {
       currentRequestId = null;
     }
-    // SSH-layer failure (e.g. password-only host without the agent, or no key
-    // auth) — fall back to typing an equivalent command into the user's live
-    // terminal, which is ALREADY logged in. This is the whole point: the AI
-    // rides the connection the user opened, so password remotes just work.
     const agentProblem =
       agentErr != null ||
       /permission denied|publickey|connection (?:refused|timed out)|no route to host|could not resolve hostname/i.test(
@@ -1419,17 +1415,25 @@
       }
     }
     if (agentErr) throw new Error(agentErr);
-    for (const ev of res?.events ?? []) {
-      if (ev?.type === "output" && term) term.write(ev.data ?? "");
-    }
-    if (res?.error && term) {
-      term.write(`\r\n\x1b[31m[puppetterm] action error: ${res.error}\x1b[0m\r\n`);
-    }
+    // Agent mode: the AI already gets the full result via the tool message, so
+    // DON'T stream the raw agent stdout into the terminal — that would pollute
+    // the terminal buffer, and if the AI later calls `read_terminal`/`terminal`
+    // it would pull a big dump back into the context window. A concise status
+    // line keeps the user informed without the token cost.
     const resultEvent = [...(res?.events ?? [])].reverse().find((e: any) => e?.type === "result");
     const rawOutputs = (res?.events ?? [])
       .filter((e: any) => e?.type === "output")
       .map((e: any) => e.data ?? "")
       .join("");
+    if (term) {
+      const exit = resultEvent?.exit ?? res?.exit ?? null;
+      term.write(
+        `\r\n\x1b[36m[puppetterm] ${name} → exit ${exit ?? "?"}, ${rawOutputs.length} bytes output\x1b[0m\r\n`,
+      );
+    }
+    if (res?.error && term) {
+      term.write(`\r\n\x1b[31m[puppetterm] action error: ${res.error}\x1b[0m\r\n`);
+    }
     // Same digest as the live-terminal path: large agent output is trimmed to
     // head + tail + error/warning lines so it doesn't burn tokens. EXCEPT for
     // file/log reads (config read, log tail, or run_command running cat/sed/

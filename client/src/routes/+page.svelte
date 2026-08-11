@@ -11,6 +11,7 @@
   type Tab = {
     id: number;
     host: string; // remote target ("" = local shell); updated when `ssh <target>` is detected
+    cwd: string; // current working directory, parsed from the shell prompt ("" = unknown)
     sessionId: number | null;
     connecting: boolean;
     buf: string; // input buffer used to detect `ssh <target>` commands
@@ -25,6 +26,8 @@
 
   // The host the AI chat binds to (the active session's host).
   let activeHost = $derived(tabs.find((t) => t.id === activeTabId)?.host ?? null);
+  // Current working directory of the active session, parsed from its prompt.
+  let activeTabCwd = $derived(tabs.find((t) => t.id === activeTabId)?.cwd ?? "");
 
   // Pinned at send time: the terminal + host a chat task is acting on. Kept so
   // switching tabs mid-task can never redirect the AI to a different server.
@@ -239,11 +242,17 @@
 
   /** The tools + system prompt to hand the model for a given host, depending
    *  on whether the remote agent is installed: agent mode exposes the
-   *  structured tools (agentic), otherwise the AI only gets the terminal tools. */
-  function chatConfigFor(host: string | null | undefined) {
+   *  structured tools (agentic), otherwise the AI only gets the terminal tools.
+   *  `cwd` (the session's current directory, if known) is injected so the AI
+   *  knows WHERE it's working — like opencode locking to a folder. */
+  function chatConfigFor(host: string | null | undefined, cwd?: string | null) {
     const hasAgent = hostHasAgent(host);
     const tools = hasAgent ? AGENT_TOOLS : TERMINAL_ONLY_TOOLS;
-    const prompt = hasAgent ? AGENT_SYSTEM_PROMPT : TERMINAL_SYSTEM_PROMPT;
+    const base = hasAgent ? AGENT_SYSTEM_PROMPT : TERMINAL_SYSTEM_PROMPT;
+    const cwdLine = cwd
+      ? `\n\nYou are currently working in the directory \`${cwd}\` on ${host || "this host"}. Prefer commands relative to that directory (or reference the full path) when the user asks about files/folders there.`
+      : "";
+    const prompt = base + cwdLine;
     return { tools, prompt, hasAgent };
   }
 
@@ -430,7 +439,7 @@
     }
 
     const id = nextTabId++;
-    tabs = [...tabs, { id, host: host ?? "", sessionId: null, connecting: false, buf: "" }];
+    tabs = [...tabs, { id, host: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "" }];
     activeTabId = id;
     showHostMenu = false;
     await tick();
@@ -799,8 +808,11 @@
     const target = { host: activeHost ?? "", tabId: activeTabId ?? -1 };
     chatTarget = target;
     // Agent-aware: choose the tool set + system prompt based on whether the
-    // remote agent is installed, so the AI knows if it's in agentic mode.
-    const cfg = chatConfigFor(target.host);
+    // remote agent is installed, so the AI knows if it's in agentic mode. The
+    // tab's current working directory (parsed from the prompt) is also passed
+    // so the AI knows where it's working.
+    const tab = target.tabId >= 0 ? tabs.find((x) => x.id === target.tabId) : null;
+    const cfg = chatConfigFor(target.host, tab?.cwd || null);
     chatTools = cfg.tools;
     chatPrompt = cfg.prompt;
     abortRequested = false;
@@ -959,6 +971,23 @@
     return target;
   }
 
+  /** Extract the current working directory from a shell prompt line, e.g.
+   *  `isr@svr-dev5:/opt/docker/mcp-rag$` → `/opt/docker/mcp-rag`, or
+   *  `devops@box:~/proj$` → `~/proj`. Returns null when the prompt doesn't
+   *  carry a directory (custom/unusual PS1). This is what lets the AI know
+   *  WHERE it's working, like opencode locking to a folder. */
+  function cwdFromPrompt(line: string): string | null {
+    // user@host:<dir>$ or user@host:<dir># — dir is between the last ':' and
+    // the trailing prompt char, may contain '~' for home.
+    const m = line.match(/[^@\s]+@[^:\s]+:(\S*)[$#>]\s*$/);
+    if (!m) return null;
+    const dir = m[1].trim();
+    // The captured group can include the dir plus trailing cruft from a busy
+    // PS1 (git branch etc.) — keep only a clean path-ish token.
+    const clean = dir.replace(/[()\[\]{}]|\(.*\)$/, "").trim();
+    return clean && (clean.startsWith("/") || clean.startsWith("~")) ? clean : null;
+  }
+
   /** Detect an ssh target from what's on screen. This catches commands that
    *  never passed through onData — e.g. recalled with the up-arrow — because
    *  the shell echoes them into the pty output. Only scans when the shell is
@@ -980,6 +1009,10 @@
     while (li >= 0 && lines[li].trim() === "") li--;
     const last = (lines[li] ?? "").trim();
     if (!/[\$#>] ?$/.test(last)) return; // only when at a shell prompt
+    // Track the working directory so the AI knows WHERE it's working (the
+    // prompt carries it, e.g. `user@host:/opt/docker/mcp-rag$`).
+    const dir = cwdFromPrompt(last);
+    if (dir) t.cwd = dir;
     // If the remote session has ended (e.g. the user typed `exit`, or ssh
     // dropped), OpenSSH prints "Connection to <host> closed." — forget the
     // host so the status dot turns grey and the AI no longer targets it.
@@ -1614,6 +1647,9 @@
             <span class="mode-badge agent">agent</span>
           {:else if agentMap[activeHost] === false}
             <span class="mode-badge terminal">terminal</span>
+          {/if}
+          {#if activeTabCwd}
+            <span class="ai-cwd" title="Current working directory on the host">{activeTabCwd}</span>
           {/if}
           {#if chatBusy && chatTarget && chatTarget.host !== activeHost}
             <span class="warn">(pinned — you switched tabs)</span>
@@ -2439,6 +2475,19 @@
     color: #8b949e;
     background: #161b22;
     border: 1px solid #30363d;
+  }
+  .ai-cwd {
+    font-family: monospace;
+    font-size: 11px;
+    color: #58a6ff;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 1px 6px;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .install-agent {
     margin-left: auto;

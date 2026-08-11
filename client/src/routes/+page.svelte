@@ -1226,11 +1226,16 @@
    *  contents (so we return the full file instead of the head/tail digest).
    *  Matches common file-viewing invocations — plain `cat file`, numbered
    *  reads (`cat -n file`, `nl file`, `sed -n '1,50p' file`), `head`/`tail`
-   *  of a file. Pipelines/chains are treated as generic command output. */
+   *  of a file. Also accepts compound commands that END in a file read, e.g.
+   *  `cd /dir && cat file` or `ls -la /dir; cat file` — the AI often chains
+   *  an ls with a cat. Pipelines are treated as generic command output. */
   function isFileReadCommand(cmd: string): boolean {
     const c = cmd.trim().replace(/^sudo\s+/, "");
-    if (/[|;&]/.test(c)) return false; // pipelines / chains → generic output
-    const m = c.match(/^(\S+)\s+(.+)$/);
+    // Take the LAST `;`/`&&`/`||` segment (chained like `ls; cat file` or
+    // `cd dir && cat file`), then reject pipelines within that segment.
+    const lastSeg = (c.split(/[;&]|\|\||&&/).filter(Boolean).pop() ?? c).trim();
+    if (/[|]/.test(lastSeg)) return false; // pipelines → generic output
+    const m = lastSeg.match(/^(\S+)\s+(.+)$/);
     if (!m) return false;
     const tool = m[1];
     const target = m[2]?.trim() ?? "";

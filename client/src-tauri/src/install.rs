@@ -123,6 +123,7 @@ pub fn install_agent(
     host: &str,
     agent_dir: Option<&str>,
     pubkey_path: Option<String>,
+    force: bool,
     emit: &dyn Fn(&str),
 ) -> Result<InstallResult, String> {
     // 1) remote arch
@@ -135,9 +136,11 @@ pub fn install_agent(
     };
     emit(&format!("==> puppetterm-agent install on {host} ({machine})"));
 
-    // 1b) idempotency: if a full (root) agent is already installed, nothing to do.
+    // 1b) idempotency: if a full (root) agent is already installed, nothing to
+    // do — UNLESS `force` (update/reinstall) is set, in which case we re-run
+    // the whole install so the binary/config/sudoers are refreshed.
     let root_agent = "/usr/local/bin/puppetterm-agent";
-    if ssh_ok(host, &["test", "-x", root_agent]) {
+    if !force && ssh_ok(host, &["test", "-x", root_agent]) {
         emit(&format!(
             "==> agent already installed at {root_agent} (root install) — nothing to do"
         ));
@@ -154,7 +157,11 @@ pub fn install_agent(
     let mut already = false;
     if ssh_ok(host, &["test", "-x", "~/.puppetterm/bin/puppetterm-agent"]) {
         already = true;
-        emit("==> agent already installed (user-space) — refreshing binary + config (idempotent)");
+        emit(if force {
+            "==> agent already installed (user-space) — forced update: refreshing binary + config"
+        } else {
+            "==> agent already installed (user-space) — refreshing binary + config (idempotent)"
+        });
     }
 
     // 2) local agent binary
@@ -293,7 +300,7 @@ mod tests {
         let host = std::env::var("PUPPETTERM_TEST_HOST")
             .unwrap_or_else(|_| "user@host".to_string());
         let lines = std::cell::RefCell::new(Vec::<String>::new());
-        let res = install_agent(&host, None, None, &|l| lines.borrow_mut().push(l.to_string()))
+        let res = install_agent(&host, None, None, false, &|l| lines.borrow_mut().push(l.to_string()))
             .expect("install_agent");
         assert!(
             res.agent_path.contains(".puppetterm") || res.agent_path.contains("/usr/local/bin"),

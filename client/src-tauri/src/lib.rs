@@ -259,6 +259,7 @@ async fn install_agent_on_host(
     host: String,
     agent_dir: Option<String>,
     pubkey_path: Option<String>,
+    force: Option<bool>,
 ) -> Result<install::InstallResult, String> {
     // Resolve the agent binary dir: explicit param → env → source-tree
     // agent/bin (dev: `make cross` output) → bundled resource dir (packaged
@@ -286,12 +287,18 @@ async fn install_agent_on_host(
     let app2 = app.clone();
     let host2 = host.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        install::install_agent(&host2, agent_dir.as_deref(), pubkey_path, &|line| {
-            let _ = app2.emit(
-                "install-output",
-                InstallOutput { host: host2.clone(), data: line.to_string() },
-            );
-        })
+        install::install_agent(
+            &host2,
+            agent_dir.as_deref(),
+            pubkey_path,
+            force.unwrap_or(false),
+            &|line| {
+                let _ = app2.emit(
+                    "install-output",
+                    InstallOutput { host: host2.clone(), data: line.to_string() },
+                );
+            },
+        )
     })
     .await
     .map_err(|e| e.to_string())?

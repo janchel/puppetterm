@@ -295,6 +295,10 @@
     "may also use the `terminal` tool to type a command into the user's live terminal when the " +
     "structured tools don't cover it (e.g. interactive commands) — it works on any host. Use " +
     "`read_terminal` to see the current terminal screen.\n\n" +
+    "NOTE: `run_command` runs in the user's HOME directory, NOT your shell's current folder — " +
+    "always use ABSOLUTE paths (e.g. `cat /opt/docker/mcp-rag/docker-compose.yml`) when reading " +
+    "files with it, or use the `terminal` tool (which types into the live shell where relative " +
+    "paths and the working directory apply).\n\n" +
     "Before running anything, explain in text what you'll run and why — the user sees your " +
     "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
     "(first/last lines + any error/warning lines) to save tokens, but FILE READS via `config` " +
@@ -1193,12 +1197,13 @@
    *     whole thing, not just the first/last lines. */
   function buildOutputDigest(raw: string, capChars = 8000, mode: "output" | "read" = "output") {
     if (mode === "read") {
-      const readCap = 30000; // full file up to ~30k chars (a big config still fits)
+      const readCap = 100000; // full file up to ~100k chars — a large compose/env/config set fits
       if (raw.length <= readCap) {
         return { text: raw, truncated: false, lines: raw.split("\n").length };
       }
       return {
-        text: `[file: ${raw.length} bytes — truncated at ${readCap} chars]\n` + raw.slice(0, readCap),
+        text: `[file: ${raw.length} bytes — truncated at ${readCap} chars]
+` + raw.slice(0, readCap),
         truncated: true,
         lines: raw.split("\n").length,
       };
@@ -1297,7 +1302,7 @@
     // then trimmed to a compact digest if it's large (see buildOutputDigest).
     // File reads (cat/sed/awk/head/tail of a file) keep the FULL content so the
     // AI can actually review config/compose files instead of a head/tail digest.
-    const raw = terminalTextFrom(term, startLine, 600);
+    const raw = terminalTextFrom(term, startLine, 3000);
     const mode = isFileReadCommand(cmd) ? "read" : "output";
     const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
     return {

@@ -36,7 +36,7 @@
   let chatPrompt = $state<string>("");
 
   // ---- agent install (in-terminal, approval-style: install the agent on the connected host) ---
-  let installPrompt = $state<{ tabId: number; host: string } | null>(null); // awaiting y/n in the terminal
+  let installPrompt = $state<{ tabId: number; host: string; force?: boolean } | null>(null); // awaiting y/n in the terminal
   let installBusy = $state(false);
   let installTabId = $state<number | null>(null); // route install-output events here
   let agentChecked = $state<Set<string>>(new Set()); // hosts we've already hinted about
@@ -454,9 +454,9 @@
       if (installPrompt && installPrompt.tabId === id) {
         const ch = data.trim().toLowerCase();
         if (ch === "y") {
-          const { host } = installPrompt;
+          const { host, force } = installPrompt;
           installPrompt = null;
-          runInstall(id, host);
+          runInstall(id, host, force ?? false);
         } else if (ch === "n" || ch === "\r" || ch === "\u0003") {
           term.write("\r\n\x1b[90m[puppetterm] install cancelled\x1b[0m\r\n");
           installPrompt = null;
@@ -845,27 +845,38 @@
   // ---- agent install (in-terminal, approval-style) --------------------------------
   /** Ask in the terminal: install the agent on the active host? [y/N] */
   function promptInstall() {
+    promptAgentAction("Install", "install");
+  }
+
+  /** Ask in the terminal: update (reinstall) the agent on the active host? */
+  function promptUpdateAgent() {
+    promptAgentAction("Update", "update");
+  }
+
+  function promptAgentAction(verb: string, mode: "install" | "update") {
     const host = activeHost;
     const tabId = activeTabId;
     const term = activeTerm();
     if (!host || !tabId || !term || installBusy) return;
-    installPrompt = { tabId, host };
+    installPrompt = { tabId, host, force: mode === "update" };
     term.write(
-      `\r\n\x1b[33m[puppetterm]\x1b[0m Install puppetterm-agent on \x1b[1m${host}\x1b[0m ` +
-        `(user-space, no sudo — reuses your SSH connection)? [y/N] `,
+      `\r\n\x1b[33m[puppetterm]\x1b[0m ${verb} puppetterm-agent on \x1b[1m${host}\x1b[0m ` +
+        `(reuses your SSH connection)? [y/N] `,
     );
   }
 
   /** Stream the install into the terminal for the given tab. */
-  async function runInstall(id: number, host: string) {
+  async function runInstall(id: number, host: string, force = false) {
     const term = termByTab.get(id)?.term;
     installTabId = id;
     installBusy = true;
-    term?.write(`\r\n\x1b[35m[puppetterm install] starting on ${host}…\x1b[0m\r\n`);
+    term?.write(
+      `\r\n\x1b[35m[puppetterm install] ${force ? "updating" : "starting on"} ${host}…\x1b[0m\r\n`,
+    );
     try {
-      const res = await call<any>("install_agent_on_host", { host });
+      const res = await call<any>("install_agent_on_host", { host, force });
       term?.write(
-        `\r\n\x1b[32m[puppetterm install] ${res?.already ? "already present —" : "done —"} ` +
+        `\r\n\x1b[32m[puppetterm install] ${res?.already && !force ? "already present —" : "done —"} ` +
           `${res?.mode ?? "user"} agent at ${res?.agent_path ?? "~/.puppetterm/bin/puppetterm-agent"}` +
           `\x1b[0m\r\n`,
       );
@@ -1537,6 +1548,15 @@
             title="Install puppetterm-agent on {activeHost} (no sudo, reuses your SSH connection)"
           >
             Install agent
+          </button>
+        {/if}
+        {#if activeHost && !installBusy && hostHasAgent(activeHost)}
+          <button
+            class="install-agent update"
+            onclick={promptUpdateAgent}
+            title="Update puppetterm-agent on {activeHost} (reinstall from the current build)"
+          >
+            ↻ Update agent
           </button>
         {/if}
       </div>
@@ -2345,6 +2365,14 @@
   .install-agent:hover {
     background: #238636;
     color: #fff;
+  }
+  .install-agent.update {
+    border-color: #d29922;
+    color: #d29922;
+  }
+  .install-agent.update:hover {
+    background: #d29922;
+    color: #000;
   }
   .approval-btns {
     display: flex;

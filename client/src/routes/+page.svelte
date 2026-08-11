@@ -221,7 +221,10 @@
     "Before running anything, explain in text what you'll run and why — the user sees your " +
     "explanation before the approval prompt. Use `read_terminal` to see the current terminal " +
     "screen — the live view of the active session, NOT the shell history file (~/.bash_history " +
-    "is a separate concern and does not reflect the current terminal).\n\n" +
+    "is a separate concern and does not reflect the current terminal). Large tool output is " +
+    "trimmed to a digest (first/last lines + any error/warning lines) to save tokens — if you " +
+    "need more detail, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via the " +
+    "`terminal` tool to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -1007,6 +1010,36 @@
     return lines.join("\n");
   }
 
+  /** Lines worth surfacing when terminal output is trimmed — error / warning /
+   *  failure-ish lines that usually matter for log questions. */
+  const ERRORISH_LINE =
+    /(?:error|errno|failed|failure|fatal|exception|traceback|panic|segfault|denied|timed?\s?out|refused|critical|warn(?:ing)?|out of memory|no space left)/i;
+
+  /** Build a compact digest of large terminal output instead of sending the
+   *  whole buffer (every char costs tokens). Small output passes through as-is;
+   *  large output becomes: first ~25 lines + "… N omitted …" + last ~80 lines,
+   *  plus any error/warning-ish lines found (deduped, capped). Returns the
+   *  text plus whether it was trimmed and the true total line count. */
+  function buildOutputDigest(raw: string, capChars = 8000) {
+    const lines = raw.split("\n");
+    const total = lines.length;
+    if (raw.length <= capChars) {
+      return { text: raw, truncated: false, lines: total };
+    }
+    const head = lines.slice(0, 25).join("\n");
+    const tail = lines.slice(-80).join("\n");
+    const omitted = Math.max(0, total - 25 - 80);
+    const hits = [...new Set(lines.filter((l) => ERRORISH_LINE.test(l)))].slice(0, 20);
+    let digest = `[output: ${total} lines — trimmed to first 25 + last 80]\n`;
+    digest += head;
+    if (omitted > 0) digest += `\n… ${omitted} lines omitted …\n`;
+    digest += tail;
+    if (hits.length > 0) {
+      digest += `\n[matched error/warning lines (${hits.length}):]\n` + hits.join("\n");
+    }
+    return { text: digest.slice(0, capChars + 2000), truncated: true, lines: total };
+  }
+
   /** Type a command into the LIVE terminal (like a human) and wait for the
    *  output to settle, then hand the result back to the AI. Works on any
    *  connection — key or password — because it rides the user's real pty. */
@@ -1039,13 +1072,19 @@
         stableSince = Date.now();
       }
     }
-    // From the command start to the current end of the buffer — full output.
-    const output = terminalTextFrom(term, startLine, 600).slice(-18000);
+    // From the command start to the current end of the buffer — full output,
+    // then trimmed to a compact digest if it's large (see buildOutputDigest).
+    const raw = terminalTextFrom(term, startLine, 600);
+    const { text, truncated, lines } = buildOutputDigest(raw);
     return {
       host: host || null,
-      note: "typed into the live terminal and waited for the output to settle",
+      note: truncated
+        ? `typed into the live terminal; output was ${lines} lines and is trimmed to a digest (run grep/tail/head/wc to narrow it)`
+        : "typed into the live terminal and waited for the output to settle",
       command: cmd,
-      output,
+      output: text,
+      truncated,
+      total_lines: lines,
     };
   }
 
@@ -1063,12 +1102,17 @@
     // Client-local tools (no SSH round-trip) — work on local OR remote tabs.
     if (name === "read_terminal") {
       if (!term) return { error: "no active terminal" };
-      const text = terminalText(term, 400);
+      const raw = terminalText(term, 400);
+      const { text, truncated, lines } = buildOutputDigest(raw);
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
         host: host || null,
-        note: "live terminal screen (not shell history)",
-        terminal: text.slice(-12000),
+        note: truncated
+          ? `terminal screen was ${lines} lines — trimmed to a digest (run grep/tail/head to narrow it)`
+          : "live terminal screen (not shell history)",
+        terminal: text,
+        truncated,
+        total_lines: lines,
       };
     }
 

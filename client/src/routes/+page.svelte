@@ -1313,18 +1313,26 @@
     term.write(`\r\n\x1b[36m[puppetterm] AI types: ${cmd}\x1b[0m\r\n`);
     await call("write_ssh_input", { id: t.sessionId, data: cmd });
     await call("write_ssh_input", { id: t.sessionId, data: "\r" });
-    // Wait for output to stop changing (or a cap), then return the tail.
-    // File reads of a large file can stream for a while — give them more time
-    // and require a longer stable window so we don't return a half-finished
-    // file and make the AI think it was truncated.
+    // Wait for the command to finish. For file reads the reliable "done" signal
+    // is the shell prompt returning AFTER the output (a large file over a slow
+    // link can pause >1s between chunks, which a pure stable-window check would
+    // mistake for completion). We require: buffer has grown past the echo AND
+    // the last line looks like a prompt ($/#/>). Non-reads keep the shorter
+    // stable-window approach (fast commands, no giant streams).
     const isRead = isFileReadCommand(cmd);
     const deadline = Date.now() + (isRead ? 60000 : 30000);
-    const stableMs = isRead ? 1500 : 800;
+    const stableMs = isRead ? 2500 : 800;
+    const lastLine = (s: string) => (s.split("\n").filter(Boolean).pop() ?? "").trimEnd();
+    const isPromptLine = (s: string) => /[$#>]\s*$/.test(s);
     let last = terminalText(term, 2000);
     let stableSince = Date.now();
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 250));
       const nowText = terminalText(term, 2000);
+      const line = lastLine(nowText);
+      // Prompt returned after the echo + output → command is done.
+      const grew = term.buffer.active.length > startLine + 2;
+      if (isRead && grew && isPromptLine(line)) break;
       if (nowText === last) {
         if (Date.now() - stableSince > stableMs) break;
       } else {
@@ -1336,7 +1344,7 @@
     // then trimmed to a compact digest if it's large (see buildOutputDigest).
     // File reads (cat/sed/awk/head/tail of a file) keep the FULL content so the
     // AI can actually review config/compose files instead of a head/tail digest.
-    const raw = terminalTextFrom(term, startLine, 3000);
+    const raw = terminalTextFrom(term, startLine, isRead ? 9000 : 3000);
     const mode = isRead ? "read" : "output";
     const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
     // DEBUG: show the AI exactly what we're handing back, so truncation (if
@@ -1440,6 +1448,48 @@
       if (/not found|No such file|Permission denied|publickey|refused|timed out/i.test(agentErr ?? res?.error ?? "")) {
         agentMap[host] = false;
         agentChecked.delete(host);
+      }
+      // File reads (config read / log tail / run_command cat) are much better
+      // served by a DIRECT ssh capture than by typing `cat` into the live
+      // terminal: the terminal path scrapes the xterm buffer, which can cut
+      // large files at scrollback/settle limits and make the AI think the file
+      // is truncated. A dedicated ssh exec returns every byte. Falls back to
+      // the live terminal if direct ssh isn't available (password-only hosts).
+      const isRead =
+        (name === "config" && String(args.op ?? "") === "read") ||
+        name === "log" ||
+        (name === "run_command" && isFileReadCommand(String(args.cmd ?? "")));
+      if (cmd && isRead) {
+        try {
+          const cap = await call<any>("ssh_capture", { host, cmd });
+          const authProblem =
+            cap == null ||
+            cap.exit == null ||
+            /permission denied|publickey|connection (?:refused|timed out)|no route to host|could not resolve hostname/i.test(
+              String(cap?.stderr ?? ""),
+            );
+          if (!authProblem) {
+            const rawOut = String(cap.stdout ?? "");
+            const { text, truncated, lines } = buildOutputDigest(rawOut, 8000, "read");
+            term?.write(
+              `\r\n\x1b[90m[puppetterm] read ${lines} lines / ${rawOut.length} bytes over ssh\x1b[0m\r\n`,
+            );
+            return {
+              host,
+              exit: cap.exit,
+              outputs: text,
+              output_truncated: truncated,
+              output_lines: lines,
+              via: "ssh-capture",
+              fallback: true,
+              from: name,
+            };
+          }
+          // ssh auth failed → fall through to the live-terminal fallback below.
+        } catch (e) {
+          // ssh unavailable (password host) → live-terminal fallback below.
+          console.warn("ssh_capture failed, falling back to live terminal:", e);
+        }
       }
       if (cmd) {
         const why = (agentErr ?? res?.error ?? "ssh failure").slice(0, 140);

@@ -244,6 +244,40 @@ fn stop_agent_action(request_id: String, host: Option<String>) -> bool {
     killed
 }
 
+/// Run a command on a host over a plain key-based SSH connection and return
+/// the FULL captured stdout (no pty, no agent). Used for file reads when the
+/// agent binary isn't installed — reading through the live terminal (typing
+/// `cat` and scraping the xterm buffer) can cut large files at scrollback or
+/// settle-time limits, but a direct SSH exec returns every byte.
+#[tauri::command]
+async fn ssh_capture(host: String, cmd: String) -> Result<serde_json::Value, String> {
+    if host.trim().is_empty() || cmd.trim().is_empty() {
+        return Err("ssh_capture: empty host or command".into());
+    }
+    let host2 = host.clone();
+    let cmd2 = cmd.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = std::process::Command::new("ssh")
+            .args([
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=8",
+                "-o", "StrictHostKeyChecking=accept-new",
+            ])
+            .arg(&host2)
+            .arg(&cmd2)
+            .output()
+            .map_err(|e| format!("ssh_capture: {e}"))?;
+        Ok(serde_json::json!({
+            "host": host2,
+            "exit": out.status.code().unwrap_or(-1),
+            "stdout": String::from_utf8_lossy(&out.stdout),
+            "stderr": String::from_utf8_lossy(&out.stderr),
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Whether the puppetterm agent is already present on the host.
 #[tauri::command]
 fn check_agent(host: String) -> bool {
@@ -492,6 +526,7 @@ pub fn run() {
             run_agent_action,
             stop_agent_action,
             check_agent,
+            ssh_capture,
             install_agent_on_host,
             audit_recent,
             get_ai_config,

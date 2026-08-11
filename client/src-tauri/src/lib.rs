@@ -470,20 +470,6 @@ fn cleanup_stale_masters() {
     }
 }
 
-/// Append a line to the AI-debug log file so we can inspect what the webview
-/// handed back to the model without having to see the terminal buffer.
-#[tauri::command]
-fn log_ai_debug(line: String) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/puppetterm-ai-debug.log")
-    {
-        use std::io::Write as _;
-        let _ = writeln!(f, "{line}");
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -510,8 +496,7 @@ pub fn run() {
             audit_recent,
             get_ai_config,
             set_ai_config,
-            ai_chat,
-            log_ai_debug
+            ai_chat
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

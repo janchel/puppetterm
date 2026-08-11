@@ -263,10 +263,11 @@
     "see the current terminal screen — the live view of the active session, NOT the shell " +
     "history file.\n\n" +
     "Before running anything, explain in text what you'll run and why — the user sees your " +
-    "explanation before the approval prompt. Large tool output is trimmed to a digest " +
-    "(first/last lines + any error/warning lines) to save tokens — if you need more detail, " +
-    "run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via the `terminal` tool to " +
-    "narrow it.\n\n" +
+    "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
+    "(first/last lines + any error/warning lines) to save tokens, but FILE READS (`cat`, `sed`, " +
+    "`head`, `tail` of a file) return the FULL content — so the AI can inspect config/compose " +
+    "files completely. If output is trimmed, run a follow-up like `grep`, `tail -n`, `head -n` " +
+    "or `wc -l` via the `terminal` tool to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -286,9 +287,11 @@
     "structured tools don't cover it (e.g. interactive commands) — it works on any host. Use " +
     "`read_terminal` to see the current terminal screen.\n\n" +
     "Before running anything, explain in text what you'll run and why — the user sees your " +
-    "explanation before the approval prompt. Large tool output is trimmed to a digest " +
-    "(first/last lines + any error/warning lines) to save tokens — if you need more detail, " +
-    "run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` to narrow it.\n\n" +
+    "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
+    "(first/last lines + any error/warning lines) to save tokens, but FILE READS via `config` " +
+    "(read) or `log` return the FULL content — prefer those when the user wants to inspect a " +
+    "config/compose file. If output is trimmed, run a follow-up like `grep`, `tail -n`, `head " +
+    "-n` or `wc -l` to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -1148,8 +1151,25 @@
    *  whole buffer (every char costs tokens). Small output passes through as-is;
    *  large output becomes: first ~25 lines + "… N omitted …" + last ~80 lines,
    *  plus any error/warning-ish lines found (deduped, capped). Returns the
-   *  text plus whether it was trimmed and the true total line count. */
-  function buildOutputDigest(raw: string, capChars = 8000) {
+   *  text plus whether it was trimmed and the true total line count.
+   *
+   *  `mode`:
+   *   - "output" (default): command output → head/tail digest (ps, df, logs…)
+   *   - "read": file contents → keep the FULL file, only capped at a much
+   *     higher limit. When the AI reads a config/compose file it needs the
+   *     whole thing, not just the first/last lines. */
+  function buildOutputDigest(raw: string, capChars = 8000, mode: "output" | "read" = "output") {
+    if (mode === "read") {
+      const readCap = 30000; // full file up to ~30k chars (a big config still fits)
+      if (raw.length <= readCap) {
+        return { text: raw, truncated: false, lines: raw.split("\n").length };
+      }
+      return {
+        text: `[file: ${raw.length} bytes — truncated at ${readCap} chars]\n` + raw.slice(0, readCap),
+        truncated: true,
+        lines: raw.split("\n").length,
+      };
+    }
     const lines = raw.split("\n");
     const total = lines.length;
     if (raw.length <= capChars) {
@@ -1167,6 +1187,29 @@
       digest += `\n[matched error/warning lines (${hits.length}):]\n` + hits.join("\n");
     }
     return { text: digest.slice(0, capChars + 2000), truncated: true, lines: total };
+  }
+
+  /** True when a `terminal` command looks like it's READING a file's contents
+   *  (so we return the full file instead of the head/tail digest). Matches
+   *  common file-viewing invocations; anything with pipes/redirects is treated
+   *  as generic output. */
+  function isFileReadCommand(cmd: string): boolean {
+    const c = cmd.trim().replace(/^sudo\s+/, "");
+    if (/[|;&]/.test(c)) return false; // pipelines / chains → generic output
+    const m = c.match(/^(\S+)\s+(.+)$/);
+    if (!m) return false;
+    const tool = m[0].split(/\s+/)[0];
+    const target = m[1]?.trim() ?? "";
+    if (["cat", "sed", "awk", "more", "less", "nl", "od", "xxd"].includes(tool)) {
+      // single file target (no glob is fine — a small set of files is readable)
+      return target.length > 0 && !target.startsWith("-");
+    }
+    if (tool === "head" || tool === "tail") {
+      // head -n N file, tail -n N file, or tail file
+      const tokens = target.split(/\s+/);
+      return tokens.some((t) => t !== "-n" && !/^\d+$/.test(t) && !t.startsWith("-"));
+    }
+    return false;
   }
 
   /** Type a command into the LIVE terminal (like a human) and wait for the
@@ -1203,8 +1246,11 @@
     }
     // From the command start to the current end of the buffer — full output,
     // then trimmed to a compact digest if it's large (see buildOutputDigest).
+    // File reads (cat/sed/awk/head/tail of a file) keep the FULL content so the
+    // AI can actually review config/compose files instead of a head/tail digest.
     const raw = terminalTextFrom(term, startLine, 600);
-    const { text, truncated, lines } = buildOutputDigest(raw);
+    const mode = isFileReadCommand(cmd) ? "read" : "output";
+    const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
     return {
       host: host || null,
       note: truncated
@@ -1314,8 +1360,12 @@
       .map((e: any) => e.data ?? "")
       .join("");
     // Same digest as the live-terminal path: large agent output is trimmed to
-    // head + tail + error/warning lines so it doesn't burn tokens.
-    const { text, truncated, lines } = buildOutputDigest(rawOutputs);
+    // head + tail + error/warning lines so it doesn't burn tokens. EXCEPT for
+    // file/log reads (config read, log tail) — those keep the full content so
+    // the AI can actually review configs and logs instead of a digest.
+    const isRead =
+      (name === "config" && String(args.op ?? "") === "read") || name === "log";
+    const { text, truncated, lines } = buildOutputDigest(rawOutputs, 8000, isRead ? "read" : "output");
     return {
       host,
       exit: resultEvent?.exit ?? res?.exit ?? null,

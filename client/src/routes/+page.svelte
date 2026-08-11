@@ -665,6 +665,14 @@
     chatLog = [...chatLog, { role, text }];
   }
 
+  /** Auto-grow the chat textarea with its content, capped at the CSS max-height
+   *  (beyond which it scrolls). Set height to 'auto' first so scrollHeight
+   *  reflects the natural (unconstrained) content height each time. */
+  function autoGrowInput(el: HTMLTextAreaElement) {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  }
+
   /** Start a fresh conversation: reset history to just the system prompt and
    *  clear the visible chat log. History is in-memory (not persisted) and is
    *  already bounded by compaction while a task runs. */
@@ -1605,15 +1613,20 @@
         {/if}
       </div>
       <div class="chat-input">
-        <input
+        <textarea
+          rows="1"
           placeholder={activeHost
             ? `Ask the AI to act on ${activeHost}…`
             : "Ask the AI to act on a remote — ssh to it first…"}
           bind:value={chatText}
+          oninput={(e) => autoGrowInput(e.currentTarget)}
           onkeydown={(e) => {
-            if (e.key === "Enter") sendChat();
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              sendChat();
+            }
           }}
-        />
+        ></textarea>
         <button onclick={sendChat} disabled={!chatText.trim() || chatBusy}>
           {chatBusy ? "…" : "Send"}
         </button>
@@ -2073,7 +2086,7 @@
     color: #8b949e;
     border-bottom: 1px solid #21262d;
   }
-  .chat-input input {
+  .chat-input textarea {
     background: #0d1117;
     border: 1px solid #30363d;
     border-radius: 6px;
@@ -2082,7 +2095,7 @@
     font-size: 13px;
     outline: none;
   }
-  .chat-input input:focus {
+  .chat-input textarea:focus {
     border-color: #1f6feb;
   }
   .save-btn {
@@ -2452,12 +2465,20 @@
   }
   .chat-input {
     display: flex;
+    align-items: flex-end;
     gap: 6px;
     padding: 10px 12px;
     border-top: 1px solid #21262d;
   }
-  .chat-input input {
+  .chat-input textarea {
     flex: 1;
+    resize: none; /* height is driven by content (auto-grow), capped at max-height */
+    overflow-y: auto;
+    min-height: 32px; /* single line */
+    max-height: 140px; /* "max standard" — beyond this it scrolls */
+    line-height: 1.45;
+    font-family: inherit;
+    box-sizing: border-box;
   }
   .chat-input button {
     background: #1f6feb;

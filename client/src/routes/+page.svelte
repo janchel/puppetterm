@@ -1000,9 +1000,16 @@
       );
       // The agent is installed now — clear the "not detected" hint state and
       // re-verify so the UI reflects reality (and stops offering to install).
+      // IMPORTANT: also record the result in agentMap so the badge AND the
+      // AI's mode flip to agent mode immediately. Before this, runInstall
+      // verified the agent and printed "agent detected ✓" but never updated
+      // agentMap — so after reinstalling an already-installed agent the app
+      // stayed stuck showing "terminal mode" (agentMap was stale from an
+      // earlier failed action) and the AI kept using terminal tools.
       agentChecked.delete(host);
       try {
         const ok = await call<boolean>("check_agent", { host });
+        agentMap[host] = ok;
         if (ok) {
           term?.write(`\r\n\x1b[32m[puppetterm] agent detected on ${host} ✓\x1b[0m\r\n`);
         }

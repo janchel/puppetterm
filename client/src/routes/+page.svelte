@@ -216,22 +216,60 @@
     return false;
   }
 
+  // The `terminal` tool types a command into the user's LIVE pty (like a human)
+  // and waits for the output — it's the universal fallback that works on ANY
+  // host (key or password, no agent). It rides the real session, so in agent
+  // mode it is a LAST RESORT for interactive commands the structured tools
+  // can't cover (htop, vim, password prompts) — NOT for regular inspection,
+  // which belongs to `run_command`/`config`/`log`/`snapshot`/`service`.
+  const TERMINAL_TOOL = {
+    type: "function",
+    function: {
+      name: "terminal",
+      description:
+        "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Works on ANY host — key or password — and needs no agent. ONLY for interactive commands the structured tools cannot handle (e.g. htop, vim, password prompts). For regular inspection and changes, prefer `run_command` (agent mode) or `read_terminal`/this tool (terminal mode). The user sees the command run live. Returns the terminal output after the command.",
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string", description: "the full command line to type and execute" } },
+        required: ["command"],
+      },
+    },
+  };
+
+  // `read_terminal` reads what is physically on the user's screen (bounded by
+  // xterm scrollback). It is ONLY offered in terminal mode, where there is no
+  // agent to return structured results. In agent mode it would show just status
+  // lines (silent mode) and make real results look truncated — so it is NOT in
+  // AGENT_TOOLS. The agent tools return full output directly in the conversation.
+  const READ_TERMINAL_TOOL = {
+    type: "function",
+    function: {
+      name: "read_terminal",
+      description:
+        "Read what is physically on the user's terminal screen right now (bounded by scrollback). Use this ONLY to see what the user is looking at or an interactive session. This is NOT how you get command output or file contents — use `run_command`/`config`/`log` (agent mode) or the `terminal` tool (terminal mode) instead, which return full results directly.",
+      parameters: { type: "object", properties: {} },
+    },
+  };
+
+  // AGENT MODE: the agent is your eyes and hands on the remote host — every
+  // tool runs ON THE MACHINE over the agent's own SSH connection and returns
+  // full, audited results directly in the conversation. No terminal screen
+  // scraping: `run_command` is PRIMARY (read files, run commands), `snapshot`,
+  // `service`, `log`, `config` cover the rest, and `terminal` is a last resort
+  // for interactive commands only.
   const AGENT_TOOLS = [
-    { type: "function", function: { name: "terminal", description: "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Works on ANY host — key or password — and needs no agent. THE PREFERRED fallback to run commands the structured tools don't cover; the user sees the command run live. Returns the terminal output after the command.", parameters: { type: "object", properties: { command: { type: "string", description: "the full command line to type and execute" } }, required: ["command"] } } },
-    { type: "function", function: { name: "read_terminal", description: "Read the current content of the active terminal (what is on screen plus recent scrollback). Use this whenever the user asks about the current terminal.", parameters: { type: "object", properties: {} } } },
-    { type: "function", function: { name: "run_command", description: "Run a command over a dedicated ssh connection via the installed puppetterm-agent: clean exit code + full output, audited. Only available when the agent is installed on the host.", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
+    { type: "function", function: { name: "run_command", description: "Run a command on the ACTIVE HOST through the installed puppetterm-agent over its dedicated SSH connection. This is your PRIMARY tool — your eyes and hands on the machine. Use it to inspect (read files with cat/sed/head/tail — full content returned; check state with ps/df/free/uptime/grep) and to change (install, configure, restart). Returns the FULL output and a clean exit code directly to you (audited).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
     { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime (via the installed agent).", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "service", description: "Control a systemd service on the active host (via the installed agent).", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
     { type: "function", function: { name: "log", description: "Tail a log file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
     { type: "function", function: { name: "config", description: "Read or write a config file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
+    TERMINAL_TOOL,
   ];
 
-  // Tools available when the agent is NOT installed on the host: only the ones
-  // that ride the user's live terminal (work on any host, incl. password-only).
-  const TERMINAL_ONLY_TOOLS = AGENT_TOOLS.filter((t) => {
-    const n = t.function.name;
-    return n === "terminal" || n === "read_terminal";
-  });
+  // TERMINAL MODE (agent not installed on the host): only tools that ride the
+  // user's live terminal — works on any host, incl. password-only. read_terminal
+  // IS useful here because there is no structured agent to return results.
+  const TERMINAL_ONLY_TOOLS = [TERMINAL_TOOL, READ_TERMINAL_TOOL];
 
   /** True when the puppetterm-agent is known to be installed on `host`
    *  (checked once per host per session; defaults to false while unknown). */
@@ -270,7 +308,9 @@
     "tool: it types the command into the user's live terminal (already logged in) and returns " +
     "the output — it works on ANY host, including password-only ones. Use `read_terminal` to " +
     "see the current terminal screen — the live view of the active session, NOT the shell " +
-    "history file.\n\n" +
+    "history file. `read_terminal` is a SCREEN SNAPSHOT bounded by scrollback: to get a " +
+    "file's FULL contents or a command's full output, run it with the `terminal` tool (e.g. " +
+    "`cat /path`) rather than reading the screen.\n\n" +
     "Before running anything, explain in text what you'll run and why — the user sees your " +
     "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
     "(first/last lines + any error/warning lines) to save tokens, but FILE READS (`cat`, `sed`, " +
@@ -285,24 +325,31 @@
     "is rejected. Be concise and summarize tool results for the user.";
 
   const AGENT_SYSTEM_PROMPT =
-    "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
-    "using the provided tools.\n\n" +
+    "You are puppetterm, an AI assistant inside a terminal app. You are the AGENT'S EYES AND " +
+    "HANDS on the ACTIVE host: you inspect and change the remote machine through the chat, " +
+    "using the structured tools that run ON that machine.\n\n" +
     "ANSWER QUESTIONS FIRST. When the user asks a question, answer it directly from your own " +
     "knowledge in text BEFORE calling any tool. Only run a command when you genuinely need LIVE " +
     "system state (current disk/memory, a service's real status, today's logs) or when the user " +
     "asked you to take an action. For general-knowledge questions, just give the answer and DO " +
     "NOT run a command at all.\n\n" +
-    "The puppetterm-agent IS installed on this host (reachable over its dedicated SSH " +
-    "connection), so PREFER the structured tools for reliable, audited results: `run_command` " +
-    "(clean exit code + full output), `snapshot` (CPU/memory/disk/uptime), `service` (systemd " +
-    "status/control), `log` (tail log files), `config` (read/write allow-listed config). You " +
-    "may also use the `terminal` tool to type a command into the user's live terminal when the " +
-    "structured tools don't cover it (e.g. interactive commands) — it works on any host. Use " +
-    "`read_terminal` to see the current terminal screen.\n\n" +
-    "NOTE: `run_command` runs in the user's HOME directory, NOT your shell's current folder — " +
-    "always use ABSOLUTE paths (e.g. `cat /opt/docker/mcp-rag/docker-compose.yml`) when reading " +
-    "files with it, or use the `terminal` tool (which types into the live shell where relative " +
-    "paths and the working directory apply).\n\n" +
+    "The puppetterm-agent IS installed on this host and reachable over its own SSH connection, " +
+    "so DO ALL YOUR WORK THROUGH THE AGENT TOOLS — never by reading the terminal screen. Your " +
+    "tool results come back to you DIRECTLY in this conversation: `run_command` returns the full " +
+    "output + a clean exit code, `snapshot` returns CPU/memory/disk/uptime, `service` returns " +
+    "systemd state, `log` and `config` return full file contents. In agent mode the terminal " +
+    "only shows one status line per action — it does NOT show command output — so reading the " +
+    "terminal would tell you nothing and make real results look truncated. If you need a " +
+    "command's output or a file's contents, GET IT FROM THE TOOLS, not from the screen.\n\n" +
+    "PREFER `run_command` for inspecting and changing the machine (read files with " +
+    "`cat`/`sed`/`head`/`tail` — full content returned; check state with `ps`/`df`/`free`/" +
+    "`uptime`; grep logs; install and configure). Use `config` (read/write) and `log` (tail) " +
+    "for their allow-listed paths, `snapshot` for a system overview, and `service` for systemd " +
+    "units. The `terminal` tool is ONLY for interactive commands the structured tools cannot " +
+    "handle (e.g. `htop`, `vim`, password prompts) — not for regular inspection.\n\n" +
+    "NOTE: `run_command` runs in the user's HOME directory on the remote host, NOT your shell's " +
+    "current folder — always use ABSOLUTE paths (e.g. `cat /opt/docker/mcp-rag/docker-compose." +
+    "yml`) when reading files with it.\n\n" +
     "READING FILES: `config` (read) and `log` return the FULL content, but `config` only works " +
     "for paths in its allow-list; if `config` is rejected for a path, read the file with " +
     "`run_command` using an ABSOLUTE path, e.g. `cat /opt/docker/mcp-rag/docker-compose.yml` " +
@@ -315,7 +362,8 @@
     "file]`: the ENTIRE file is included and NOTHING was cut — do NOT tell the user the output " +
     "was truncated, cut off, or needs re-reading when you see those markers. Only treat a result " +
     "as truncated if it explicitly says `TRUNCATED` or `… N lines omitted …`. If output is " +
-    "trimmed, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` to narrow it.\n\n" +
+    "trimmed, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via `run_command` to " +
+    "narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -1388,18 +1436,25 @@
     if (name === "read_terminal") {
       if (!term) return { error: "no active terminal" };
       const raw = terminalText(term, 1000);
-      // Full-content mode: read_terminal is often used to inspect a file or
-      // long output that is on screen — don't collapse it to a head/tail digest.
-      const { text, truncated, lines } = buildOutputDigest(raw, 8000, "read");
+      // This is a SCREEN SNAPSHOT, not a file: the xterm buffer is bounded by
+      // scrollback, so it can NEVER be guaranteed "complete". Label it honestly
+      // (NOT as a `[file: … COMPLETE …]` read — that marker would make the AI
+      // believe it has the whole file when the screen may have scrolled past
+      // it, which is exactly how "the output looks truncated" reports started).
+      // Keep as much as fits so on-screen file views are still usable.
+      const screenCap = 100000;
+      const truncated = raw.length > screenCap;
+      const body = truncated ? raw.slice(0, screenCap) : raw;
+      const text = truncated
+        ? `[terminal screen: ${raw.length} bytes — TRUNCATED at ${screenCap} chars; the screen is bounded by scrollback, this is NOT a complete file]\n${body}`
+        : `[terminal screen: ${raw.length} bytes — what is on the user's screen right now, bounded by scrollback (NOT a file, NOT full command output)]\n${body}`;
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
         host: host || null,
-        note: truncated
-          ? `terminal screen was ${lines} lines — long, returned as much as fits (run grep/tail/head to narrow it)`
-          : "live terminal screen (not shell history)",
+        note: "live terminal screen (not shell history) — a screen snapshot bounded by scrollback. To get a FILE's full contents or a command's full output, run the command via the `terminal` tool (or the agent tools in agent mode) instead of reading the screen.",
         terminal: text,
         truncated,
-        total_lines: lines,
+        total_lines: raw.split("\n").length,
       };
     }
 

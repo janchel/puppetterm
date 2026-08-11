@@ -299,12 +299,15 @@
     "always use ABSOLUTE paths (e.g. `cat /opt/docker/mcp-rag/docker-compose.yml`) when reading " +
     "files with it, or use the `terminal` tool (which types into the live shell where relative " +
     "paths and the working directory apply).\n\n" +
+    "READING FILES: `config` (read) and `log` return the FULL content, but `config` only works " +
+    "for paths in its allow-list; if `config` is rejected for a path, read the file with " +
+    "`run_command` using an ABSOLUTE path, e.g. `cat /opt/docker/mcp-rag/docker-compose.yml` " +
+    "(cat/sed/head/tail file reads return full content too).\n\n" +
     "Before running anything, explain in text what you'll run and why — the user sees your " +
     "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
-    "(first/last lines + any error/warning lines) to save tokens, but FILE READS via `config` " +
-    "(read) or `log` return the FULL content — prefer those when the user wants to inspect a " +
-    "config/compose file. If output is trimmed, run a follow-up like `grep`, `tail -n`, `head " +
-    "-n` or `wc -l` to narrow it.\n\n" +
+    "(first/last lines + any error/warning lines) to save tokens, but FILE READS (via `config` " +
+    "read, `log`, or `cat`/`sed`/`head`/`tail` of a file) return the FULL content. If output is " +
+    "trimmed, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` to narrow it.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 

@@ -34,6 +34,51 @@ pub struct AgentRunResult {
 pub static ACTIVE_ACTIONS: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Cached resolved agent binary path per host ("" = not yet resolved).
+/// `check_agent` (install.rs) considers the agent present if EITHER the
+/// user-space (`~/.puppetterm/bin`) OR the system-wide (`/usr/local/bin`) copy
+/// exists — so `run_action` must invoke whichever one is actually installed,
+/// not always the root path.
+static AGENT_BIN_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve the agent binary path to use on `host`, preferring the configured
+/// env override, then probing the host for a user-space or system-wide agent.
+/// The probe is one quick SSH `test` and is cached per host for the session.
+fn resolve_agent_bin(host: &str) -> Result<String, String> {
+    if let Ok(bin) = std::env::var("PUPPETTERM_AGENT_BIN") {
+        if !bin.trim().is_empty() {
+            return Ok(bin);
+        }
+    }
+    if let Some(bin) = AGENT_BIN_CACHE.lock().unwrap().get(host) {
+        if !bin.is_empty() {
+            return Ok(bin.clone());
+        }
+    }
+    let probe = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+        .arg(host)
+        .args([
+            "sh", "-c",
+            "for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1",
+        ])
+        .output()
+        .map_err(|e| format!("resolve agent bin (ssh): {e}"))?;
+    if !probe.status.success() {
+        return Err(
+            "puppetterm-agent not found on host (checked ~/.puppetterm/bin and /usr/local/bin)"
+                .to_string(),
+        );
+    }
+    let bin = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    if bin.is_empty() {
+        return Err("puppetterm-agent probe returned empty path".into());
+    }
+    AGENT_BIN_CACHE.lock().unwrap().insert(host.to_string(), bin.clone());
+    Ok(bin)
+}
+
 /// Kill a running agent action by request id (kills its ssh process group).
 pub fn kill_action(request_id: &str) -> bool {
     let pid = match ACTIVE_ACTIONS.lock().unwrap().get(request_id) {
@@ -68,8 +113,11 @@ pub fn run_action(
     emit: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<AgentRunResult, String> {
     validate_host(host)?;
-    let agent = std::env::var("PUPPETTERM_AGENT_BIN")
-        .unwrap_or_else(|_| "/usr/local/bin/puppetterm-agent".to_string());
+    // Use whichever agent binary actually exists on the host (user-space or
+    // system-wide) — NOT always the root path. check_agent reports "present"
+    // for either, so invoking only /usr/local/bin broke user-space-only hosts
+    // with "bash: /usr/local/bin/puppetterm-agent: No such file or directory".
+    let agent = resolve_agent_bin(host)?;
 
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);

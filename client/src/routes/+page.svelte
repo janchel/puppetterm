@@ -321,7 +321,11 @@
     "output was truncated, cut off, or needs re-reading when you see those markers or `complete: " +
     "true`. Only treat a result as truncated if `complete` is false or it explicitly says " +
     "`TRUNCATED` or `… N lines omitted …`. If output is trimmed, run a follow-up like `grep`, " +
-    "`tail -n`, `head -n` or `wc -l` via the `terminal` tool to narrow it.\n\n" +
+    "`tail -n`, `head -n` or `wc -l` via the `terminal` tool to narrow it. For a large file, " +
+    "first check its size with `wc -l <file>`, then read ONLY the ranges you need with " +
+    "`sed -n 'START,ENDp' <file>` or `grep -n 'pattern' <file>` — don't re-read the whole " +
+    "file." +
+    "\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -370,7 +374,9 @@
     "re-reading when you see those markers or `complete: true`. Only treat a result as truncated " +
     "if `complete` is false or it explicitly says `TRUNCATED` or `… N lines omitted …`. If " +
     "output is trimmed, run a follow-up like `grep`, `tail -n`, `head -n` or `wc -l` via " +
-    "`run_command` to narrow it.\n\n" +
+    "`run_command` to narrow it. For a large file, first check its size with `wc -l <file>`, " +
+    "then read ONLY the ranges you need with `sed -n 'START,ENDp' <file>` or `grep -n " +
+    "'pattern' <file>` — don't re-read the whole file.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -1161,48 +1167,76 @@
   async function runAiLoop() {
     try {
       let guard = 0;
-    while (guard++ < 25) {
-      if (abortRequested) {
-        pushChat("ai", "(aborted by user)");
-        return;
-      }
-      history = compactHistory(history);
-      aiThinking = true;
-      let resp: any;
-      try {
-        resp = await call<any>("ai_chat", { messages: history, tools: chatTools });
-      } finally {
-        aiThinking = false;
-      }
-      const msg = resp?.choices?.[0]?.message;
-      if (!msg) {
-        pushChat("ai", "(no response from the model)");
-        return;
-      }
-      if (msg.tool_calls && msg.tool_calls.length > 0) {
-        // Show the AI's explanation even when it also calls a tool — otherwise
-        // the user only sees the approval dialog and never the answer/plan.
-        const explain = (msg.content ?? "").trim();
-        if (explain) pushChat("ai", explain);
-        history = [
-          ...history,
-          { role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls },
-        ];
-        for (const tc of msg.tool_calls) {
-          const ok = await requestApproval(tc, explain || undefined);
-          const content = ok
-            ? JSON.stringify(await executeTool(tc))
-            : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
-          history = [...history, { role: "tool", tool_call_id: tc.id, content }];
+      // Generous for legitimate multi-step work (reading a large file in
+      // sections, several edits). The guard is only a safety net against
+      // runaway loops — real loops are caught by the repeat check below
+      // instead of just a raw step count, so 25 was cutting off genuine tasks
+      // like "read server.py in sections" mid-way.
+      const MAX_STEPS = 60;
+      let lastSig: string | null = null;
+      let repeatCount = 0;
+      while (guard++ < MAX_STEPS) {
+        if (abortRequested) {
+          pushChat("ai", "(aborted by user)");
+          return;
         }
-        continue;
+        history = compactHistory(history);
+        aiThinking = true;
+        let resp: any;
+        try {
+          resp = await call<any>("ai_chat", { messages: history, tools: chatTools });
+        } finally {
+          aiThinking = false;
+        }
+        const msg = resp?.choices?.[0]?.message;
+        if (!msg) {
+          pushChat("ai", "(no response from the model)");
+          return;
+        }
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          // Show the AI's explanation even when it also calls a tool — otherwise
+          // the user only sees the approval dialog and never the answer/plan.
+          const explain = (msg.content ?? "").trim();
+          if (explain) pushChat("ai", explain);
+          history = [
+            ...history,
+            { role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls },
+          ];
+          for (const tc of msg.tool_calls) {
+            // Loop guard: repeating the EXACT same tool call 3 times in a row
+            // means the model is stuck, not making progress — stop early
+            // instead of burning all MAX_STEPS.
+            const sig = `${tc.function.name}:${tc.function.arguments}`;
+            if (sig === lastSig) {
+              repeatCount++;
+            } else {
+              lastSig = sig;
+              repeatCount = 1;
+            }
+            if (repeatCount >= 3) {
+              pushChat(
+                "ai",
+                "(stopped — the AI repeated the same action 3× in a row and appears stuck. Try rephrasing, or ask it to be more specific.)",
+              );
+              return;
+            }
+            const ok = await requestApproval(tc, explain || undefined);
+            const content = ok
+              ? JSON.stringify(await executeTool(tc))
+              : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
+            history = [...history, { role: "tool", tool_call_id: tc.id, content }];
+          }
+          continue;
+        }
+        const text = msg.content ?? "(done)";
+        pushChat("ai", text);
+        history = [...history, { role: "assistant", content: text }];
+        return;
       }
-      const text = msg.content ?? "(done)";
-      pushChat("ai", text);
-      history = [...history, { role: "assistant", content: text }];
-      return;
-    }
-      pushChat("ai", "(stopped after too many tool steps)");
+      pushChat(
+        "ai",
+        "(stopped after too many tool steps — the task may be too large for one go; try breaking it into smaller steps)",
+      );
     } catch (e) {
       pushChat("ai", `(AI error: ${e})`);
       console.error("ai_chat", e);

@@ -959,7 +959,10 @@
     const t = tabs.find((x) => x.id === id);
     const term = termByTab.get(id)?.term;
     if (!t || !term) return;
-    const lines = terminalText(term, 60).split("\n");
+    // Scan a generous window: a recalled `ssh …` can sit many lines up in the
+    // buffer behind a long MOTD/scrollback (especially after history recall,
+    // where the command never passes through onData).
+    const lines = terminalText(term, 200).split("\n");
     // The shell prompt is the last non-empty line (a trailing blank line can
     // follow the prompt, e.g. after a redraw — skip it before gating).
     let li = lines.length - 1;

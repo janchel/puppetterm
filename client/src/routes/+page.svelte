@@ -1293,15 +1293,20 @@
     term.write(`\r\n\x1b[36m[puppetterm] AI types: ${cmd}\x1b[0m\r\n`);
     await call("write_ssh_input", { id: t.sessionId, data: cmd });
     await call("write_ssh_input", { id: t.sessionId, data: "\r" });
-    // Wait for output to stop changing (or a 30s cap), then return the tail.
-    const deadline = Date.now() + 30000;
+    // Wait for output to stop changing (or a cap), then return the tail.
+    // File reads of a large file can stream for a while — give them more time
+    // and require a longer stable window so we don't return a half-finished
+    // file and make the AI think it was truncated.
+    const isRead = isFileReadCommand(cmd);
+    const deadline = Date.now() + (isRead ? 60000 : 30000);
+    const stableMs = isRead ? 1500 : 800;
     let last = terminalText(term, 2000);
     let stableSince = Date.now();
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 250));
       const nowText = terminalText(term, 2000);
       if (nowText === last) {
-        if (Date.now() - stableSince > 800) break;
+        if (Date.now() - stableSince > stableMs) break;
       } else {
         last = nowText;
         stableSince = Date.now();
@@ -1312,7 +1317,7 @@
     // File reads (cat/sed/awk/head/tail of a file) keep the FULL content so the
     // AI can actually review config/compose files instead of a head/tail digest.
     const raw = terminalTextFrom(term, startLine, 3000);
-    const mode = isFileReadCommand(cmd) ? "read" : "output";
+    const mode = isRead ? "read" : "output";
     const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
     // DEBUG: show the AI exactly what we're handing back, so truncation (if
     // any) is visible in the terminal instead of mysterious.
@@ -1405,6 +1410,13 @@
       );
     if (agentProblem) {
       const cmd = structuredToolToShell(name, args);
+      // The agent binary is genuinely missing on this host (or auth failed) —
+      // correct our cached belief so the badge flips to terminal mode and the
+      // AI stops being offered agent tools it can't use.
+      if (/not found|No such file|Permission denied|publickey|refused|timed out/i.test(agentErr ?? res?.error ?? "")) {
+        agentMap[host] = false;
+        agentChecked.delete(host);
+      }
       if (cmd) {
         const why = (agentErr ?? res?.error ?? "ssh failure").slice(0, 140);
         term?.write(

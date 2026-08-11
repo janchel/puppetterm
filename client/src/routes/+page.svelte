@@ -1308,6 +1308,12 @@
     const raw = terminalTextFrom(term, startLine, 3000);
     const mode = isFileReadCommand(cmd) ? "read" : "output";
     const { text, truncated, lines } = buildOutputDigest(raw, 8000, mode);
+    // DEBUG: show the AI exactly what we're handing back, so truncation (if
+    // any) is visible in the terminal instead of mysterious.
+    term.write(
+      `\r\n\x1b[90m[puppetterm] returned ${raw.length} bytes / ${lines} lines ` +
+        `(mode=${mode}, truncated=${truncated})\x1b[0m\r\n`,
+    );
     return {
       host: host || null,
       note: truncated

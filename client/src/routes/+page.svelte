@@ -2140,6 +2140,8 @@
     padding: 6px 8px;
     word-break: break-all;
     white-space: pre-wrap;
+    max-height: 120px; /* long commands scroll internally so the buttons stay visible */
+    overflow-y: auto;
   }
   .approval-explain {
     font-size: 12px;
@@ -2149,6 +2151,8 @@
     padding: 6px 8px;
     white-space: pre-wrap;
     word-break: break-word;
+    max-height: 100px; /* long AI explanations scroll internally too */
+    overflow-y: auto;
   }
   .approval-host {
     margin-top: 6px;

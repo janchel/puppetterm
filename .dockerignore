@@ -1,0 +1,26 @@
+# Keep the build context small — no VCS, deps, or build outputs.
+.git
+.gitignore
+.env
+.env.*
+
+# Rust build artifacts (workspace target + legacy per-crate target)
+target/
+client/src-tauri/target/
+
+# Node
+client/node_modules/
+client/build/
+.svelte-kit/
+
+# Go agent build output
+agent/bin/
+agent/dist/
+
+# Docs & local files not needed inside the image
+docs/
+TASKS.md
+agentic-remote-terminal-plan.txt
+*.log
+*.db
+*.db-journal

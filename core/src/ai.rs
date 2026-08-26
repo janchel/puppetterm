@@ -234,6 +234,50 @@ pub async fn chat_completion(
     }
 }
 
+/// Update the stored AI config (shared by the desktop and web frontends).
+/// Blank fields keep their current values; a blank key keeps the stored one.
+pub fn apply_ai_config(
+    base_url: String,
+    model: String,
+    provider: Option<String>,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let mut cfg = match load_config() {
+        Ok(c) => c,
+        Err(_) => AiConfig {
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            provider: PROVIDER_OPENAI.into(),
+            api_key_enc: None,
+        },
+    };
+    if !base_url.trim().is_empty() {
+        cfg.base_url = base_url.trim().to_string();
+    }
+    if !model.trim().is_empty() {
+        cfg.model = model.trim().to_string();
+    }
+    if let Some(p) = provider {
+        let p = p.trim().to_string();
+        if !p.is_empty() {
+            cfg.provider = if p == PROVIDER_ANTHROPIC || p == PROVIDER_DEEPSEEK || p == PROVIDER_OPENAI
+            {
+                p
+            } else {
+                PROVIDER_OPENAI.into()
+            };
+        }
+    }
+    if let Some(k) = api_key {
+        let k = k.trim();
+        if !k.is_empty() {
+            cfg.api_key = k.to_string();
+        }
+    }
+    save_config(&cfg)
+}
+
 /// Call an OpenAI-compatible `/chat/completions` endpoint (custom + DeepSeek).
 async fn openai_completion(
     cfg: &AiConfig,

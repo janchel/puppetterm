@@ -27,13 +27,21 @@ pub struct InstallResult {
 
 /// True if the agent binary is already reachable on the host (either the
 /// user-space or the system-wide path).
+///
+/// Uses the SAME `sh -c` probe as `agent::resolve_agent_bin` so the badge can
+/// never disagree with what `run_action` will actually find. The old raw
+/// `test -x ~/.puppetterm/bin/puppetterm-agent -o -x /usr/local/bin/...` was
+/// run through the user's LOGIN shell, where `~` expansion and the deprecated
+/// `test -o` operator behave differently (fish/zsh) — so the badge could claim
+/// "agent mode" while `resolve_agent_bin` then reported the binary missing and
+/// the AI fell back to typing into the live terminal.
 pub fn check_agent(host: &str) -> bool {
     let out = Command::new("ssh")
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
         .arg(host)
         .args([
-            "test", "-x", "~/.puppetterm/bin/puppetterm-agent", "-o", "-x",
-            "/usr/local/bin/puppetterm-agent",
+            "sh", "-c",
+            "for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && exit 0; done; exit 1",
         ])
         .output();
     matches!(out, Ok(o) if o.status.success())

@@ -18,6 +18,8 @@ client/src-tauri/target/
 client/src-tauri/gen/schemas/
 client/src-tauri/gen/android/
 client/src-tauri/gen/apple/
+# Cargo workspace (root Cargo.toml) puts the shared target dir at the root
+/target/
 
 # --- Build artifacts / misc ---
 *.log

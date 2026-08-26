@@ -1,117 +1,40 @@
-//! puppetterm client backend.
+//! puppetterm desktop shell (Tauri).
 //!
-//! Manages interactive SSH sessions backed by a pty (via `portable-pty`),
-//! streams pty output to the webview as events, and provides host discovery
-//! from ~/.ssh/config.
+//! Thin command wrappers around `puppetterm-core`. All real logic — SSH
+//! sessions, remote agent, AI client, audit log, installer — lives in core so
+//! the headless web server (`server/`) shares exactly the same behavior.
 
-mod agent;
-mod ai;
-mod audit;
-mod install;
-mod ssh;
+use std::sync::Arc;
 
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use puppetterm_core as core;
+use puppetterm_core::sessions::{Emitter, SessionManager};
 
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter as _, Manager, State};
 
-/// One live SSH session backed by a pty.
-struct Session {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-}
-
+/// All live terminal sessions.
 #[derive(Default)]
 struct AppState {
-    sessions: Mutex<HashMap<u32, Session>>,
-    next_id: AtomicU32,
+    sessions: SessionManager,
 }
 
-#[derive(Clone, Serialize)]
-struct PtyOutput {
-    id: u32,
-    data: String,
-}
-
-#[derive(Clone, Serialize)]
-struct PtyExit {
-    id: u32,
-}
-
-/// Progress line emitted while installing the agent on a remote host.
-#[derive(Clone, Serialize)]
-struct InstallOutput {
-    host: String,
-    data: String,
+/// Map a core emitter callback onto Tauri IPC events.
+fn tauri_emitter(app: &AppHandle) -> Emitter {
+    let app = app.clone();
+    Arc::new(move |event, payload| {
+        let _ = app.emit(event, payload);
+    })
 }
 
 /// List concrete host aliases from ~/.ssh/config.
 #[tauri::command]
 fn list_ssh_hosts() -> Vec<String> {
-    ssh::parse_ssh_config_hosts()
+    core::ssh::parse_ssh_config_hosts()
 }
 
 /// Quick reachability probe for a host (used for status dots).
 #[tauri::command]
 fn check_host(host: String) -> bool {
-    ssh::check_host(&host)
-}
-
-/// Open a pty running `cmd` (optionally in `cwd`) and stream its output as
-/// `pty-output`/`pty-exit` events. Returns the new session id.
-fn spawn_pty_session(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    cmd_name: &str,
-    args: &[&str],
-    cwd: Option<&std::path::Path>,
-) -> Result<u32, String> {
-    let id = state.next_id.fetch_add(1, Ordering::SeqCst);
-
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| e.to_string())?;
-
-    let mut cmd = CommandBuilder::new(cmd_name);
-    cmd.args(args);
-    if let Some(cwd) = cwd {
-        cmd.cwd(cwd);
-    }
-    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-
-    // Stream pty output to the frontend, then signal exit.
-    let app_out = app.clone();
-    let app_exit = app.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app_out.emit("pty-output", PtyOutput { id, data });
-                }
-            }
-        }
-        let _ = app_exit.emit("pty-exit", PtyExit { id });
-    });
-
-    {
-        let mut sessions = state.sessions.lock().unwrap();
-        sessions.insert(id, Session { master: pair.master, writer, child });
-    }
-
-    Ok(id)
+    core::ssh::check_host(&host)
 }
 
 /// Open an interactive SSH session to `host` and start streaming its pty.
@@ -121,49 +44,31 @@ fn start_ssh_session(
     state: State<'_, AppState>,
     host: String,
 ) -> Result<u32, String> {
-    spawn_pty_session(&app, &state, "ssh", &["-tt", &host], None)
+    state.sessions.spawn_ssh(tauri_emitter(&app), &host)
 }
 
 /// Open a local shell in the user's home directory (no remote connection).
 #[tauri::command]
 fn start_local_session(app: AppHandle, state: State<'_, AppState>) -> Result<u32, String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    spawn_pty_session(&app, &state, &shell, &[], Some(std::path::Path::new(&home)))
+    state.sessions.spawn_local(tauri_emitter(&app))
 }
 
 /// Send terminal input (keystrokes) to the session.
 #[tauri::command]
 fn write_ssh_input(state: State<'_, AppState>, id: u32, data: String) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let s = sessions.get_mut(&id).ok_or("no such session")?;
-    s.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    s.writer.flush().map_err(|e| e.to_string())
+    state.sessions.write_input(id, &data)
 }
 
 /// Resize the remote pty to match the frontend terminal.
 #[tauri::command]
-fn resize_ssh_pty(
-    state: State<'_, AppState>,
-    id: u32,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
-    let sessions = state.sessions.lock().unwrap();
-    let s = sessions.get(&id).ok_or("no such session")?;
-    s.master
-        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| e.to_string())
+fn resize_ssh_pty(state: State<'_, AppState>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+    state.sessions.resize(id, cols, rows)
 }
 
 /// Terminate a session and release its resources.
 #[tauri::command]
 fn stop_ssh_session(state: State<'_, AppState>, id: u32) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    if let Some(mut s) = sessions.remove(&id) {
-        let _ = s.child.kill();
-    }
-    Ok(())
+    state.sessions.stop(id)
 }
 
 /// Run one agent action on a host over SSH. Streams NDJSON events as
@@ -176,8 +81,8 @@ async fn run_agent_action(
     request: String,
     source: Option<String>,
     approved: Option<bool>,
-) -> Result<agent::AgentRunResult, String> {
-    let app2 = app.clone();
+) -> Result<core::agent::AgentRunResult, String> {
+    let emit = tauri_emitter(&app);
     let source = source.unwrap_or_else(|| "user".to_string());
     let approval = match approved {
         Some(true) => "approved",
@@ -194,15 +99,28 @@ async fn run_agent_action(
         .unwrap_or("")
         .to_string();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        agent::run_action(&host_for_action, &request_for_action, &request_id, move |ev| {
-            let _ = app2.emit("agent-event", ev);
+        core::agent::run_action(&host_for_action, &request_for_action, &request_id, move |ev| {
+            emit("agent-event", serde_json::to_value(ev).unwrap_or_default());
         })
     })
     .await
     .map_err(|e| e.to_string())?;
 
     // Audit log (best-effort — never blocks or fails the action).
-    let req_value: serde_json::Value = serde_json::from_str(&request).unwrap_or_default();
+    record_agent_audit(&host, &source, approval, &request, &result);
+
+    result
+}
+
+/// Shared audit bookkeeping for one completed agent action (best-effort).
+fn record_agent_audit(
+    host: &str,
+    source: &str,
+    approval: &str,
+    request: &str,
+    result: &Result<core::agent::AgentRunResult, String>,
+) {
+    let req_value: serde_json::Value = serde_json::from_str(request).unwrap_or_default();
     let action = req_value
         .get("action")
         .and_then(|a| a.as_str())
@@ -210,13 +128,11 @@ async fn run_agent_action(
         .to_string();
     let params = req_value.get("params").map(|p| p.to_string());
     let exit = result.as_ref().map(|r| r.exit as i64).ok();
-    let summary = match &result {
+    let summary = match result {
         Ok(r) => serde_json::json!({ "exit": r.exit, "events": r.events.len() }).to_string(),
         Err(e) => serde_json::json!({ "error": e }).to_string(),
     };
-    let _ = audit::record(&host, &source, &action, params.as_deref(), approval, exit, Some(&summary));
-
-    result
+    let _ = core::audit::record(host, source, &action, params.as_deref(), approval, exit, Some(&summary));
 }
 
 /// Abort a running agent action: kills the local ssh process group AND tells
@@ -227,7 +143,7 @@ async fn run_agent_action(
 /// escape hatch.
 #[tauri::command]
 fn stop_agent_action(request_id: String, host: Option<String>) -> bool {
-    let killed = agent::kill_action(&request_id);
+    let killed = core::agent::kill_action(&request_id);
     if let Some(h) = host {
         let user = h.split('@').next().unwrap_or_default();
         let mut cmd = std::process::Command::new("ssh");
@@ -251,37 +167,31 @@ fn stop_agent_action(request_id: String, host: Option<String>) -> bool {
 /// settle-time limits, but a direct SSH exec returns every byte.
 #[tauri::command]
 async fn ssh_capture(host: String, cmd: String) -> Result<serde_json::Value, String> {
-    if host.trim().is_empty() || cmd.trim().is_empty() {
-        return Err("ssh_capture: empty host or command".into());
-    }
-    let host2 = host.clone();
-    let cmd2 = cmd.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let out = std::process::Command::new("ssh")
-            .args([
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=8",
-                "-o", "StrictHostKeyChecking=accept-new",
-            ])
-            .arg(&host2)
-            .arg(&cmd2)
-            .output()
-            .map_err(|e| format!("ssh_capture: {e}"))?;
-        Ok(serde_json::json!({
-            "host": host2,
-            "exit": out.status.code().unwrap_or(-1),
-            "stdout": String::from_utf8_lossy(&out.stdout),
-            "stderr": String::from_utf8_lossy(&out.stderr),
-        }))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    core::run_ssh_capture(host, cmd).await
 }
 
 /// Whether the puppetterm agent is already present on the host.
 #[tauri::command]
 fn check_agent(host: String) -> bool {
-    install::check_agent(&host)
+    core::install::check_agent(&host)
+}
+
+/// Resolve the directory holding the prebuilt agent binaries (dev tree or env).
+fn agent_bin_dir() -> Option<String> {
+    std::env::var("PUPPETTERM_AGENT_DIR").ok().filter(|d| !d.is_empty()).or_else(|| {
+        // Dev: prefer the source-tree agent/bin (repo/agent/bin, built with
+        // `make cross`). In `tauri dev` the resource dir is target/debug,
+        // which NEVER contains the agent binary — picking it first made
+        // installs fail with "agent binary not found".
+        let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agent/bin");
+        if dev.join("puppetterm-agent-linux-amd64").exists()
+            || dev.join("puppetterm-agent-linux-arm64").exists()
+        {
+            Some(dev.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    })
 }
 
 /// Install the puppetterm agent on a host over the existing SSH key
@@ -294,42 +204,27 @@ async fn install_agent_on_host(
     agent_dir: Option<String>,
     pubkey_path: Option<String>,
     force: Option<bool>,
-) -> Result<install::InstallResult, String> {
-    // Resolve the agent binary dir: explicit param → env → source-tree
-    // agent/bin (dev: `make cross` output) → bundled resource dir (packaged
-    // builds) → home default.
-    let agent_dir = agent_dir
-        .or_else(|| std::env::var("PUPPETTERM_AGENT_DIR").ok().filter(|d| !d.is_empty()))
-        .or_else(|| {
-            // Dev: prefer the source-tree agent/bin (repo/agent/bin, built with
-            // `make cross`). In `tauri dev` the resource dir is target/debug,
-            // which NEVER contains the agent binary — picking it first made
-            // installs fail with "agent binary not found".
-            let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agent/bin");
-            if dev.join("puppetterm-agent-linux-amd64").exists()
-                || dev.join("puppetterm-agent-linux-arm64").exists()
-            {
-                Some(dev.to_string_lossy().into_owned())
-            } else {
-                // Packaged build: the binaries are bundled into the app resources.
-                app.path()
-                    .resource_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
-            }
-        });
-    let app2 = app.clone();
+) -> Result<core::install::InstallResult, String> {
+    // Resolve the agent binary dir: explicit param → env → dev source tree →
+    // bundled resource dir (packaged builds).
+    let agent_dir = agent_dir.or_else(agent_bin_dir).or_else(|| {
+        app.path()
+            .resource_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let emit = tauri_emitter(&app);
     let host2 = host.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        install::install_agent(
+        core::install::install_agent(
             &host2,
             agent_dir.as_deref(),
             pubkey_path,
             force.unwrap_or(false),
             &|line| {
-                let _ = app2.emit(
+                emit(
                     "install-output",
-                    InstallOutput { host: host2.clone(), data: line.to_string() },
+                    serde_json::json!({ "host": host2.clone(), "data": line }),
                 );
             },
         )
@@ -340,16 +235,16 @@ async fn install_agent_on_host(
 
 /// Return the most recent audit log entries (newest first).
 #[tauri::command]
-fn audit_recent(limit: Option<i64>) -> Result<Vec<audit::AuditRow>, String> {
-    audit::recent(limit.unwrap_or(50))
+fn audit_recent(limit: Option<i64>) -> Result<Vec<core::audit::AuditRow>, String> {
+    core::audit::recent(limit.unwrap_or(50))
 }
 
 /// Return the AI provider config (provider + endpoint + model + whether a key
 /// is set). The API key itself is never returned to the frontend.
 #[tauri::command]
-fn get_ai_config() -> Result<ai::AiConfigView, String> {
-    let cfg = ai::load_config()?;
-    Ok(ai::AiConfigView {
+fn get_ai_config() -> Result<core::ai::AiConfigView, String> {
+    let cfg = core::ai::load_config()?;
+    Ok(core::ai::AiConfigView {
         base_url: cfg.base_url,
         model: cfg.model,
         provider: cfg.provider,
@@ -366,142 +261,18 @@ fn set_ai_config(
     provider: Option<String>,
     api_key: Option<String>,
 ) -> Result<(), String> {
-    let mut cfg = match ai::load_config() {
-        Ok(c) => c,
-        Err(_) => ai::AiConfig {
-            base_url: String::new(),
-            api_key: String::new(),
-            model: String::new(),
-            provider: ai::PROVIDER_OPENAI.into(),
-            api_key_enc: None,
-        },
-    };
-    if !base_url.trim().is_empty() {
-        cfg.base_url = base_url.trim().to_string();
-    }
-    if !model.trim().is_empty() {
-        cfg.model = model.trim().to_string();
-    }
-    if let Some(p) = provider {
-        let p = p.trim().to_string();
-        if !p.is_empty() {
-            cfg.provider = if p == ai::PROVIDER_ANTHROPIC
-                || p == ai::PROVIDER_DEEPSEEK
-                || p == ai::PROVIDER_OPENAI
-            {
-                p
-            } else {
-                ai::PROVIDER_OPENAI.into()
-            };
-        }
-    }
-    if let Some(k) = api_key {
-        let k = k.trim();
-        if !k.is_empty() {
-            cfg.api_key = k.to_string();
-        }
-    }
-    ai::save_config(&cfg)
+    core::ai::apply_ai_config(base_url, model, provider, api_key)
 }
 
 /// Send a chat completion to the configured OpenAI-compatible endpoint,
 /// including tool calls. The API key is read from disk/env, never the frontend.
 #[tauri::command]
 async fn ai_chat(
-    messages: Vec<ai::ChatMessage>,
-    tools: Option<Vec<ai::ToolDef>>,
-) -> Result<ai::ChatResponse, String> {
-    let cfg = ai::load_config()?;
-    ai::chat_completion(&cfg, messages, tools, Some(4096)).await
-}
-
-/// Run a command; return true if it exits 0 within `ms` (killed on timeout).
-fn run_with_timeout(args: &[&str], ms: u64) -> bool {
-    use std::time::{Duration, Instant};
-    let mut child = match std::process::Command::new(&args[0])
-        .args(&args[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let start = Instant::now();
-    loop {
-        if let Some(st) = child.try_wait().unwrap_or(None) {
-            return st.success();
-        }
-        if start.elapsed() >= Duration::from_millis(ms) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Remove ControlMaster sockets whose master is dead OR broken. A broken master
-/// — alive enough to answer `-O check` but unable to serve a new session — makes
-/// the user's next interactive `ssh` hang or fail with "PTY allocation request
-/// failed", so each socket is probed by attaching a throwaway session. Best-effort.
-fn cleanup_stale_masters() {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let mux_dir = std::path::Path::new(&home).join(".ssh/puppetterm-mux");
-    let entries = match std::fs::read_dir(&mux_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // Socket filenames are `user@host:port` (no `.sock` extension), so
-        // process every non-directory entry in the mux dir.
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
-            continue;
-        };
-        // Socket filename is `user@host:port` (from %r@%h:%p).
-        let (user, host_port) = match name.rfind('@') {
-            Some(i) => (name[..i].to_string(), name[i + 1..].to_string()),
-            None => (String::new(), name.clone()),
-        };
-        let (host, port) = match host_port.rfind(':') {
-            Some(i) => (host_port[..i].to_string(), host_port[i + 1..].to_string()),
-            None => (host_port.clone(), "22".to_string()),
-        };
-        let target = if user.is_empty() {
-            host
-        } else {
-            format!("{user}@{host}")
-        };
-        let sock = path.to_string_lossy().into_owned();
-        // Attach a throwaway session: healthy master → `true` returns 0 fast;
-        // broken/dead master → fails or hangs (killed by the timeout).
-        let ok = run_with_timeout(
-            &[
-                "ssh",
-                "-S", &sock,
-                "-o", "ControlMaster=no",
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=2",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-p", &port,
-                &target,
-                "true",
-            ],
-            4000,
-        );
-        if !ok {
-            let _ = std::fs::remove_file(&path);
-            eprintln!("[puppetterm] removed broken ControlMaster socket {name}");
-        }
-    }
+    messages: Vec<core::ai::ChatMessage>,
+    tools: Option<Vec<core::ai::ToolDef>>,
+) -> Result<core::ai::ChatResponse, String> {
+    let cfg = core::ai::load_config()?;
+    core::ai::chat_completion(&cfg, messages, tools, Some(4096)).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -512,7 +283,7 @@ pub fn run() {
         .manage(AppState::default())
         .setup(|_app| {
             // Clean up any leftover ControlMaster sockets from the old approach.
-            std::thread::spawn(cleanup_stale_masters);
+            std::thread::spawn(core::sessions::cleanup_stale_masters);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

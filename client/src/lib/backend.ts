@@ -1,32 +1,134 @@
 // Frontend ↔ backend bridge.
 //
-// Under Tauri this calls the real Rust commands via IPC. In a plain browser
-// (vite dev/preview) it falls back to a lightweight mock so the UI can be
-// iterated on without rebuilding the native app.
+// Three transports, selected automatically:
+//   ipc  — under Tauri: calls the real Rust commands via IPC.
+//   web  — plain browser: POSTs to /api/<cmd> and streams events over /ws
+//          (the puppetterm-server deployment).
+//   mock — UI iteration only, enabled with VITE_PUPPETTERM_MOCK=1.
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type { UnlistenFn };
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const useMock = import.meta.env.VITE_PUPPETTERM_MOCK === "1";
 
-/** Call a Rust command (or its mock in the browser). */
+type Handler = (p: unknown) => void;
+
+/** Call a backend command (IPC, HTTP or mock depending on the runtime). */
 export async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri) return invoke<T>(cmd, args);
-  return mockCall<T>(cmd, args ?? {});
+  if (useMock) return mockCall<T>(cmd, args ?? {});
+  return webCall<T>(cmd, args ?? {});
 }
 
-/** Subscribe to a backend event (or the mock emitter in the browser). */
+/** Subscribe to a backend event stream. */
 export async function on<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {
   if (isTauri) return listen<T>(event, (e) => handler(e.payload));
-  mockHandlers[event] = handler as (p: unknown) => void;
+  const h = handler as (p: unknown) => void;
+  if (useMock) {
+    mockHandlers[event] = h;
+    return () => {
+      delete mockHandlers[event];
+    };
+  }
+  ensureWebsocket();
+  handlersByEvent.set(event, (handlersByEvent.get(event) ?? new Set()).add(h));
   return () => {
-    delete mockHandlers[event];
+    const set = handlersByEvent.get(event);
+    set?.delete(h);
+    if (set && set.size === 0) handlersByEvent.delete(event);
   };
 }
 
+// ---- web transport ---------------------------------------------------------
+
+async function webCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/${encodeURIComponent(cmd)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(args),
+    });
+  } catch (e) {
+    throw new Error(`backend unreachable (${String(e)})`);
+  }
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.error) msg = String(body.error);
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(msg);
+  }
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+const handlersByEvent = new Map<string, Set<Handler>>();
+
+let ws: WebSocket | null = null;
+let wsBackoff = 500;
+
+function dispatchEvent(event: string, payload: unknown) {
+  handlersByEvent.get(event)?.forEach((h) => {
+    try {
+      h(payload);
+    } catch (e) {
+      console.error(`handler for ${event} failed`, e);
+    }
+  });
+}
+
+function connectWebsocket() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onmessage = (msg) => {
+    try {
+      const { event, payload } = JSON.parse(String(msg.data));
+      if (typeof event === "string") dispatchEvent(event, payload);
+    } catch {
+      /* malformed frame */
+    }
+  };
+
+  ws.onopen = () => {
+    wsBackoff = 500;
+  };
+
+  // Auto-reconnect with capped backoff. Subscriptions live in
+  // handlersByEvent, so nothing needs re-registering after a reconnect.
+  ws.onclose = () => {
+    ws = null;
+    setTimeout(connectWebsocket, wsBackoff);
+    wsBackoff = Math.min(wsBackoff * 2, 8000);
+  };
+}
+
+function ensureWebsocket() {
+  if (ws || useMock || isTauri) return;
+  connectWebsocket();
+}
+
+// Reconnect promptly when the tab becomes visible again.
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      if (!ws && !isTauri && !useMock) {
+        wsBackoff = 0;
+        connectWebsocket();
+      }
+    }
+  });
+}
+
 // ---- browser mock (layout / UX iteration only) ---------------------------
-const mockHandlers: Record<string, (p: unknown) => void> = {};
+const mockHandlers: Record<string, Handler> = {};
 const mockSessions = new Map<number, string>();
 let mockNextId = 1;
 

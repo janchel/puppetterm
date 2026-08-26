@@ -3,6 +3,8 @@ import { sveltekit } from "@sveltejs/kit/vite";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+// @ts-expect-error process is a nodejs global
+const serverUrl = process.env.PUPPETTERM_SERVER_URL || "http://127.0.0.1:8080";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -27,6 +29,19 @@ export default defineConfig(async () => ({
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
+    },
+    // Browser mode (no Tauri) proxies API + WebSocket to the headless
+    // puppetterm-server. Override the target with PUPPETTERM_SERVER_URL.
+    proxy: {
+      "/api": {
+        target: serverUrl,
+        changeOrigin: true,
+      },
+      "/ws": {
+        target: serverUrl,
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
 }));

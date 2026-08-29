@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response as AxumResponse};
+use axum::response::{Html, IntoResponse, Response as AxumResponse};
 use axum::Json;
 use futures_util::{SinkExt, StreamExt};
 use puppetterm_core::sessions::Emitter;
@@ -254,18 +254,42 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
                     "model": cfg.model,
                     "provider": cfg.provider,
                     "has_api_key": !cfg.api_key.is_empty(),
+                    "auth_method": cfg.auth_method,
+                    "oauth": {
+                        "auth_url": cfg.oauth.auth_url,
+                        "token_url": cfg.oauth.token_url,
+                        "client_id": cfg.oauth.client_id,
+                        "scope": cfg.oauth.scope,
+                        "redirect_uri": cfg.oauth.redirect_uri,
+                        "has_client_secret": !cfg.oauth.client_secret.is_empty(),
+                    },
                 })
             })
         })
         .await,
         "set_ai_config" => run_blocking(move || {
+            let auth_method = args
+                .get("auth_method")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let oauth: Option<puppetterm_core::ai::AiOAuthMeta> = args
+                .get("oauth")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
             puppetterm_core::ai::apply_ai_config(
                 arg_str(&args, "base_url"),
                 arg_str(&args, "model"),
                 args.get("provider").and_then(|v| v.as_str()).map(String::from),
                 args.get("api_key").and_then(|v| v.as_str()).map(String::from),
+                auth_method,
+                oauth,
             )?;
             Ok(json!(null))
+        })
+        .await,
+        "ai_oauth_begin" => run_blocking(|| {
+            puppetterm_core::ai::begin_oauth().map(|b| {
+                json!({ "authorize_url": b.authorize_url, "state": b.state })
+            })
         })
         .await,
         "delete_ai_config" => run_blocking(|| {
@@ -299,10 +323,15 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
                 None => None,
             };
             match puppetterm_core::ai::load_config() {
-                Ok(cfg) => match puppetterm_core::ai::chat_completion(&cfg, messages, tools, Some(4096)).await {
-                    Ok(resp) => ok(serde_json::to_value(resp).unwrap_or(Value::Null)),
-                    Err(e) => err(e),
-                },
+                Ok(mut cfg) => {
+                    if let Err(e) = puppetterm_core::ai::ensure_valid_token(&mut cfg).await {
+                        return err(e);
+                    }
+                    match puppetterm_core::ai::chat_completion(&cfg, messages, tools, Some(4096)).await {
+                        Ok(resp) => ok(serde_json::to_value(resp).unwrap_or(Value::Null)),
+                        Err(e) => err(e),
+                    }
+                }
                 Err(e) => err(e),
             }
         }
@@ -364,4 +393,35 @@ async fn handle_socket(socket: WebSocket, app: App) {
             }
         }
     }
+}
+
+/// GET /oauth/callback — the provider redirects the browser here after the user
+/// logs in. We exchange the `code` for an access token (PKCE) and persist it,
+/// then show a simple "close this tab" page. This route is exempt from basic
+/// auth (see `auth::require_basic_auth`) so the provider redirect can reach it.
+pub async fn oauth_callback(Query(params): Query<std::collections::HashMap<String, String>>) -> AxumResponse {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let state = params.get("state").cloned().unwrap_or_default();
+    let result = match params.get("error").cloned() {
+        Some(e) => Err(format!("provider returned error: {e}")),
+        None if code.is_empty() || state.is_empty() => {
+            Err("missing code or state in OAuth callback".into())
+        }
+        None => puppetterm_core::ai::complete_oauth(&state, &code).await,
+    };
+    let html = match result {
+        Ok(_) => "<!doctype html><html><head><meta charset=\"utf-8\"><title>puppetterm</title></head>\
+<body style=\"font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;text-align:center;padding-top:22vh\">\
+<h2>✅ Login complete</h2><p>You can close this tab and return to puppetterm.</p></body></html>",
+        Err(e) => {
+            let safe = e.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            Box::leak(format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><title>puppetterm</title></head>\
+<body style=\"font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;text-align:center;padding-top:22vh\">\
+<h2>❌ Login failed</h2><p>{}</p></body></html>",
+                safe
+            ).into_boxed_str())
+        }
+    };
+    Html(html.to_string()).into_response()
 }

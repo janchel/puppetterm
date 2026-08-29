@@ -10,7 +10,10 @@
 //! environment variables. The API key is **encrypted at rest** (ChaCha20-Poly1305
 //! keyed from the machine id) and never crosses into the frontend.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chacha20poly1305::{
@@ -23,12 +26,43 @@ pub const PROVIDER_OPENAI: &str = "openai"; // custom OpenAI-compatible
 pub const PROVIDER_DEEPSEEK: &str = "deepseek";
 pub const PROVIDER_ANTHROPIC: &str = "anthropic";
 
+/// Authentication method used to obtain the bearer token sent to the endpoint.
+/// `key`   — a static API key pasted by the user (encrypted at rest).
+/// `oauth` — a bearer token obtained via a browser-based OAuth (PKCE) login,
+///           refreshed automatically while valid. The token is stored in the
+///           same encrypted `api_key` slot used by the `key` method.
+pub const AUTH_METHOD_KEY: &str = "key";
+pub const AUTH_METHOD_OAUTH: &str = "oauth";
+
 fn default_provider() -> String {
     PROVIDER_OPENAI.to_string()
 }
 
+fn default_auth_method() -> String {
+    AUTH_METHOD_KEY.to_string()
+}
+
+/// Non-secret OAuth client metadata (the provider's authorize/token endpoints,
+/// client id, etc.). Never holds a token/secret at rest (the token lives in the
+/// encrypted `api_key`/`refresh_token_enc` slots).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct AiOAuthMeta {
+    #[serde(default)]
+    pub auth_url: String,
+    #[serde(default)]
+    pub token_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+}
+
 /// AI provider config, stored on disk (never committed). `api_key` is the
-/// decrypted key in memory only; `api_key_enc` is what lives on disk.
+/// decrypted bearer token in memory only; `api_key_enc` is what lives on disk.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AiConfig {
     pub base_url: String,
@@ -39,6 +73,20 @@ pub struct AiConfig {
     pub api_key: String,
     #[serde(default)]
     pub api_key_enc: Option<String>,
+    /// How the bearer token is obtained: `key` (static) or `oauth` (browser login).
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+    /// OAuth client metadata (authorize/token endpoints, client id, scope…).
+    #[serde(default)]
+    pub oauth: AiOAuthMeta,
+    /// Refresh token (in memory only; `refresh_token_enc` is persisted).
+    #[serde(skip_serializing, default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub refresh_token_enc: Option<String>,
+    /// Unix epoch second at which the access token expires (if known).
+    #[serde(default)]
+    pub token_expires_at: Option<u64>,
 }
 
 /// Non-secret view of the config for the settings UI.
@@ -116,6 +164,11 @@ pub fn load_config() -> Result<AiConfig, String> {
             model: model.clone(),
             provider: env_provider.unwrap_or_else(default_provider),
             api_key_enc: None,
+            auth_method: default_auth_method(),
+            oauth: AiOAuthMeta::default(),
+            refresh_token: String::new(),
+            refresh_token_enc: None,
+            token_expires_at: None,
         });
     }
     let data = std::fs::read_to_string(config_path())
@@ -124,6 +177,15 @@ pub fn load_config() -> Result<AiConfig, String> {
     // Decrypt the stored key; legacy plaintext `api_key` field also loads.
     if let Some(enc) = &cfg.api_key_enc {
         cfg.api_key = decrypt_key(enc).unwrap_or_default();
+    }
+    if let Some(enc) = &cfg.refresh_token_enc {
+        cfg.refresh_token = decrypt_key(enc).unwrap_or_default();
+    }
+    if cfg.provider.is_empty() {
+        cfg.provider = default_provider();
+    }
+    if cfg.auth_method.is_empty() {
+        cfg.auth_method = default_auth_method();
     }
     Ok(cfg)
 }
@@ -134,6 +196,10 @@ pub fn save_config(cfg: &AiConfig) -> Result<(), String> {
         out.api_key_enc = Some(encrypt_key(&out.api_key)?);
     }
     out.api_key = String::new(); // never write the plaintext key to disk
+    if !out.refresh_token.is_empty() {
+        out.refresh_token_enc = Some(encrypt_key(&out.refresh_token)?);
+    }
+    out.refresh_token = String::new(); // never write the plaintext refresh token to disk
     let path = config_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -236,11 +302,15 @@ pub async fn chat_completion(
 
 /// Update the stored AI config (shared by the desktop and web frontends).
 /// Blank fields keep their current values; a blank key keeps the stored one.
+/// `auth_method` selects how the bearer token is obtained (`key` or `oauth`);
+/// `oauth` carries the client metadata for the browser login flow.
 pub fn apply_ai_config(
     base_url: String,
     model: String,
     provider: Option<String>,
     api_key: Option<String>,
+    auth_method: Option<String>,
+    oauth: Option<AiOAuthMeta>,
 ) -> Result<(), String> {
     let mut cfg = match load_config() {
         Ok(c) => c,
@@ -250,6 +320,11 @@ pub fn apply_ai_config(
             model: String::new(),
             provider: PROVIDER_OPENAI.into(),
             api_key_enc: None,
+            auth_method: default_auth_method(),
+            oauth: AiOAuthMeta::default(),
+            refresh_token: String::new(),
+            refresh_token_enc: None,
+            token_expires_at: None,
         },
     };
     if !base_url.trim().is_empty() {
@@ -275,7 +350,255 @@ pub fn apply_ai_config(
             cfg.api_key = k.to_string();
         }
     }
+    if let Some(m) = auth_method {
+        let m = m.trim().to_string();
+        if !m.is_empty() {
+            cfg.auth_method = if m == AUTH_METHOD_OAUTH {
+                AUTH_METHOD_OAUTH.into()
+            } else {
+                AUTH_METHOD_KEY.into()
+            };
+        }
+    }
+    if let Some(o) = oauth {
+        // Only adopt non-empty fields so a partial update doesn't wipe the rest.
+        if !o.auth_url.trim().is_empty() {
+            cfg.oauth.auth_url = o.auth_url.trim().to_string();
+        }
+        if !o.token_url.trim().is_empty() {
+            cfg.oauth.token_url = o.token_url.trim().to_string();
+        }
+        if !o.client_id.trim().is_empty() {
+            cfg.oauth.client_id = o.client_id.trim().to_string();
+        }
+        if !o.client_secret.trim().is_empty() {
+            cfg.oauth.client_secret = o.client_secret.trim().to_string();
+        }
+        if !o.scope.trim().is_empty() {
+            cfg.oauth.scope = o.scope.trim().to_string();
+        }
+        if !o.redirect_uri.trim().is_empty() {
+            cfg.oauth.redirect_uri = o.redirect_uri.trim().to_string();
+        }
+    }
     save_config(&cfg)
+}
+
+// ---- OAuth (PKCE) browser login -------------------------------------------
+//
+// Used when `auth_method == "oauth"`: the app opens the provider's authorize
+// URL in the user's browser; the provider redirects back to `redirect_uri`
+// (a server route) with a `code`+`state`. We exchange the code for an access
+// token (PKCE) and store it in the same encrypted `api_key` slot the chat call
+// already sends as a bearer token — so no chat-path changes are needed.
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    getrandom::getrandom(&mut v).expect("rng");
+    v
+}
+
+fn urlsafe_no_pad(b: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Minimal percent-encoding for OAuth query parameters (RFC 3986 unreserved set).
+fn qenc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
+            _ => o.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    o
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(verifier.as_bytes());
+    urlsafe_no_pad(&h.finalize())
+}
+
+/// In-flight OAuth login, keyed by the CSRF `state`. Survives the redirect
+/// because it lives in the server process (not the stateless callback request).
+struct PendingOAuth {
+    verifier: String,
+    client_id: String,
+    client_secret: String,
+    token_url: String,
+    redirect_uri: String,
+    scope: String,
+}
+
+static PENDING: LazyLock<Mutex<HashMap<String, PendingOAuth>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Result of `begin_oauth` — the URL to open in the browser and the CSRF state.
+#[derive(Serialize)]
+pub struct AiOAuthBegin {
+    pub authorize_url: String,
+    pub state: String,
+}
+
+/// Start a browser-based OAuth (PKCE) login. Reads the OAuth metadata already
+/// saved via `apply_ai_config` (auth_url/token_url/client_id/redirect_uri/…).
+/// Returns the provider authorize URL to open and the state to expect back.
+pub fn begin_oauth() -> Result<AiOAuthBegin, String> {
+    let cfg = load_config()?;
+    let o = &cfg.oauth;
+    if o.auth_url.trim().is_empty()
+        || o.token_url.trim().is_empty()
+        || o.client_id.trim().is_empty()
+    {
+        return Err(
+            "OAuth not configured: set Auth URL, Token URL and Client ID in AI settings first"
+                .into(),
+        );
+    }
+    if o.redirect_uri.trim().is_empty() {
+        return Err("OAuth redirect URI is required (use the auto-filled one in settings)".into());
+    }
+    let verifier = urlsafe_no_pad(&random_bytes(48));
+    let challenge = pkce_challenge(&verifier);
+    let state = urlsafe_no_pad(&random_bytes(24));
+
+    let sep = if o.auth_url.contains('?') { '&' } else { '?' };
+    let mut url = format!(
+        "{}{sep}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+        o.auth_url,
+        qenc(&o.client_id),
+        qenc(&o.redirect_uri),
+        qenc(&state),
+        qenc(&challenge),
+    );
+    if !o.scope.trim().is_empty() {
+        url.push_str(&format!("&scope={}", qenc(&o.scope)));
+    }
+
+    PENDING.lock().unwrap().insert(
+        state.clone(),
+        PendingOAuth {
+            verifier,
+            client_id: o.client_id.clone(),
+            client_secret: o.client_secret.clone(),
+            token_url: o.token_url.clone(),
+            redirect_uri: o.redirect_uri.clone(),
+            scope: o.scope.clone(),
+        },
+    );
+    Ok(AiOAuthBegin { authorize_url: url, state })
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// Exchange an OAuth `code` for tokens and persist them (access token in the
+/// encrypted `api_key` slot, refresh token in `refresh_token_enc`).
+pub async fn complete_oauth(state: &str, code: &str) -> Result<(), String> {
+    let pending = {
+        let mut m = PENDING.lock().unwrap();
+        m.remove(state)
+            .ok_or_else(|| "unknown or expired OAuth state".to_string())?
+    };
+    let client = reqwest::Client::new();
+    let params: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", &pending.redirect_uri),
+        ("client_id", &pending.client_id),
+        ("code_verifier", &pending.verifier),
+    ];
+    let mut req = client.post(&pending.token_url).form(&params);
+    if !pending.client_secret.is_empty() {
+        req = req.form(&[("client_secret", pending.client_secret.as_str())]);
+    }
+    let resp = req.send().await.map_err(|e| format!("token exchange failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "token exchange failed ({status}): {}",
+            &text.chars().take(400).collect::<String>()
+        ));
+    }
+    let tr: TokenResponse =
+        serde_json::from_str(&text).map_err(|e| format!("bad token response: {e}"))?;
+
+    let mut cfg = load_config().map_err(|e| format!("save AI settings before logging in: {e}"))?;
+    cfg.api_key = tr.access_token;
+    cfg.auth_method = AUTH_METHOD_OAUTH.into();
+    cfg.refresh_token = tr.refresh_token.unwrap_or_default();
+    cfg.token_expires_at = tr.expires_in.map(|s| now_secs() + s);
+    save_config(&cfg)?;
+    Ok(())
+}
+
+/// Refresh an expired OAuth access token in place (uses the stored refresh token).
+async fn refresh_access_token(cfg: &mut AiConfig) -> Result<(), String> {
+    if cfg.oauth.token_url.trim().is_empty() || cfg.refresh_token.is_empty() {
+        return Err("OAuth token expired and cannot be refreshed — please log in again".into());
+    }
+    let client = reqwest::Client::new();
+    let params: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &cfg.refresh_token),
+        ("client_id", &cfg.oauth.client_id),
+    ];
+    let mut req = client.post(&cfg.oauth.token_url).form(&params);
+    if !cfg.oauth.client_secret.is_empty() {
+        req = req.form(&[("client_secret", cfg.oauth.client_secret.as_str())]);
+    }
+    let resp = req.send().await.map_err(|e| format!("token refresh failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "token refresh failed ({status}): {}",
+            &text.chars().take(400).collect::<String>()
+        ));
+    }
+    let tr: TokenResponse =
+        serde_json::from_str(&text).map_err(|e| format!("bad token response: {e}"))?;
+    cfg.api_key = tr.access_token;
+    if let Some(rt) = tr.refresh_token.filter(|s| !s.is_empty()) {
+        cfg.refresh_token = rt;
+    }
+    cfg.token_expires_at = tr.expires_in.map(|s| now_secs() + s);
+    save_config(cfg)?;
+    Ok(())
+}
+
+/// Ensure `cfg.api_key` holds a valid (unexpired) bearer token before a chat
+/// call. For the `key` method this is a no-op; for `oauth` it refreshes the
+/// access token when it has (or is about to) expire.
+pub async fn ensure_valid_token(cfg: &mut AiConfig) -> Result<(), String> {
+    if cfg.auth_method != AUTH_METHOD_OAUTH {
+        return Ok(());
+    }
+    let expired = cfg
+        .token_expires_at
+        .map(|e| e <= now_secs() + 60)
+        .unwrap_or(false);
+    if !expired {
+        return Ok(());
+    }
+    refresh_access_token(cfg).await
 }
 
 /// Remove the on-disk AI config (clears the configured provider). The in-memory
@@ -323,6 +646,11 @@ pub async fn test_config(
         model: model.clone(),
         provider: provider.clone(),
         api_key_enc: None,
+        auth_method: default_auth_method(),
+        oauth: AiOAuthMeta::default(),
+        refresh_token: String::new(),
+        refresh_token_enc: None,
+        token_expires_at: None,
     };
     let resp = chat_completion(
         &cfg,
@@ -619,6 +947,11 @@ mod tests {
             provider: PROVIDER_OPENAI.into(),
             api_key: "sk-super-secret-xyz".into(),
             api_key_enc: None,
+            auth_method: default_auth_method(),
+            oauth: AiOAuthMeta::default(),
+            refresh_token: String::new(),
+            refresh_token_enc: None,
+            token_expires_at: None,
         };
         save_config(&cfg).expect("save");
         let raw = std::fs::read_to_string(&path).expect("read file");

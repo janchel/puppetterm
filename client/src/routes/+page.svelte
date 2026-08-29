@@ -66,6 +66,17 @@
   let aiKey = $state("");
   let aiHasKey = $state(false);
   let aiReady = $state(false);
+  // How the bearer token is obtained: "key" (static) or "oauth" (browser login).
+  let aiAuthMethod = $state("key");
+  // OAuth client metadata (shown when auth_method === "oauth").
+  let oauthAuthUrl = $state("");
+  let oauthTokenUrl = $state("");
+  let oauthClientId = $state("");
+  let oauthClientSecret = $state("");
+  let oauthScope = $state("");
+  let oauthRedirectUri = $state("");
+  let oauthHasSecret = $state(false);
+  let aiOauthBusy = $state(false);
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -113,6 +124,74 @@
     if (preset && preset.baseUrl) aiBaseUrl = preset.baseUrl;
     else if (p === "openai") aiBaseUrl = customBaseUrl; // restore the custom endpoint
     if (preset?.model) aiModel = preset.model;
+  }
+
+  /** Switch the authentication method. OAuth always targets an
+   *  OpenAI-compatible endpoint, so the provider is forced to "openai" and the
+   *  redirect URI is auto-filled from the current origin. */
+  function setAiAuthMethod(m: string) {
+    aiAuthMethod = m;
+    if (m === "oauth") {
+      if (aiProvider !== "openai") {
+        aiProvider = "openai";
+        aiBaseUrl = customBaseUrl;
+      }
+      if (!oauthRedirectUri.trim()) {
+        try {
+          oauthRedirectUri = `${location.origin}/oauth/callback`;
+        } catch {
+          oauthRedirectUri = "";
+        }
+      }
+    }
+  }
+
+  /** Begin a browser-based OAuth login: save the metadata, open the provider's
+   *  authorize URL, then poll until the token lands in the saved config. */
+  async function startOauthLogin() {
+    if (aiOauthBusy) return;
+    aiOauthBusy = true;
+    try {
+      if (aiProvider === "openai") customBaseUrl = aiBaseUrl;
+      await call("set_ai_config", {
+        base_url: aiBaseUrl,
+        model: aiModel,
+        provider: aiProvider,
+        api_key: aiKey,
+        auth_method: "oauth",
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+        },
+      });
+      const r = await call<any>("ai_oauth_begin");
+      window.open(r.authorize_url, "puppetterm-oauth", "width=600,height=720");
+      pushChat("ai", "(opened provider login — complete it in the popup, then return here)");
+      const timer = setInterval(async () => {
+        try {
+          const v = await call<any>("get_ai_config");
+          if (v.auth_method === "oauth" && v.has_api_key) {
+            clearInterval(timer);
+            aiHasKey = true;
+            aiReady = true;
+            pushChat("ai", "(AI logged in via OAuth — token stored, encrypted)");
+            notify("OAuth login successful");
+          }
+        } catch {
+          /* keep polling */
+        }
+      }, 1500);
+      setTimeout(() => clearInterval(timer), 5 * 60 * 1000);
+    } catch (e) {
+      notify(`OAuth login failed: ${e}`, "err");
+      pushChat("ai", `(OAuth login failed: ${e})`);
+    } finally {
+      aiOauthBusy = false;
+    }
   }
 
   // Every model across all provider presets, plus whatever is currently saved.
@@ -1087,6 +1166,15 @@
         model: aiModel,
         provider: aiProvider,
         api_key: aiKey,
+        auth_method: aiAuthMethod,
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+        },
       });
       aiKey = "";
       const v = await call<any>("get_ai_config");
@@ -1094,6 +1182,15 @@
       aiModel = v.model;
       aiProvider = v.provider ?? "openai";
       aiHasKey = v.has_api_key;
+      aiAuthMethod = v.auth_method ?? "key";
+      if (v.oauth) {
+        oauthAuthUrl = v.oauth.auth_url ?? "";
+        oauthTokenUrl = v.oauth.token_url ?? "";
+        oauthClientId = v.oauth.client_id ?? "";
+        oauthScope = v.oauth.scope ?? "";
+        oauthRedirectUri = v.oauth.redirect_uri ?? "";
+        oauthHasSecret = !!v.oauth.has_client_secret;
+      }
       aiReady = true;
       if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
       pushChat("ai", "(AI settings saved)");
@@ -1133,6 +1230,14 @@
       customBaseUrl = "";
       aiModel = "";
       aiKey = "";
+      aiAuthMethod = "key";
+      oauthAuthUrl = "";
+      oauthTokenUrl = "";
+      oauthClientId = "";
+      oauthClientSecret = "";
+      oauthScope = "";
+      oauthRedirectUri = "";
+      oauthHasSecret = false;
       aiHasKey = false;
       aiReady = false;
       aiTest = null;
@@ -2142,6 +2247,15 @@
         aiModel = v.model;
         aiProvider = v.provider ?? "openai";
         aiHasKey = v.has_api_key;
+        aiAuthMethod = v.auth_method ?? "key";
+        if (v.oauth) {
+          oauthAuthUrl = v.oauth.auth_url ?? "";
+          oauthTokenUrl = v.oauth.token_url ?? "";
+          oauthClientId = v.oauth.client_id ?? "";
+          oauthScope = v.oauth.scope ?? "";
+          oauthRedirectUri = v.oauth.redirect_uri ?? "";
+          oauthHasSecret = !!v.oauth.has_client_secret;
+        }
         aiReady = true;
         if (aiProvider === "openai") customBaseUrl = v.base_url || "";
         setHistory(chatHostOf(activeHost), [{ role: "system", content: SYSTEM_PROMPT }]);
@@ -2521,13 +2635,66 @@
           </datalist>
         </label>
         <label class="modal-field">
-          API key
-          <input
-            bind:value={aiKey}
-            type="password"
-            placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
-          />
+          Authentication
+          <select
+            value={aiAuthMethod}
+            onchange={(e) => setAiAuthMethod((e.currentTarget as HTMLSelectElement).value)}
+          >
+            <option value="key">API key</option>
+            <option value="oauth">Web login (OAuth — no key)</option>
+          </select>
         </label>
+        {#if aiAuthMethod === "oauth"}
+          <label class="modal-field">
+            OAuth authorize URL
+            <input bind:value={oauthAuthUrl} placeholder="https://provider.example/oauth/authorize" />
+          </label>
+          <label class="modal-field">
+            OAuth token URL
+            <input bind:value={oauthTokenUrl} placeholder="https://provider.example/oauth/token" />
+          </label>
+          <label class="modal-field">
+            Client ID
+            <input bind:value={oauthClientId} placeholder="client id from your OAuth app" />
+          </label>
+          <label class="modal-field">
+            Client secret (optional — confidential clients only)
+            <input
+              bind:value={oauthClientSecret}
+              type="password"
+              placeholder={oauthHasSecret ? "••• (set — encrypted)" : "leave blank for PKCE public clients"}
+            />
+          </label>
+          <label class="modal-field">
+            Scope (optional)
+            <input bind:value={oauthScope} placeholder="e.g. openid profile email" />
+          </label>
+          <label class="modal-field">
+            Redirect URI (auto-filled — must match the OAuth app)
+            <input bind:value={oauthRedirectUri} placeholder="http://host:8080/oauth/callback" />
+          </label>
+          <div class="modal-inline">
+            <button
+              type="button"
+              onclick={startOauthLogin}
+              disabled={aiOauthBusy || !oauthAuthUrl.trim() || !oauthTokenUrl.trim() || !oauthClientId.trim() || !aiBaseUrl.trim() || !aiModel.trim()}
+            >
+              {aiOauthBusy ? "Opening login…" : (aiHasKey ? "Log in again" : "Log in")}
+            </button>
+            {#if aiHasKey && aiAuthMethod === "oauth"}
+              <span class="ai-test ok">✓ token set (encrypted)</span>
+            {/if}
+          </div>
+        {:else}
+          <label class="modal-field">
+            API key
+            <input
+              bind:value={aiKey}
+              type="password"
+              placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
+            />
+          </label>
+        {/if}
         <div class="modal-inline">
           <button
             type="button"

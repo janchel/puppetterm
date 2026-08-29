@@ -39,7 +39,14 @@ fn default_provider() -> String {
 }
 
 fn default_auth_method() -> String {
-    AUTH_METHOD_KEY.to_string()
+    AUTH_METHOD_OAUTH.to_string()
+}
+
+/// Default OAuth "flow" — the standard authorization-code + PKCE flow
+/// (`/authorize` → redirect with `code` → `/token` form exchange). `openrouter`
+/// is OpenRouter's variant (different param names + JSON key exchange).
+fn default_flow() -> String {
+    "standard".to_string()
 }
 
 /// Non-secret OAuth client metadata (the provider's authorize/token endpoints,
@@ -59,6 +66,9 @@ pub struct AiOAuthMeta {
     pub scope: String,
     #[serde(default)]
     pub redirect_uri: String,
+    /// "standard" or "openrouter" (see `default_flow`).
+    #[serde(default = "default_flow")]
+    pub flow: String,
 }
 
 /// AI provider config, stored on disk (never committed). `api_key` is the
@@ -380,6 +390,13 @@ pub fn apply_ai_config(
         if !o.redirect_uri.trim().is_empty() {
             cfg.oauth.redirect_uri = o.redirect_uri.trim().to_string();
         }
+        if !o.flow.trim().is_empty() {
+            cfg.oauth.flow = if o.flow.trim() == "openrouter" {
+                "openrouter".into()
+            } else {
+                "standard".into()
+            };
+        }
     }
     save_config(&cfg)
 }
@@ -439,6 +456,7 @@ struct PendingOAuth {
     token_url: String,
     redirect_uri: String,
     scope: String,
+    flow: String,
 }
 
 static PENDING: LazyLock<Mutex<HashMap<String, PendingOAuth>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -456,9 +474,12 @@ pub struct AiOAuthBegin {
 pub fn begin_oauth() -> Result<AiOAuthBegin, String> {
     let cfg = load_config()?;
     let o = &cfg.oauth;
+    // OpenRouter's variant has no client registration (it identifies the app by
+    // the `callback_url`), so `client_id` is only required for the standard flow.
+    let need_client_id = o.flow.trim() != "openrouter";
     if o.auth_url.trim().is_empty()
         || o.token_url.trim().is_empty()
-        || o.client_id.trim().is_empty()
+        || (need_client_id && o.client_id.trim().is_empty())
     {
         return Err(
             "OAuth not configured: set Auth URL, Token URL and Client ID in AI settings first"
@@ -472,18 +493,37 @@ pub fn begin_oauth() -> Result<AiOAuthBegin, String> {
     let challenge = pkce_challenge(&verifier);
     let state = urlsafe_no_pad(&random_bytes(24));
 
-    let sep = if o.auth_url.contains('?') { '&' } else { '?' };
-    let mut url = format!(
-        "{}{sep}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
-        o.auth_url,
-        qenc(&o.client_id),
-        qenc(&o.redirect_uri),
-        qenc(&state),
-        qenc(&challenge),
-    );
-    if !o.scope.trim().is_empty() {
-        url.push_str(&format!("&scope={}", qenc(&o.scope)));
-    }
+    let flow = if o.flow.trim() == "openrouter" {
+        "openrouter"
+    } else {
+        "standard"
+    };
+
+    let url = if flow == "openrouter" {
+        // OpenRouter's variant: no client_id/state/scope; the callback URL is the
+        // `callback_url` param and the code is returned at that URL.
+        let sep = if o.auth_url.contains('?') { '&' } else { '?' };
+        format!(
+            "{}{sep}callback_url={}&code_challenge={}&code_challenge_method=S256",
+            o.auth_url,
+            qenc(&o.redirect_uri),
+            qenc(&challenge),
+        )
+    } else {
+        let sep = if o.auth_url.contains('?') { '&' } else { '?' };
+        let mut u = format!(
+            "{}{sep}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+            o.auth_url,
+            qenc(&o.client_id),
+            qenc(&o.redirect_uri),
+            qenc(&state),
+            qenc(&challenge),
+        );
+        if !o.scope.trim().is_empty() {
+            u.push_str(&format!("&scope={}", qenc(&o.scope)));
+        }
+        u
+    };
 
     PENDING.lock().unwrap().insert(
         state.clone(),
@@ -494,6 +534,7 @@ pub fn begin_oauth() -> Result<AiOAuthBegin, String> {
             token_url: o.token_url.clone(),
             redirect_uri: o.redirect_uri.clone(),
             scope: o.scope.clone(),
+            flow: flow.to_string(),
         },
     );
     Ok(AiOAuthBegin { authorize_url: url, state })
@@ -513,10 +554,54 @@ struct TokenResponse {
 pub async fn complete_oauth(state: &str, code: &str) -> Result<(), String> {
     let pending = {
         let mut m = PENDING.lock().unwrap();
-        m.remove(state)
-            .ok_or_else(|| "unknown or expired OAuth state".to_string())?
+        if let Some(p) = m.remove(state) {
+            p
+        } else if m.len() == 1 {
+            // OpenRouter's flow doesn't echo `state`; consume the single in-flight login.
+            m.drain().next().map(|(_, v)| v).unwrap()
+        } else {
+            return Err("unknown or expired OAuth state".into());
+        }
     };
     let client = reqwest::Client::new();
+
+    // OpenRouter's variant: POST JSON `{code, code_verifier, code_challenge_method}`
+    // and read `{key}` (a long-lived API key, no refresh/expiry).
+    if pending.flow == "openrouter" {
+        let body = serde_json::json!({
+            "code": code,
+            "code_verifier": pending.verifier,
+            "code_challenge_method": "S256",
+        });
+        let resp = client
+            .post(&pending.token_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("token exchange failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "token exchange failed ({status}): {}",
+                &text.chars().take(400).collect::<String>()
+            ));
+        }
+        #[derive(Deserialize)]
+        struct OrKey {
+            key: String,
+        }
+        let ok: OrKey = serde_json::from_str(&text).map_err(|e| format!("bad token response: {e}"))?;
+        let mut cfg = load_config().map_err(|e| format!("save AI settings before logging in: {e}"))?;
+        cfg.api_key = ok.key;
+        cfg.auth_method = AUTH_METHOD_OAUTH.into();
+        cfg.refresh_token = String::new();
+        cfg.token_expires_at = None;
+        save_config(&cfg)?;
+        return Ok(());
+    }
+
+    // Standard authorization-code + PKCE exchange (form-encoded, JSON response).
     let params: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -524,7 +609,10 @@ pub async fn complete_oauth(state: &str, code: &str) -> Result<(), String> {
         ("client_id", &pending.client_id),
         ("code_verifier", &pending.verifier),
     ];
-    let mut req = client.post(&pending.token_url).form(&params);
+    let mut req = client
+        .post(&pending.token_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&params);
     if !pending.client_secret.is_empty() {
         req = req.form(&[("client_secret", pending.client_secret.as_str())]);
     }
@@ -560,7 +648,10 @@ async fn refresh_access_token(cfg: &mut AiConfig) -> Result<(), String> {
         ("refresh_token", &cfg.refresh_token),
         ("client_id", &cfg.oauth.client_id),
     ];
-    let mut req = client.post(&cfg.oauth.token_url).form(&params);
+    let mut req = client
+        .post(&cfg.oauth.token_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&params);
     if !cfg.oauth.client_secret.is_empty() {
         req = req.form(&[("client_secret", cfg.oauth.client_secret.as_str())]);
     }

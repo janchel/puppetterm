@@ -39,10 +39,9 @@ pub fn check_agent(host: &str) -> bool {
     let out = Command::new("ssh")
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
         .arg(host)
-        .args([
-            "sh", "-c",
-            "for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && exit 0; done; exit 1",
-        ])
+        .arg(
+            "sh -c 'for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && exit 0; done; exit 1'",
+        )
         .output();
     matches!(out, Ok(o) if o.status.success())
 }

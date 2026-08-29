@@ -140,7 +140,15 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
                     Ok(r) => json!({ "exit": r.exit, "events": r.events.len() }).to_string(),
                     Err(e) => json!({ "error": e }).to_string(),
                 };
-                let _ = puppetterm_core::audit::record(
+                // Full output (verbose) goes to a file keyed by the new row id;
+                // the DB row keeps only the light summary above. This keeps the
+                // audit index small and means the AI never ingests history
+                // output as context — details are pulled on demand by the UI.
+                let detail_json = match &result {
+                    Ok(r) => serde_json::to_string(r).unwrap_or_default(),
+                    Err(e) => json!({ "error": e }).to_string(),
+                };
+                if let Ok(id) = puppetterm_core::audit::record(
                     &host,
                     &source,
                     &action,
@@ -148,7 +156,9 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
                     approval,
                     exit,
                     Some(&summary),
-                );
+                ) {
+                    let _ = puppetterm_core::audit::write_detail(id, &detail_json);
+                }
                 result.map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
             })
             .await
@@ -224,6 +234,17 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
             })
             .await
         }
+        "audit_detail" => {
+            let id = arg_str(&args, "id")
+                .parse::<i64>()
+                .unwrap_or(-1);
+            run_blocking(move || {
+                puppetterm_core::audit::read_detail(id).map(|opt| {
+                    json!({ "id": id, "detail": opt })
+                })
+            })
+            .await
+        }
 
         // ---- AI ---------------------------------------------------------------
         "get_ai_config" => run_blocking(move || {
@@ -247,6 +268,21 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
             Ok(json!(null))
         })
         .await,
+        "delete_ai_config" => run_blocking(|| {
+            puppetterm_core::ai::delete_config()?;
+            Ok(json!(null))
+        })
+        .await,
+        "test_ai_config" => {
+            let base_url = arg_str(&args, "base_url");
+            let model = arg_str(&args, "model");
+            let provider = args.get("provider").and_then(|v| v.as_str()).map(String::from);
+            let api_key = args.get("api_key").and_then(|v| v.as_str()).map(String::from);
+            match puppetterm_core::ai::test_config(base_url, model, provider, api_key).await {
+                Ok(summary) => ok(json!({ "ok": true, "summary": summary })),
+                Err(e) => ok(json!({ "ok": false, "error": e })),
+            }
+        }
         "ai_chat" => {
             let messages: Vec<puppetterm_core::ai::ChatMessage> = match args.get("messages") {
                 Some(m) => match serde_json::from_value(m.clone()) {

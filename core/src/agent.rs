@@ -59,10 +59,9 @@ fn resolve_agent_bin(host: &str) -> Result<String, String> {
     let probe = Command::new("ssh")
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
         .arg(host)
-        .args([
-            "sh", "-c",
-            "for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1",
-        ])
+        .arg(
+            "sh -c 'for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1'",
+        )
         .output()
         .map_err(|e| format!("resolve agent bin (ssh): {e}"))?;
     if !probe.status.success() {

@@ -56,9 +56,10 @@ fn resolve_agent_bin(host: &str) -> Result<String, String> {
             return Ok(bin.clone());
         }
     }
-    let probe = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
-        .arg(host)
+    let mut cmd = Command::new("ssh");
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
+    crate::ssh::ssh_host(&mut cmd, host);
+    let probe = cmd
         .arg(
             "sh -c 'for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1'",
         )
@@ -123,7 +124,8 @@ pub fn run_action(
     if let Some(sock) = mux_socket_for(host) {
         cmd.arg("-S").arg(sock);
     }
-    cmd.arg(host).arg(agent);
+    crate::ssh::ssh_host(&mut cmd, host);
+    cmd.arg(agent);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {

@@ -86,7 +86,15 @@ impl SessionManager {
 
     /// Open an interactive SSH session to `host`.
     pub fn spawn_ssh(&self, emit: Emitter, host: &str) -> Result<u32, String> {
-        self.spawn(emit, "ssh", &["-tt", host], None)
+        let mut args: Vec<String> = vec!["-tt".to_string()];
+        let (h, port) = crate::ssh::split_ssh_host(host);
+        if let Some(p) = port {
+            args.push("-p".to_string());
+            args.push(p.to_string());
+        }
+        args.push(h);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.spawn(emit, "ssh", &arg_refs, None)
     }
 
     /// Open a local shell in $HOME (no remote connection).

@@ -23,16 +23,17 @@ pub async fn run_ssh_capture(host: String, cmd: String) -> Result<serde_json::Va
     let host2 = host.clone();
     let cmd2 = cmd.clone();
     tokio::task::spawn_blocking(move || {
-        let out = Command::new("ssh")
-            .args([
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=8",
-                "-o", "StrictHostKeyChecking=accept-new",
-            ])
-            .arg(&host2)
-            .arg(&cmd2)
-            .output()
-            .map_err(|e| format!("ssh_capture: {e}"))?;
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]);
+    crate::ssh::ssh_host(&mut cmd, &host2);
+    let out = cmd
+        .arg(&cmd2)
+        .output()
+        .map_err(|e| format!("ssh_capture: {e}"))?;
         Ok(serde_json::json!({
             "host": host2,
             "exit": out.status.code().unwrap_or(-1),

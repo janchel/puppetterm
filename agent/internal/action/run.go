@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/puppetterm/agent/internal/protocol"
@@ -79,8 +82,19 @@ func Run(ctx context.Context, req protocol.Request, out *protocol.Encoder) int {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go pumpStream(stdout, protocol.StreamStdout, req.RequestID, out, &wg)
-	go pumpStream(stderr, protocol.StreamStderr, req.RequestID, out, &wg)
+	// Bound the output we send back so a single huge command (e.g. `cat` on a
+	// large log) can't blow the model's context. PUPPETTERM_AGENT_OUTPUT_WORDS
+	// tunes the per-command word budget (0 = unlimited). Beyond the budget we
+	// stop streaming and emit a marker telling the model to narrow the command.
+	if limit := maxOutputWords(); limit <= 0 {
+		go pumpStream(stdout, protocol.StreamStdout, req.RequestID, out, &wg)
+		go pumpStream(stderr, protocol.StreamStderr, req.RequestID, out, &wg)
+	} else {
+		var budget int64 = limit
+		var exceeded int32
+		go pumpStreamCapped(stdout, protocol.StreamStdout, req.RequestID, out, &wg, &budget, &exceeded)
+		go pumpStreamCapped(stderr, protocol.StreamStderr, req.RequestID, out, &wg, &budget, &exceeded)
+	}
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
@@ -108,6 +122,53 @@ func pumpStream(r io.Reader, stream, requestID string, out *protocol.Encoder, wg
 		n, err := r.Read(buf)
 		if n > 0 {
 			_ = out.Output(stream, string(buf[:n]), requestID)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// maxOutputWords returns the per-command word budget (0 = unlimited),
+// tunable via PUPPETTERM_AGENT_OUTPUT_WORDS.
+func maxOutputWords() int64 {
+	if v := os.Getenv("PUPPETTERM_AGENT_OUTPUT_WORDS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return 24000
+}
+
+// outputTruncatedMarker tells the model the stream was cut and how to narrow.
+func outputTruncatedMarker() string {
+	return "\n[OUTPUT TRUNCATED — only the first ~" + strconv.FormatInt(maxOutputWords(), 10) +
+		" words of this command's output were returned. To read more, narrow the command: " +
+		"use `grep \"pattern\"`, `head -n N`, `tail -n N`, or `sed -n 'START,ENDp' <file>`, " +
+		"or use the `read` tool with an `offset`/`limit` to page through the file. " +
+		"Prefer grep-first on large logs.]\n"
+}
+
+// pumpStreamCapped is like pumpStream but stops emitting once the shared word
+// budget is exhausted, then emits a single truncation marker. The budget and
+// exceeded flag are shared across the stdout/stderr pumps.
+func pumpStreamCapped(r io.Reader, stream, requestID string, out *protocol.Encoder, wg *sync.WaitGroup, budget *int64, exceeded *int32) {
+	defer wg.Done()
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if atomic.LoadInt32(exceeded) == 1 {
+				// already over budget — drop the rest of this stream
+			} else {
+			chunk := string(buf[:n])
+			words := int64(len(strings.Fields(chunk)))
+			remaining := atomic.AddInt64(budget, -words)
+			_ = out.Output(stream, chunk, requestID)
+			if remaining <= 0 && atomic.CompareAndSwapInt32(exceeded, 0, 1) {
+				_ = out.Output(stream, outputTruncatedMarker(), requestID)
+			}
+			}
 		}
 		if err != nil {
 			return

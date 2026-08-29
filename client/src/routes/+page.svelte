@@ -621,10 +621,12 @@
     return out.join("");
   }
 
-  /** Extract the target host from a line like `ssh -p 2222 user@host`.
-   *  Returns the host WITH a `:port` suffix when a non-standard port is given,
-   *  so the (server-side) SSH calls for agent install/run/check can pass `-p`.
-   *  OpenSSH itself doesn't accept `host:port`, but the backend rewrites it. */
+  /** Extract the target host from a line like `ssh -p 2222 user@host` or
+   *  `ssh user@host -p 2222`. Returns the host WITH a `:port` suffix when a
+   *  non-standard port is given, so the (server-side) SSH calls for agent
+   *  install/run/check can pass `-p`. OpenSSH itself doesn't accept `host:port`,
+   *  but the backend rewrites it. The port is scanned from anywhere in the line
+   *  (it may appear before OR after the host). */
   function parseSshTarget(line: string): string | null {
     const m = line.trim().match(/^ssh(?:2)?\s+(.+)$/i);
     if (!m) return null;
@@ -655,11 +657,12 @@
         i += 1;
         continue;
       }
-      // Strip control/whitespace characters (a stray newline/tab makes OpenSSH
-      // reject the username with 'remote username contains invalid characters').
-      host = tok.replace(/[\s\x00-\x1f\x7f]/g, "");
-      i++;
-      break; // first non-option token is the destination host
+      // First non-option token is the destination host. Don't break — keep
+      // scanning so a `-p` that comes AFTER the host is still captured.
+      if (!host) {
+        host = tok.replace(/[\s\x00-\x1f\x7f]/g, "");
+      }
+      i += 1;
     }
     if (!host) return null;
     if (port && /^\d+$/.test(port)) host = `${host}:${port}`;

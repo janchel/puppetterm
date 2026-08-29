@@ -210,8 +210,14 @@ pub fn install_agent(
         "==> installing binary (user-space)"
     });
     ssh_io(host, &["mkdir", "-p", "~/.puppetterm/bin"], None, emit)?;
-    ssh_io(host, &["cat", ">", "~/.puppetterm/bin/puppetterm-agent"], Some(&bin), &|_| {})?;
-    ssh_io(host, &["chmod", "0755", "~/.puppetterm/bin/puppetterm-agent"], None, emit)?;
+    // Write to a temp file then rename over the target. A plain `cat >` overwrite
+    // of the binary fails with "Text file busy" (ETXTBSY) when the agent is
+    // currently executing (e.g. a live metrics poll or in-flight action). `mv`
+    // only relinks the directory entry, so the running process keeps its old
+    // inode and new invocations pick up the new binary.
+    ssh_io(host, &["cat", ">", "~/.puppetterm/bin/puppetterm-agent.tmp"], Some(&bin), &|_| {})?;
+    ssh_io(host, &["chmod", "0755", "~/.puppetterm/bin/puppetterm-agent.tmp"], None, emit)?;
+    ssh_io(host, &["mv", "-f", "~/.puppetterm/bin/puppetterm-agent.tmp", "~/.puppetterm/bin/puppetterm-agent"], None, emit)?;
 
     // 5) command-locked authorized_keys entry (idempotent)
     emit("==> authorizing agent key");

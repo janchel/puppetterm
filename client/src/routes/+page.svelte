@@ -4,7 +4,7 @@
   import "xterm/css/xterm.css";
   import { FitAddon } from "@xterm/addon-fit";
   import { writeText as tauriWriteText, readText as tauriReadText } from "@tauri-apps/plugin-clipboard-manager";
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
 
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -148,25 +148,58 @@
   let chatText = $state("");
   // Chat history is persisted locally (see the $effect below) so a page reload
   // keeps the conversation; we restore it here on first load.
-  function loadChatSession() {
-    if (typeof localStorage === "undefined") return null;
-    try {
-      const raw = localStorage.getItem("pp.chat.session");
-      if (!raw) return null;
-      const v = JSON.parse(raw);
-      if (v && Array.isArray(v.chatLog)) return v;
-    } catch {
-      /* corrupt/unavailable — start fresh */
-    }
-    return null;
+  // Chat sessions are kept per-host: one conversation per SSH target / tab, so
+  // switching tabs switches the visible history. Each is stored under its own
+  // localStorage key (pp.chat.<host>.session).
+  function chatKey(host: string) {
+    return `pp.chat.${host}.session`;
   }
-  const _chatSession = loadChatSession();
-  let chatLog = $state<Array<{ role: string; text: string }>>(
-    _chatSession ? _chatSession.chatLog : [],
-  );
-  let history = $state<any[]>(
-    _chatSession && Array.isArray(_chatSession.history) ? _chatSession.history : [],
-  );
+  function chatHostOf(h: string | null | undefined) {
+    return h && h.length ? h : "__local__";
+  }
+  function loadChatFor(host: string): { chatLog: any[]; history: any[] } {
+    if (typeof localStorage === "undefined") return { chatLog: [], history: [] };
+    let raw = localStorage.getItem(chatKey(host));
+    // Back-compat: fall back to the old single global session if it matches this host.
+    if (!raw) {
+      const g = localStorage.getItem("pp.chat.session");
+      if (g) {
+        try {
+          const v = JSON.parse(g);
+          if (v && v.host === host && Array.isArray(v.chatLog)) raw = g;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    if (raw) {
+      try {
+        const v = JSON.parse(raw);
+        if (v && Array.isArray(v.chatLog)) {
+          return {
+            chatLog: v.chatLog,
+            history: Array.isArray(v.history) ? v.history : [],
+          };
+        }
+      } catch {
+        /* corrupt — start fresh */
+      }
+    }
+    return { chatLog: [], history: [] };
+  }
+
+  const _initialHost = chatHostOf(activeHost);
+  const _initial = loadChatFor(_initialHost);
+  let chats = $state<Record<string, { chatLog: any[]; history: any[] }>>({});
+  // Seed the active host from storage (per-host) + keep one conversation per
+  // SSH target / tab, so switching tabs switches the visible history.
+  chats[_initialHost] = _initial;
+  // The visible chat is always the active host's entry (derived, so it follows
+  // the tab automatically). Writes go through helpers that route to the right
+  // host — a pinned in-flight task streams into its OWN host's chat, not the
+  // one currently on screen.
+  let chatLog = $derived(chats[chatHostOf(activeHost)]?.chatLog ?? []);
+  let history = $derived(chats[chatHostOf(activeHost)]?.history ?? []);
   let autonomy = $state(
     typeof localStorage !== "undefined"
       ? (localStorage.getItem("pp.autonomy") ?? "ask-first")
@@ -196,19 +229,75 @@
     localStorage.setItem("pp.autonomy", autonomy);
   });
 
-  // Persist the conversation locally so a reload restores it. Wrapped in
-  // try/catch: large tool-output histories can exceed the quota and we never
-  // want to break the UI over a save.
-  $effect(() => {
+  function chatEntry(host: string) {
+    if (!chats[host]) {
+      chats[host] = { chatLog: [], history: [{ role: "system", content: SYSTEM_PROMPT }] };
+    }
+    return chats[host];
+  }
+  function saveChat(host: string) {
     if (typeof localStorage === "undefined") return;
+    const e = chats[host];
+    if (!e) return;
     try {
       localStorage.setItem(
-        "pp.chat.session",
-        JSON.stringify({ chatLog, history, host: activeHost ?? "", savedAt: Date.now() }),
+        chatKey(host),
+        JSON.stringify({ chatLog: e.chatLog, history: e.history, host, savedAt: Date.now() }),
       );
     } catch {
       /* ignore quota / serialization errors */
     }
+  }
+  function appendChat(host: string, role: string, text: string) {
+    const e = chatEntry(host);
+    e.chatLog = [...e.chatLog, { role, text }];
+    saveChat(host);
+  }
+  function setHistory(host: string, next: any[]) {
+    const e = chatEntry(host);
+    e.history = next;
+    saveChat(host);
+  }
+  function getHistory(host: string) {
+    return chats[host]?.history ?? [{ role: "system", content: SYSTEM_PROMPT }];
+  }
+  // Messages route to the pinned task's host when one is running, else the
+  // active host (so streaming during a tab switch lands in the right chat).
+  function pushChat(role: string, text: string) {
+    const host = chatTarget?.host ? chatHostOf(chatTarget.host) : (activeHost ?? "__local__");
+    appendChat(host, role, text);
+  }
+
+  // Persist the active conversation locally (per host) so a reload restores it.
+  // Deep dependency on `chats` re-runs on every message; wrapped in try/catch
+  // because large tool-output histories can exceed the quota.
+  $effect(() => {
+    if (typeof localStorage === "undefined") return;
+    const host = chatHostOf(activeHost);
+    const e = chats[host];
+    if (!e) return;
+    try {
+      localStorage.setItem(
+        chatKey(host),
+        JSON.stringify({ chatLog: e.chatLog, history: e.history, host, savedAt: Date.now() }),
+      );
+    } catch {
+      /* ignore quota / serialization errors */
+    }
+  });
+
+  // Switching tabs changes the active host; the derived chatLog/history already
+  // follow it. Just flush the PREVIOUS host's chat to storage on the way out
+  // (it's only re-saved by the effect above while it's the active host).
+  // `appliedHost` is a plain (non-reactive) guard so this runs only on a switch.
+  let appliedHost: string | null = null;
+  $effect(() => {
+    const host = chatHostOf(activeHost);
+    if (host === appliedHost) return;
+    untrack(() => {
+      if (appliedHost) saveChat(appliedHost);
+    });
+    appliedHost = host;
   });
 
   // ---- settings modal + theme ----------------------------------------------
@@ -802,14 +891,10 @@
     resizing = false;
   }
 
-  function pushChat(role: string, text: string) {
-    chatLog = [...chatLog, { role, text }];
-  }
-
   /** Dump the current conversation to a local Markdown file. This is the
    *  human-readable transcript (what's visible in the chat panel); the full
    *  raw session — including tool outputs — also lives in localStorage under
-   *  `pp.chat.session` for reload-restore and JSON export. */
+   *  `pp.chat.<host>.session` (per host) for reload-restore and JSON export. */
   function dumpChat() {
     if (typeof document === "undefined" || chatLog.length === 0) return;
     const host = activeHost ?? "local";
@@ -873,8 +958,11 @@
    *  already bounded by compaction while a task runs. */
   function newChat() {
     if (chatBusy) return; // don't clear mid-task
-    history = [{ role: "system", content: SYSTEM_PROMPT }];
-    chatLog = [];
+    const h = chatHostOf(activeHost);
+    setHistory(h, [{ role: "system", content: SYSTEM_PROMPT }]);
+    const e = chatEntry(h);
+    e.chatLog = [];
+    saveChat(h);
     chatText = "";
     pushChat("ai", "(new chat started — earlier conversation cleared)");
     notify("New chat started");
@@ -1080,12 +1168,14 @@
     );
     // Keep the system prompt in the conversation in sync with the current host
     // (agent vs terminal mode), so a host switch mid-conversation re-frames it.
+    // All writes route to the target host's chat (see pushChat / setHistory).
+    const th = chatHostOf(target.host);
     const userMsg = { role: "user", content: text };
-    history = [
+    setHistory(th, [
       { role: "system", content: cfg.prompt },
-      ...history.filter((m) => m.role !== "system"),
+      ...getHistory(th).filter((m) => m.role !== "system"),
       userMsg,
-    ];
+    ]);
     chatBusy = true;
     try {
       await runAiLoop();
@@ -1440,16 +1530,19 @@
       const MAX_STEPS = 60;
       let lastSig: string | null = null;
       let repeatCount = 0;
+      // All history writes/reads in this loop target the pinned task's host, so
+      // a tab switch mid-task streams into the correct host's chat.
+      const th = chatHostOf(chatTarget?.host ?? "");
       while (guard++ < MAX_STEPS) {
         if (abortRequested) {
           pushChat("ai", "(aborted by user)");
           return;
         }
-        history = compactHistory(history);
+        setHistory(th, compactHistory(getHistory(th)));
         aiThinking = true;
         let resp: any;
         try {
-          resp = await call<any>("ai_chat", { messages: history, tools: chatTools });
+          resp = await call<any>("ai_chat", { messages: getHistory(th), tools: chatTools });
         } finally {
           aiThinking = false;
         }
@@ -1463,10 +1556,10 @@
           // the user only sees the approval dialog and never the answer/plan.
           const explain = (msg.content ?? "").trim();
           if (explain) pushChat("ai", explain);
-          history = [
-            ...history,
+          setHistory(th, [
+            ...getHistory(th),
             { role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls },
-          ];
+          ]);
           for (const tc of msg.tool_calls) {
             // Loop guard: repeating the EXACT same tool call 3 times in a row
             // means the model is stuck, not making progress — stop early
@@ -1489,13 +1582,13 @@
             const content = ok
               ? JSON.stringify(await executeTool(tc))
               : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
-            history = [...history, { role: "tool", tool_call_id: tc.id, content }];
+            setHistory(th, [...getHistory(th), { role: "tool", tool_call_id: tc.id, content }]);
           }
           continue;
         }
         const text = msg.content ?? "(done)";
         pushChat("ai", text);
-        history = [...history, { role: "assistant", content: text }];
+        setHistory(th, [...getHistory(th), { role: "assistant", content: text }]);
         return;
       }
       pushChat(
@@ -2027,7 +2120,7 @@
         aiHasKey = v.has_api_key;
         aiReady = true;
         if (aiProvider === "openai") customBaseUrl = v.base_url || "";
-        history = [{ role: "system", content: SYSTEM_PROMPT }];
+        setHistory(chatHostOf(activeHost), [{ role: "system", content: SYSTEM_PROMPT }]);
       } catch (e) {
         console.warn("ai config unavailable:", e);
       }

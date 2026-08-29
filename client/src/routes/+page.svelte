@@ -183,6 +183,9 @@
   let abortRequested = $state(false); // user hit Abort — stop starting new tool calls
   let currentRequestId = $state<string | null>(null); // in-flight agent request (for abort)
   let activity = $state<any[]>([]); // recent audit entries (what the AI did)
+  // Live host resources (via the agent), shown in the "acting on <host>" bar.
+  let liveMetrics = $state<{ cpu: number; mem: number; load: number } | null>(null);
+  let metricsTimer: ReturnType<typeof setInterval> | null = null;
   let showActivity = $state(false);
   let expandedActivityId = $state<number | null>(null);
   // Full per-entry output, pulled on demand from the server (file-backed detail
@@ -1122,6 +1125,48 @@
       /* audit may be unavailable in the browser mock — leave empty */
     }
   }
+
+  /** Poll the agent's lightweight `metrics` action for the active host and
+   *  update the live resource readout. Cheap: the agent samples /proc directly
+   *  and returns just CPU%/MEM%/load1 (no snapshot payload). */
+  async function pollMetrics() {
+    const host = activeHost;
+    if (!host || !hostHasAgent(host)) {
+      liveMetrics = null;
+      return;
+    }
+    try {
+      const res = await call<any>("run_agent_action", {
+        host,
+        request: JSON.stringify({ action: "metrics", params: {} }),
+        approved: true,
+      });
+      const ev = (res?.events ?? []).find((e: any) => e?.type === "result");
+      const s = ev?.structured;
+      if (s && typeof s.cpu_percent === "number") {
+        liveMetrics = { cpu: s.cpu_percent, mem: s.mem_percent, load: s.load1 };
+      } else {
+        liveMetrics = null;
+      }
+    } catch {
+      liveMetrics = null;
+    }
+  }
+
+  // Keep the live resource readout fresh while an agent is active on the host.
+  // Re-runs when the active host or its agent-presence flips; cleans up the
+  // timer on change/unmount so we never poll a host without an agent.
+  $effect(() => {
+    const host = activeHost;
+    const has = host ? hostHasAgent(host) : false;
+    if (!has || !host) {
+      liveMetrics = null;
+      return;
+    }
+    pollMetrics();
+    const t = setInterval(pollMetrics, 3000);
+    return () => clearInterval(t);
+  });
 
   function toggleActivity(id: number) {
     if (expandedActivityId === id) {
@@ -2173,6 +2218,12 @@
           {#if activeTabCwd}
             <span class="ai-cwd" title="Current working directory on the host">{activeTabCwd}</span>
           {/if}
+          {#if hostHasAgent(activeHost) && liveMetrics}
+            <span class="ai-metrics" title="Live host resources (via agent)">
+              CPU {liveMetrics.cpu.toFixed(0)}% · MEM {liveMetrics.mem.toFixed(0)}%
+              {#if liveMetrics.load != null}· load {liveMetrics.load.toFixed(2)}{/if}
+            </span>
+          {/if}
           {#if chatBusy && chatTarget && chatTarget.host !== activeHost}
             <span class="warn">(pinned — you switched tabs)</span>
           {/if}
@@ -3149,6 +3200,16 @@
     max-width: 180px;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ai-metrics {
+    font-family: monospace;
+    font-size: 11px;
+    color: #3fb950;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 1px 6px;
     white-space: nowrap;
   }
   .install-agent {

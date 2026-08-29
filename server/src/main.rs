@@ -55,6 +55,7 @@ async fn main() {
         .route("/api/health", get(health))
         .route("/api/{cmd}", post(api::command))
         .route("/ws", get(api::ws_upgrade))
+        .route("/oauth/callback", get(api::oauth_callback))
         .with_state(app_state.clone());
 
     if let Some(dist) = dist {

@@ -26,6 +26,7 @@ func NewRegistry() *Registry {
 	r.Register("log", Log)
 	r.Register("config", Config)
 	r.Register("read", Read)
+	r.Register("metrics", Metrics)
 	return r
 }
 

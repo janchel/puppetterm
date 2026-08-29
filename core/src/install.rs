@@ -36,9 +36,10 @@ pub struct InstallResult {
 /// "agent mode" while `resolve_agent_bin` then reported the binary missing and
 /// the AI fell back to typing into the live terminal.
 pub fn check_agent(host: &str) -> bool {
-    let out = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
-        .arg(host)
+    let mut cmd = Command::new("ssh");
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
+    crate::ssh::ssh_host(&mut cmd, host);
+    let out = cmd
         .arg(
             "sh -c 'for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && exit 0; done; exit 1'",
         )
@@ -56,7 +57,8 @@ fn ssh_io(
 ) -> Result<(i32, String), String> {
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-    cmd.arg(host).args(remote);
+    crate::ssh::ssh_host(&mut cmd, host);
+    cmd.args(remote);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn ssh: {e}"))?;
     if let Some(mut si) = child.stdin.take() {

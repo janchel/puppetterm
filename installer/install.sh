@@ -74,17 +74,22 @@ AGENT_PATH="/usr/local/bin/puppetterm-agent"
 echo "==> puppetterm-agent install (user: $SSH_USER)"
 
 # --- install the binary -----------------------------------------------------
+# Write to a temp file then atomically rename over the target. Overwriting the
+# binary in place fails with "Text file busy" (ETXTBSY) when the agent is
+# currently executing (e.g. a live metrics poll or in-flight action); rename
+# only relinks the directory entry so the running process keeps its old inode.
 if [ -n "$RELEASE_URL" ]; then
   echo "    downloading $RELEASE_URL"
-  curl -fsSL -o "$AGENT_PATH" "$RELEASE_URL"
-  chmod 0755 "$AGENT_PATH"
+  curl -fsSL -o "${AGENT_PATH}.tmp" "$RELEASE_URL"
+  chmod 0755 "${AGENT_PATH}.tmp"
 elif [ -n "$BINARY_SRC" ]; then
   [ -f "$BINARY_SRC" ] || { echo "error: binary not found: $BINARY_SRC" >&2; exit 1; }
-  install -m 0755 "$BINARY_SRC" "$AGENT_PATH"
+  install -m 0755 "$BINARY_SRC" "${AGENT_PATH}.tmp"
 else
   echo "error: provide --binary or --release" >&2
   exit 1
 fi
+mv -f "${AGENT_PATH}.tmp" "$AGENT_PATH"
 echo "    installed: $AGENT_PATH"
 "$AGENT_PATH" </dev/null >/dev/null 2>&1 || true # smoke: should exit 1 with an error, not crash
 

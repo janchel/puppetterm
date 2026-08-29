@@ -621,16 +621,34 @@
     return out.join("");
   }
 
-  /** Extract the target host from a line like `ssh -p 2222 user@host`. */
+  /** Extract the target host from a line like `ssh -p 2222 user@host`.
+   *  Returns the host WITH a `:port` suffix when a non-standard port is given,
+   *  so the (server-side) SSH calls for agent install/run/check can pass `-p`.
+   *  OpenSSH itself doesn't accept `host:port`, but the backend rewrites it. */
   function parseSshTarget(line: string): string | null {
     const m = line.trim().match(/^ssh(?:2)?\s+(.+)$/i);
     if (!m) return null;
     const tokens = m[1].trim().split(/\s+/).filter(Boolean);
     let i = 0;
+    let port: string | null = null;
+    let host: string | null = null;
     while (i < tokens.length) {
       const tok = tokens[i];
-      if (tok === "-p" || tok === "-i" || tok === "-l" || tok === "-o" || tok === "-J") {
-        i += 2; // option + its value
+      // `-p 2222` / `-p2222` (and `-P` just in case) carry the port.
+      if (tok === "-p" || tok === "-P") {
+        port = tokens[i + 1] ?? null;
+        i += 2;
+        continue;
+      }
+      if ((tok.startsWith("-p") || tok.startsWith("-P")) && tok.length > 2) {
+        port = tok.slice(2);
+        i += 1;
+        continue;
+      }
+      if (
+        tok === "-i" || tok === "-l" || tok === "-o" || tok === "-J" || tok === "-W"
+      ) {
+        i += 2; // option + its value (we don't forward these to the app's ssh)
         continue;
       }
       if (tok.startsWith("-")) {
@@ -639,10 +657,13 @@
       }
       // Strip control/whitespace characters (a stray newline/tab makes OpenSSH
       // reject the username with 'remote username contains invalid characters').
-      const host = tok.replace(/[\s\x00-\x1f\x7f]/g, "");
-      return host.length > 0 ? host : null;
+      host = tok.replace(/[\s\x00-\x1f\x7f]/g, "");
+      i++;
+      break; // first non-option token is the destination host
     }
-    return null;
+    if (!host) return null;
+    if (port && /^\d+$/.test(port)) host = `${host}:${port}`;
+    return host;
   }
 
   async function openTab(host?: string) {

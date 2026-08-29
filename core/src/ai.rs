@@ -278,6 +278,70 @@ pub fn apply_ai_config(
     save_config(&cfg)
 }
 
+/// Remove the on-disk AI config (clears the configured provider). The in-memory
+/// config is untouched; the next `load_config()` simply finds no file.
+pub fn delete_config() -> Result<(), String> {
+    let path = config_path();
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("cannot delete AI config: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Validate a provider/endpoint/model/key combo with a real (tiny) completion
+/// request **without** persisting it. Returns a short success summary, or the
+/// upstream error so the UI can surface why the connection failed.
+pub async fn test_config(
+    base_url: String,
+    model: String,
+    provider: Option<String>,
+    api_key: Option<String>,
+) -> Result<String, String> {
+    // Start from any stored config so an already-saved key (or field the user
+    // didn't retype) is still used for the probe.
+    let stored = load_config().ok();
+    let base_url = base_url.trim().to_string();
+    let model = model.trim().to_string();
+    let base_url = if base_url.is_empty() { stored.as_ref().map(|c| c.base_url.clone()).unwrap_or_default() } else { base_url };
+    let model = if model.is_empty() { stored.as_ref().map(|c| c.model.clone()).unwrap_or_default() } else { model };
+    if base_url.is_empty() || model.is_empty() {
+        return Err("base_url and model are required".into());
+    }
+    let provider = provider.map(|p| p.trim().to_string()).filter(|p| !p.is_empty())
+        .or_else(|| stored.as_ref().map(|c| c.provider.clone()))
+        .unwrap_or_else(default_provider);
+    let provider = match provider.as_str() {
+        PROVIDER_ANTHROPIC | PROVIDER_DEEPSEEK | PROVIDER_OPENAI => provider,
+        _ => PROVIDER_OPENAI.to_string(),
+    };
+    let api_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+        .or_else(|| stored.as_ref().map(|c| c.api_key.clone()))
+        .unwrap_or_default();
+    let cfg = AiConfig {
+        base_url,
+        api_key,
+        model: model.clone(),
+        provider: provider.clone(),
+        api_key_enc: None,
+    };
+    let resp = chat_completion(
+        &cfg,
+        vec![ChatMessage {
+            role: Role::User,
+            content: Some("Reply with exactly the single word: PONG".into()),
+            tool_call_id: None,
+            tool_calls: None,
+        }],
+        None,
+        Some(16),
+    )
+    .await?;
+    if resp.choices.is_empty() {
+        return Err("provider returned an empty response".into());
+    }
+    Ok(format!("Connected · {} · {}", provider, model))
+}
+
 /// Call an OpenAI-compatible `/chat/completions` endpoint (custom + DeepSeek).
 async fn openai_completion(
     cfg: &AiConfig,

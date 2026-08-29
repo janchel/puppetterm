@@ -65,7 +65,8 @@ fn now_ts() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-/// Append one audit entry.
+/// Append one audit entry. Returns the new row's id so callers can attach a
+/// full-output detail file (see `write_detail`).
 pub fn record(
     host: &str,
     source: &str,
@@ -74,7 +75,7 @@ pub fn record(
     approval: &str,
     exit: Option<i64>,
     result: Option<&str>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     let conn = conn()?;
     conn.execute(
         "INSERT INTO audit (ts, host, source, action, params, approval, exit, result)
@@ -91,7 +92,35 @@ pub fn record(
         ],
     )
     .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
+}
+
+/// Directory holding per-entry full-output detail files (`<id>.json`). Kept
+/// separate from the SQLite row so verbose command output never bloats the
+/// index; the DB stays a lightweight header, details are pulled on demand.
+pub fn detail_dir() -> PathBuf {
+    audit_db_path()
+        .parent()
+        .map(|p| p.join("audit-details"))
+        .unwrap_or_else(|| PathBuf::from("audit-details"))
+}
+
+/// Write the full output for an audit entry to a file keyed by its id.
+pub fn write_detail(id: i64, content: &str) -> Result<(), String> {
+    let dir = detail_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{id}.json"));
+    std::fs::write(&path, content).map_err(|e| e.to_string())
+}
+
+/// Read the full output for an audit entry, if one was stored.
+pub fn read_detail(id: i64) -> Result<Option<String>, String> {
+    let path = detail_dir().join(format!("{id}.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Return the most recent audit entries (newest first).

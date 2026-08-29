@@ -66,6 +66,9 @@
   let aiKey = $state("");
   let aiHasKey = $state(false);
   let aiReady = $state(false);
+  // Result of a "test connection" probe (before saving).
+  let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
+  let aiTestBusy = $state(false);
   // The user's own OpenAI-compatible endpoint (the `openai` provider has no
   // preset URL). Remembered so switching to DeepSeek/Claude and back restores
   // it — otherwise the model switcher leaves a stale preset URL behind.
@@ -135,7 +138,7 @@
     }
     aiReady = true;
     call("set_ai_config", {
-      baseUrl: aiBaseUrl,
+      base_url: aiBaseUrl,
       model: aiModel,
       provider: aiProvider,
     }).catch((e) => console.error("save model", e));
@@ -143,8 +146,27 @@
   let chatBusy = $state(false);
   let aiThinking = $state(false);
   let chatText = $state("");
-  let chatLog = $state<Array<{ role: string; text: string }>>([]);
-  let history = $state<any[]>([]);
+  // Chat history is persisted locally (see the $effect below) so a page reload
+  // keeps the conversation; we restore it here on first load.
+  function loadChatSession() {
+    if (typeof localStorage === "undefined") return null;
+    try {
+      const raw = localStorage.getItem("pp.chat.session");
+      if (!raw) return null;
+      const v = JSON.parse(raw);
+      if (v && Array.isArray(v.chatLog)) return v;
+    } catch {
+      /* corrupt/unavailable — start fresh */
+    }
+    return null;
+  }
+  const _chatSession = loadChatSession();
+  let chatLog = $state<Array<{ role: string; text: string }>>(
+    _chatSession ? _chatSession.chatLog : [],
+  );
+  let history = $state<any[]>(
+    _chatSession && Array.isArray(_chatSession.history) ? _chatSession.history : [],
+  );
   let autonomy = $state(
     typeof localStorage !== "undefined"
       ? (localStorage.getItem("pp.autonomy") ?? "ask-first")
@@ -162,9 +184,28 @@
   let currentRequestId = $state<string | null>(null); // in-flight agent request (for abort)
   let activity = $state<any[]>([]); // recent audit entries (what the AI did)
   let showActivity = $state(false);
+  let expandedActivityId = $state<number | null>(null);
+  // Full per-entry output, pulled on demand from the server (file-backed detail
+  // store) when a row is expanded — kept out of the audit index and out of AI context.
+  let activityDetails = $state<Record<number, any>>({});
 
   $effect(() => {
     localStorage.setItem("pp.autonomy", autonomy);
+  });
+
+  // Persist the conversation locally so a reload restores it. Wrapped in
+  // try/catch: large tool-output histories can exceed the quota and we never
+  // want to break the UI over a save.
+  $effect(() => {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem(
+        "pp.chat.session",
+        JSON.stringify({ chatLog, history, host: activeHost ?? "", savedAt: Date.now() }),
+      );
+    } catch {
+      /* ignore quota / serialization errors */
+    }
   });
 
   // ---- settings modal + theme ----------------------------------------------
@@ -264,6 +305,7 @@
     { type: "function", function: { name: "service", description: "Control a systemd service on the active host (via the installed agent).", parameters: { type: "object", properties: { unit: { type: "string" }, op: { type: "string", enum: ["status", "is-active", "is-enabled", "start", "stop", "restart", "enable", "disable"] } }, required: ["unit", "op"] } } },
     { type: "function", function: { name: "log", description: "Tail a log file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
     { type: "function", function: { name: "config", description: "Read or write a config file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
+    { type: "function", function: { name: "read", description: "Read a BOUNDED line-range of ANY file on the active host (via the installed agent) — for paging through large logs/configs WITHOUT dumping the whole file into context. Returns line-numbered output. Use `offset` (1-based starting line) and `limit` to page (e.g. read first 200 lines, then offset 201). Prefer `grep \"pattern\"` via run_command to find the relevant section FIRST, then `read` just that range. Default limit 200, max 5000.", parameters: { type: "object", properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } }, required: ["path"] } } },
   ];
 
   // TERMINAL MODE (agent not installed on the host): only tools that ride the
@@ -287,10 +329,16 @@
     const hasAgent = hostHasAgent(host);
     const tools = hasAgent ? AGENT_TOOLS : TERMINAL_ONLY_TOOLS;
     const base = hasAgent ? AGENT_SYSTEM_PROMPT : TERMINAL_SYSTEM_PROMPT;
+    // History is a terminal app's working context, NOT ground truth. Explicitly
+    // tell the model to re-query the live server rather than trust stale chat
+    // or activity output — keeps it honest about current config and avoids
+    // wasting tokens re-reading old logs.
+    const historyCaveat =
+      "\n\nHISTORY IS EPHEMERAL — the chat and Activity log are working context only, never the source of truth about the server. Do NOT treat prior tool output or chat history as the host's CURRENT state. Whenever you need current config or status, re-query the LIVE server with the tools (run_command / config / snapshot / service, or the terminal tool). This is a terminal app: trust the server's CURRENT state, not stale history.";
     const cwdLine = cwd
       ? `\n\nYou are currently working in the directory \`${cwd}\` on ${host || "this host"}. Prefer commands relative to that directory (or reference the full path) when the user asks about files/folders there.`
       : "";
-    const prompt = base + cwdLine;
+    const prompt = base + historyCaveat + cwdLine;
     return { tools, prompt, hasAgent };
   }
 
@@ -351,6 +399,7 @@
     "`uptime`; grep logs; install and configure). Use `config` (read/write) and `log` (tail) " +
     "for their allow-listed paths, `snapshot` for a system overview, and `service` for systemd " +
     "units.\n\n" +
+    "LARGE FILES / LOGS: `run_command` output is capped at ~24k words PER command, so NEVER `cat` a huge log or file (the tail is truncated and you'll miss most of it). Instead: `grep \"pattern\"` via run_command to find the relevant section, then use the `read` tool with `offset`/`limit` to page through that exact range (line-numbered). This keeps the conversation bounded and you only ever see what's relevant.\n\n" +
     "IMPORTANT — YOU NEVER TYPE INTO THE USER'S TERMINAL in agent mode. All your work goes " +
     "through the agent tools above; the results appear here in the chat, and the terminal only " +
     "shows a status line. If a tool returns that the puppetterm-agent is not available on the " +
@@ -388,6 +437,7 @@
     service: "service",
     log: "log",
     config: "config",
+    read: "read",
   };
 
   // ---- terminal plumbing (per-tab, non-reactive) --------------------------
@@ -753,6 +803,60 @@
     chatLog = [...chatLog, { role, text }];
   }
 
+  /** Dump the current conversation to a local Markdown file. This is the
+   *  human-readable transcript (what's visible in the chat panel); the full
+   *  raw session — including tool outputs — also lives in localStorage under
+   *  `pp.chat.session` for reload-restore and JSON export. */
+  function dumpChat() {
+    if (typeof document === "undefined" || chatLog.length === 0) return;
+    const host = activeHost ?? "local";
+    const md: string[] = [
+      "# PuppetTerm chat",
+      "",
+      `**Host:** ${host}`,
+      `**Dumped:** ${new Date().toISOString()}`,
+      "",
+    ];
+    for (const m of chatLog) {
+      const who = m.role === "user" ? "🧑 You" : m.role === "ai" ? "🤖 AI" : m.role;
+      md.push(`### ${who}`, "", m.text, "");
+    }
+    const blob = new Blob([md.join("\n")], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `puppetterm-chat-${host.replace(/[^a-zA-Z0-9._-]/g, "_")}-${Date.now()}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    notify("Chat dumped to a local .md file");
+  }
+
+  /** Dump the full raw session (chatLog + all tool messages/history) as JSON —
+   *  useful for archival or re-import. */
+  function dumpChatJson() {
+    if (typeof document === "undefined") return;
+    const payload = {
+      host: activeHost ?? "local",
+      dumpedAt: new Date().toISOString(),
+      chatLog,
+      history,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `puppetterm-chat-${activeHost?.replace(/[^a-zA-Z0-9._-]/g, "_") ?? "local"}-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    notify("Full chat session dumped to a local .json file");
+  }
+
   /** Auto-grow the chat textarea with its content, capped at the CSS max-height
    *  (beyond which it scrolls). Set height to 'auto' first so scrollHeight
    *  reflects the natural (unconstrained) content height each time. */
@@ -864,10 +968,10 @@
     try {
       if (aiProvider === "openai") customBaseUrl = aiBaseUrl; // remember the custom endpoint
       await call("set_ai_config", {
-        baseUrl: aiBaseUrl,
+        base_url: aiBaseUrl,
         model: aiModel,
         provider: aiProvider,
-        apiKey: aiKey,
+        api_key: aiKey,
       });
       aiKey = "";
       const v = await call<any>("get_ai_config");
@@ -882,6 +986,44 @@
     } catch (e) {
       pushChat("ai", `(failed to save AI settings: ${e})`);
       notify(`Failed to save AI settings: ${e}`, "err");
+    }
+  }
+
+  /** Probe the endpoint/model/key with a tiny completion before saving. */
+  async function testAiConfig() {
+    aiTestBusy = true;
+    aiTest = null;
+    try {
+      const r = await call<any>("test_ai_config", {
+        base_url: aiBaseUrl,
+        model: aiModel,
+        provider: aiProvider,
+        api_key: aiKey,
+      });
+      if (r && r.ok) aiTest = { ok: true, msg: r.summary };
+      else aiTest = { ok: false, msg: r?.error ?? "connection test failed" };
+    } catch (e) {
+      aiTest = { ok: false, msg: String(e) };
+    } finally {
+      aiTestBusy = false;
+    }
+  }
+
+  /** Delete the saved AI provider config entirely. */
+  async function deleteAiConfig() {
+    if (!confirm("Delete the saved AI provider config? The endpoint/key will be cleared.")) return;
+    try {
+      await call("delete_ai_config");
+      aiBaseUrl = "";
+      customBaseUrl = "";
+      aiModel = "";
+      aiKey = "";
+      aiHasKey = false;
+      aiReady = false;
+      aiTest = null;
+      notify("AI provider config deleted");
+    } catch (e) {
+      notify(`Failed to delete AI config: ${e}`, "err");
     }
   }
 
@@ -903,6 +1045,21 @@
     // be empty (local tab) — read_terminal still works, agent tools will say so.
     const target = { host: activeHost ?? "", tabId: activeTabId ?? -1 };
     chatTarget = target;
+    // Keep agent presence fresh so we pick the right mode. The in-memory
+    // agentMap is only set by the in-UI install flow or the terminal-buffer
+    // auto-detect; if the agent was installed out-of-band (e.g. via the API)
+    // that flag stays false and we'd wrongly fall back to terminal mode — the
+    // AI would type into the terminal instead of using the agent tools. Re-check
+    // the host once per chat so agent mode activates automatically.
+    if (target.host) {
+      try {
+        const ok = await call<boolean>("check_agent", { host: target.host });
+        agentMap[target.host] = ok;
+        agentChecked.add(target.host);
+      } catch {
+        /* leave the current state as-is */
+      }
+    }
     // Agent-aware: choose the tool set + system prompt based on whether the
     // remote agent is installed, so the AI knows if it's in agentic mode. The
     // tab's current working directory (parsed from the prompt) is also passed
@@ -960,9 +1117,61 @@
   /** Load the recent audit log (what the AI/user did on each host). */
   async function loadActivity() {
     try {
-      activity = await call<any[]>("audit_recent", { limit: 20 });
+      activity = await call<any[]>("audit_recent", { limit: 100 });
     } catch {
       /* audit may be unavailable in the browser mock — leave empty */
+    }
+  }
+
+  function toggleActivity(id: number) {
+    if (expandedActivityId === id) {
+      expandedActivityId = null;
+      return;
+    }
+    expandedActivityId = id;
+    loadActivityDetail(id);
+  }
+
+  /** Pull the full output for an audit entry (stored server-side in a file, not
+   *  in the SQLite index). Best-effort; never blocks the UI. */
+  async function loadActivityDetail(id: number) {
+    if (activityDetails[id] !== undefined) return; // already fetched (or failed)
+    activityDetails = { ...activityDetails, [id]: "loading" }; // sentinel
+    try {
+      const d = await call<any>("audit_detail", { id: String(id) });
+      activityDetails = { ...activityDetails, [id]: d?.detail ?? null };
+    } catch {
+      activityDetails = { ...activityDetails, [id]: null };
+    }
+  }
+
+  /** Human-readable one-liner for an audit row (action + the key params). */
+  function describeAction(a: any): string {
+    let p: Record<string, unknown> = {};
+    try {
+      if (a.params) p = JSON.parse(a.params);
+    } catch {
+      /* keep empty */
+    }
+    const cmd = typeof p.cmd === "string" ? p.cmd : "";
+    const unit = typeof p.unit === "string" ? p.unit : "";
+    const op = typeof p.op === "string" ? p.op : "";
+    const path = typeof p.path === "string" ? p.path : "";
+    if (a.action === "run_command" && cmd) return `run: ${cmd}`;
+    if (a.action === "service" && unit) return `service ${op || ""} ${unit}`.trim();
+    if (a.action === "log" && path) return `log ${path}`;
+    if (a.action === "config" && path) return `config ${op || ""} ${path}`.trim();
+    if (a.action === "snapshot") return "snapshot";
+    return a.action;
+  }
+
+  /** Pretty-print the raw params JSON for the detail view. */
+  function prettyParams(raw: string | null | undefined): string {
+    if (!raw) return "";
+    try {
+      return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch {
+      return raw;
     }
   }
 
@@ -1129,6 +1338,17 @@
         return;
       }
     }
+    // A host may already be known WITHOUT an `ssh` line in the buffer — e.g.
+    // when connected directly via the host menu (`openTab(host)`), which starts
+    // the session over SSH without echoing the command into the pty. In that
+    // case we MUST still probe for the agent, or the app would stay stuck in
+    // terminal mode even though the agent is installed.
+    if (t.host) {
+      checkAndHintAgent(id, t.host); // idempotent per host per session
+      return;
+    }
+    // Otherwise discover an ssh target from the buffer (a command typed or
+    // recalled into the live terminal).
     for (let i = li; i >= 0; i--) {
       const target = detectSshFromLine(lines[i]);
       if (target) {
@@ -1823,33 +2043,36 @@
         </div>
       {/each}
 
-      <span class="new-wrap">
-        <button class="new-host" onclick={() => openTab()} title="Open a local terminal">+ New</button>
-        <button
-          class="new-chevron"
-          onclick={() => (showHostMenu = !showHostMenu)}
-          title="Connect to a saved host"
-        >
-          ▾
-        </button>
-        {#if showHostMenu}
-          <div class="host-menu">
-            {#if hosts.length === 0}
-              <div class="menu-item muted">No hosts in ~/.ssh/config</div>
-            {:else}
-              {#each hosts as h (h)}
-                <button class="menu-item" onclick={() => openTab(h)}>
-                  <span class="dot {statuses[h] ? 'up' : 'down'}"></span>{h}
-                </button>
-              {/each}
-            {/if}
-          </div>
-        {/if}
-      </span>
+    </nav>
 
+    <span class="new-wrap">
+      <button class="new-host" onclick={() => openTab()} title="Open a local terminal">+ New</button>
+      <button
+        class="new-chevron"
+        onclick={() => (showHostMenu = !showHostMenu)}
+        title="Connect to a saved host"
+      >
+        ▾
+      </button>
+      {#if showHostMenu}
+        <div class="host-menu">
+          {#if hosts.length === 0}
+            <div class="menu-item muted">No hosts in ~/.ssh/config</div>
+          {:else}
+            {#each hosts as h (h)}
+              <button class="menu-item" onclick={() => openTab(h)}>
+                <span class="dot {statuses[h] ? 'up' : 'down'}"></span>{h}
+              </button>
+            {/each}
+          {/if}
+        </div>
+      {/if}
+    </span>
+
+    <span class="tab-actions">
       <button class="refresh" onclick={loadHosts} title="Refresh hosts">↻</button>
       <button class="settings-btn" onclick={() => (showSettings = true)} title="Settings">⚙</button>
-    </nav>
+    </span>
   </header>
 
   <main class="body">
@@ -1892,6 +2115,22 @@
           title="Start a new chat (clear this conversation)"
         >
           ＋ new chat
+        </button>
+        <button
+          class="ai-settings-link"
+          onclick={dumpChat}
+          disabled={chatLog.length === 0}
+          title="Save this conversation to a local Markdown file"
+        >
+          ⭳ dump
+        </button>
+        <button
+          class="ai-settings-link"
+          onclick={dumpChatJson}
+          disabled={chatLog.length === 0}
+          title="Save the full raw session (incl. tool outputs) to a local JSON file"
+        >
+          ⭳ json
         </button>
       </div>
 
@@ -1969,14 +2208,38 @@
             <p class="muted">No recorded actions yet.</p>
           {:else}
             {#each activity as a (a.id)}
-              <div class="activity-row">
+              <div class="activity-row" onclick={() => toggleActivity(a.id)} title="Click to expand details">
                 <span class="a-time">{a.ts.slice(11, 19)}</span>
+                <span class="a-src {a.source}">{a.source}</span>
                 <span class="a-host">{a.host}</span>
-                <span class="a-action">{a.action}</span>
+                <span class="a-action">{describeAction(a)}</span>
                 <span class="a-exit {a.exit === 0 ? 'ok' : 'bad'}">
                   {a.exit == null ? '-' : 'exit ' + a.exit}
                 </span>
               </div>
+              {#if expandedActivityId === a.id}
+                <div class="activity-detail">
+                  <div><b>source:</b> {a.source} · <b>approval:</b> {a.approval}</div>
+                  {#if a.params}
+                    <div class="ad-label">params</div>
+                    <pre class="ad-pre">{prettyParams(a.params)}</pre>
+                  {/if}
+                  {#if a.result}
+                    <div class="ad-label">result (summary)</div>
+                    <pre class="ad-pre">{prettyParams(a.result)}</pre>
+                  {/if}
+                  {#if activityDetails[a.id] === "loading"}
+                    <div class="ad-label">full output</div>
+                    <pre class="ad-pre">loading…</pre>
+                  {:else if activityDetails[a.id]}
+                    <div class="ad-label">full output</div>
+                    <pre class="ad-pre">{prettyParams(activityDetails[a.id])}</pre>
+                  {:else if activityDetails[a.id] === null}
+                    <div class="ad-label">full output</div>
+                    <pre class="ad-pre">no detailed output recorded for this entry</pre>
+                  {/if}
+                </div>
+              {/if}
             {/each}
           {/if}
         </div>
@@ -1997,7 +2260,7 @@
       </div>
       <div class="chat-input">
         <textarea
-          rows="1"
+          rows="3"
           placeholder={activeHost
             ? `Ask the AI to act on ${activeHost}…`
             : "Ask the AI to act on a remote — ssh to it first…"}
@@ -2097,6 +2360,20 @@
             placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
           />
         </label>
+        <div class="modal-inline">
+          <button
+            type="button"
+            onclick={testAiConfig}
+            disabled={aiTestBusy || !aiBaseUrl.trim() || !aiModel.trim()}
+          >
+            {aiTestBusy ? "Testing…" : "Test connection"}
+          </button>
+          {#if aiTest}
+            <span class="ai-test {aiTest.ok ? 'ok' : 'err'}">
+              {aiTest.ok ? "✓ " : "✗ "}{aiTest.msg}
+            </span>
+          {/if}
+        </div>
         <label class="modal-field">
           Autonomy
           <select bind:value={autonomy}>
@@ -2115,6 +2392,10 @@
         </label>
 
         <div class="modal-btns">
+          <button class="danger" type="button" onclick={deleteAiConfig}>
+            Delete provider
+          </button>
+          <div class="spacer"></div>
           <button onclick={() => (showSettings = false)}>Cancel</button>
           <button
             class="primary"
@@ -2162,17 +2443,29 @@
   }
   .tabs {
     display: flex;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 4px;
     padding: 0 8px;
     overflow-x: auto;
+    overflow-y: hidden;
     flex: 1;
     min-width: 0;
+    height: 100%;
+    scrollbar-width: thin;
+  }
+  .tab-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px 0 4px;
+    flex: none;
   }
   .tab {
     display: flex;
     align-items: center;
     gap: 7px;
+    flex: 0 0 auto;
     height: 26px;
     padding: 0 8px 0 10px;
     border: 1px solid transparent;
@@ -2214,6 +2507,8 @@
   .new-wrap {
     position: relative;
     display: inline-flex;
+    align-items: center;
+    flex: none;
   }
   .new-host,
   .new-chevron,
@@ -2586,9 +2881,53 @@
     padding: 3px 4px;
     border-bottom: 1px solid #161b22;
     font-family: monospace;
+    cursor: pointer;
+  }
+  .activity-row:hover {
+    background: #161b22;
   }
   .activity-row:last-child {
     border-bottom: none;
+  }
+  .a-src {
+    font-size: 10px;
+    padding: 0 4px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+  .a-src.ai {
+    color: #bc8cff;
+    background: #21262d;
+  }
+  .a-src.user {
+    color: #58a6ff;
+    background: #21262d;
+  }
+  .activity-detail {
+    padding: 6px 8px;
+    background: #010409;
+    border-bottom: 1px solid #161b22;
+    font-size: 11px;
+    color: #c9d1d9;
+  }
+  .ad-label {
+    color: #8b949e;
+    margin: 4px 0 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 10px;
+  }
+  .ad-pre {
+    margin: 0;
+    padding: 6px;
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: monospace;
+    max-height: 200px;
+    overflow-y: auto;
   }
   .a-time {
     color: #484f58;
@@ -2718,6 +3057,46 @@
   }
   .modal-btns button:hover {
     filter: brightness(1.1);
+  }
+  .modal-btns .spacer {
+    flex: 1;
+  }
+  .modal-btns button.danger {
+    background: #21262d;
+    border-color: #6e2a2a;
+    color: #f0883e;
+  }
+  .modal-btns button.danger:hover {
+    background: #3d1518;
+  }
+  .modal-inline {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 0 4px;
+  }
+  .modal-inline button {
+    border: 1px solid #30363d;
+    background: #21262d;
+    color: #e6edf3;
+    border-radius: 6px;
+    padding: 7px 14px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .modal-inline button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .ai-test {
+    font-size: 12px;
+    word-break: break-word;
+  }
+  .ai-test.ok {
+    color: #3fb950;
+  }
+  .ai-test.err {
+    color: #f85149;
   }
 
   .ai-target {
@@ -2874,8 +3253,8 @@
     flex: 1;
     resize: none; /* height is driven by content (auto-grow), capped at max-height */
     overflow-y: auto;
-    min-height: 32px; /* single line */
-    max-height: 140px; /* "max standard" — beyond this it scrolls */
+    min-height: 64px; /* ~3 lines so you can see what you're typing */
+    max-height: 200px; /* "max standard" — beyond this it scrolls */
     line-height: 1.45;
     font-family: inherit;
     box-sizing: border-box;

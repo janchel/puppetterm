@@ -33,7 +33,7 @@ replay commands blindly. puppetterm:
 | | **Agent mode** (SSH key available) | **Terminal mode** (any host, incl. password-only) |
 |---|---|---|
 | Setup | Install `puppetterm-agent` on the remote (in-app or `installer/install.sh`) | Nothing to install |
-| How the AI acts | Structured tools over SSH: `run_command`, `service`, `log`, `config`, `snapshot` | Types the command into your **live terminal** and waits for the output |
+| How the AI acts | Structured tools over SSH: `run_command`, `read`, `service`, `log`, `config`, `snapshot` (run_command output capped ~24k words; page big files with `read`/`grep`) | Types the command into your **live terminal** and waits for the output |
 | Result | Structured (exit code, snapshot data, service state, audit log) | What you see on screen |
 | Good for | Agentic coding / management, repeatable ops | Quick checks, password-auth servers |
 
@@ -71,6 +71,18 @@ Both modes share the same **approval gate**:
   and in the remote agent's log.
 - **Safety** — AI targets are pinned per task (switching tabs mid-task can't redirect
   it), Abort kills the remote command, and dangerous commands are screened.
+- **Bounded file access (agent mode)** — `run_command` output is capped at ~24k words
+  per command (truncated with a "narrow your command" hint), and a paginated `read`
+  tool (`offset`/`limit`) pages through large logs without dumping them into context.
+  The AI is told to `grep` first, then `read` the exact range.
+- **Local chat history** — the conversation auto-persists in the browser (localStorage)
+  and can be **dumped** to Markdown or JSON; the AI is instructed not to trust stale
+  chat/activity history and to re-query the live server state instead.
+- **Audit detail on demand** — the Activity panel is click-to-expand: each row shows the
+  command plus the full output (stored in a file, kept out of the SQLite index and out
+  of AI context).
+- **AI provider management** — delete a provider and **test the connection** before
+  saving (endpoint/model/key validated with a real completion call).
 
 ## Requirements
 
@@ -158,7 +170,9 @@ make test && make smoke
 **In-app (recommended):** connect to a key-based host with `ssh user@host`, click
 **Install agent** in the AI panel, type `y`. It installs user-space
 (`~/.puppetterm/bin/puppetterm-agent`) with a command-locked key, then upgrades to
-root if passwordless sudo is available.
+root if passwordless sudo is available. The **↻ Update agent** button (or any re-run)
+reinstalls and refreshes the existing binary, so deploying always updates an installed
+agent.
 
 **Manual:**
 
@@ -177,6 +191,8 @@ Open **Settings (⚙)** in the app:
 
 - **Provider** — Custom (OpenAI-compatible), DeepSeek, or Claude (Anthropic).
 - **Endpoint / Model / API key** — presets prefill for DeepSeek/Claude.
+- **Test connection** — validate the endpoint/model/key with a live completion call before saving.
+- **Delete provider** — remove a configured provider from the UI.
 - The config is stored at `~/.config/puppetterm/ai.json` (outside the repo, `chmod 600`);
   the key is encrypted at rest. Env overrides: `PUPPETTERM_AI_BASE_URL`, `PUPPETTERM_AI_MODEL`,
   `PUPPETTERM_AI_API_KEY`, `PUPPETTERM_AI_PROVIDER`.

@@ -261,6 +261,7 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
                         "client_id": cfg.oauth.client_id,
                         "scope": cfg.oauth.scope,
                         "redirect_uri": cfg.oauth.redirect_uri,
+                        "flow": cfg.oauth.flow,
                         "has_client_secret": !cfg.oauth.client_secret.is_empty(),
                     },
                 })
@@ -404,9 +405,9 @@ pub async fn oauth_callback(Query(params): Query<std::collections::HashMap<Strin
     let state = params.get("state").cloned().unwrap_or_default();
     let result = match params.get("error").cloned() {
         Some(e) => Err(format!("provider returned error: {e}")),
-        None if code.is_empty() || state.is_empty() => {
-            Err("missing code or state in OAuth callback".into())
-        }
+        // Only `code` is strictly required; `state` may be absent (OpenRouter's
+        // flow doesn't echo it) — `complete_oauth` handles that via its fallback.
+        None if code.is_empty() => Err("missing code in OAuth callback".into()),
         None => puppetterm_core::ai::complete_oauth(&state, &code).await,
     };
     let html = match result {

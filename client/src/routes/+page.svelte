@@ -75,6 +75,7 @@
   let oauthClientSecret = $state("");
   let oauthScope = $state("");
   let oauthRedirectUri = $state("");
+  let oauthFlow = $state("standard");
   let oauthHasSecret = $state(false);
   let aiOauthBusy = $state(false);
   // Result of a "test connection" probe (before saving).
@@ -118,6 +119,41 @@
     },
   };
 
+  // OAuth provider presets — one click fills the endpoint + OAuth metadata so
+  // the user only needs to register an OAuth app (client id/secret) and log in.
+  // `flow` selects the backend exchange variant ("standard" or "openrouter").
+  const AI_OAUTH_PRESETS: Record<
+    string,
+    { label: string; flow: string; baseUrl: string; model: string; authUrl: string; tokenUrl: string; scope: string }
+  > = {
+    "github-models": {
+      label: "GitHub Models (OAuth)",
+      flow: "standard",
+      baseUrl: "https://models.inference.ai.azure.com/openai/v1",
+      model: "gpt-4o",
+      authUrl: "https://github.com/login/oauth/authorize",
+      tokenUrl: "https://github.com/login/oauth/access_token",
+      scope: "read:models",
+    },
+    openrouter: {
+      label: "OpenRouter (OAuth)",
+      flow: "openrouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "",
+      authUrl: "https://openrouter.ai/auth",
+      tokenUrl: "https://openrouter.ai/api/v1/auth/keys",
+      scope: "",
+    },
+  };
+
+  // Every model across all provider presets, plus whatever is currently saved.
+  let allModels = $derived.by(() => {
+    const set = new Set<string>();
+    for (const p of Object.values(AI_PROVIDERS)) for (const m of p.models) set.add(m);
+    if (aiModel) set.add(aiModel);
+    return [...set];
+  });
+
   function applyAiProvider(p: string) {
     aiProvider = p;
     const preset = AI_PROVIDERS[p];
@@ -142,6 +178,27 @@
         } catch {
           oauthRedirectUri = "";
         }
+      }
+    }
+  }
+
+  /** Fill the OAuth fields from a provider preset (GitHub Models / OpenRouter). */
+  function applyOauthPreset(key: string) {
+    const p = AI_OAUTH_PRESETS[key];
+    if (!p) return;
+    aiProvider = "openai";
+    aiBaseUrl = p.baseUrl;
+    if (p.model) aiModel = p.model;
+    oauthAuthUrl = p.authUrl;
+    oauthTokenUrl = p.tokenUrl;
+    oauthScope = p.scope;
+    oauthFlow = p.flow;
+    aiAuthMethod = "oauth";
+    if (!oauthRedirectUri.trim()) {
+      try {
+        oauthRedirectUri = `${location.origin}/oauth/callback`;
+      } catch {
+        oauthRedirectUri = "";
       }
     }
   }
@@ -193,14 +250,6 @@
       aiOauthBusy = false;
     }
   }
-
-  // Every model across all provider presets, plus whatever is currently saved.
-  let allModels = $derived.by(() => {
-    const set = new Set<string>();
-    for (const p of Object.values(AI_PROVIDERS)) for (const m of p.models) set.add(m);
-    if (aiModel) set.add(aiModel);
-    return [...set];
-  });
 
   /** Pick a model in the chat panel. If it belongs to a provider preset,
    *  switch the provider + endpoint too (the custom/openai preset restores the
@@ -1174,6 +1223,7 @@
           client_secret: oauthClientSecret,
           scope: oauthScope,
           redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
         },
       });
       aiKey = "";
@@ -1182,17 +1232,18 @@
       aiModel = v.model;
       aiProvider = v.provider ?? "openai";
       aiHasKey = v.has_api_key;
-      aiAuthMethod = v.auth_method ?? "key";
-      if (v.oauth) {
-        oauthAuthUrl = v.oauth.auth_url ?? "";
-        oauthTokenUrl = v.oauth.token_url ?? "";
-        oauthClientId = v.oauth.client_id ?? "";
-        oauthScope = v.oauth.scope ?? "";
-        oauthRedirectUri = v.oauth.redirect_uri ?? "";
-        oauthHasSecret = !!v.oauth.has_client_secret;
-      }
-      aiReady = true;
-      if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
+        aiAuthMethod = v.auth_method ?? "key";
+        if (v.oauth) {
+          oauthAuthUrl = v.oauth.auth_url ?? "";
+          oauthTokenUrl = v.oauth.token_url ?? "";
+          oauthClientId = v.oauth.client_id ?? "";
+          oauthScope = v.oauth.scope ?? "";
+          oauthRedirectUri = v.oauth.redirect_uri ?? "";
+          oauthFlow = v.oauth.flow ?? "standard";
+          oauthHasSecret = !!v.oauth.has_client_secret;
+        }
+        aiReady = true;
+        if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
       pushChat("ai", "(AI settings saved)");
       notify(`AI settings saved — ${AI_PROVIDERS[aiProvider]?.label ?? "Custom"} · ${aiModel}`);
     } catch (e) {
@@ -1237,6 +1288,7 @@
       oauthClientSecret = "";
       oauthScope = "";
       oauthRedirectUri = "";
+      oauthFlow = "standard";
       oauthHasSecret = false;
       aiHasKey = false;
       aiReady = false;
@@ -2254,6 +2306,7 @@
           oauthClientId = v.oauth.client_id ?? "";
           oauthScope = v.oauth.scope ?? "";
           oauthRedirectUri = v.oauth.redirect_uri ?? "";
+          oauthFlow = v.oauth.flow ?? "standard";
           oauthHasSecret = !!v.oauth.has_client_secret;
         }
         aiReady = true;
@@ -2645,6 +2698,22 @@
           </select>
         </label>
         {#if aiAuthMethod === "oauth"}
+          <label class="modal-field">
+            Provider preset
+            <select
+              value=""
+              onchange={(e) => {
+                const v = (e.currentTarget as HTMLSelectElement).value;
+                if (v) applyOauthPreset(v);
+                e.currentTarget.value = "";
+              }}
+            >
+              <option value="" disabled>Choose a preset…</option>
+              {#each Object.entries(AI_OAUTH_PRESETS) as [key, p] (key)}
+                <option value={key}>{p.label}</option>
+              {/each}
+            </select>
+          </label>
           <label class="modal-field">
             OAuth authorize URL
             <input bind:value={oauthAuthUrl} placeholder="https://provider.example/oauth/authorize" />

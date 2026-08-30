@@ -144,6 +144,8 @@ What compose mounts:
 | `puppetterm-ssh` volume | Writable `~/.ssh` inside the container (`known_hosts`, ControlMaster sockets). |
 | `puppetterm-config` volume | AI config + audit DB + pinned machine-id (the encrypted AI key survives restarts). |
 
+> **Updating SSH keys/hosts:** host `~/.ssh` changes are only synced at container startup (`docker/entrypoint.sh:24-31` copies `/ssh-in` → `~/.ssh`). After adding a key/host or editing `~/.ssh/config`, run `docker compose restart puppetterm` (or `docker compose up -d`) — no rebuild needed.
+
 Useful knobs: `PUPPETTERM_PORT` (host port), `PUPPETTERM_SSH_DIR` (alternate
 SSH dir), `PUID`/`PGID` (container user), `PUPPETTERM_AI_*` (AI provider env
 overrides). The AI provider/model/key can also be set in-app via ⚙ Settings.

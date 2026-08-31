@@ -259,9 +259,10 @@
   });
 
   let hasAutoFetchedModels = $state(false);
-  // Auto-fetch models only when the Models tab is opened and the provider is authenticated
+  // Auto-fetch models as soon as there are enabled saved providers,
+  // so the chatbox dropdown is populated without needing to open the Models tab.
   $effect(() => {
-    if (showSettings && activeSettingsTab === "models" && savedProviders.some((p: any) => p.enabled) && !modelsList.length && !modelsLoading && !hasAutoFetchedModels) {
+    if (savedProviders.some((p: any) => p.enabled) && !modelsList.length && !modelsLoading && !hasAutoFetchedModels) {
       hasAutoFetchedModels = true;
       loadModels();
     }
@@ -1370,18 +1371,11 @@
           // Apply backspaces / drop arrow-key sequences BEFORE parsing, so a
           // corrected typo (e.g. `user2<BS>@host`) detects as `user@host`.
           const target = parseSshTarget(cleanTyped(line));
-          // Only update the tracked host if there is no active SSH
-          // session yet, OR if the host field is still empty (first
-          // connection). A wrong `ssh <target>` typed mid-session
-          // must not displace the already-established connection.
-          if (target && target !== t.host && (!t.sessionId || !t.host)) {
-            // Set the host immediately, but DON'T check for the agent here —
-            // on password-only remotes the check would run before the user has
-            // connected (no ControlMaster yet) and fail. The prompt-gated
-            // buffer scan (maybeDetectSshFromBuffer) does the check once the
-            // connection is actually established.
-            t.host = target;
-          }
+          // Host detection is deferred to maybeDetectSshFromBuffer which
+          // verifies actual SSH connection traffic (shell prompt + connection)
+          // before updating the "acting on" display, so a wrong `ssh <target>`
+          // cannot displace the current session.
+          maybeDetectSshFromBuffer(id);
         } else if (t.buf.length > 4096) {
           t.buf = "";
         }
@@ -2231,12 +2225,19 @@
       return;
     }
     // Otherwise discover an ssh target from the buffer (a command typed or
-    // recalled into the live terminal).
+    // recalled into the live terminal). Verify the current prompt confirms
+    // an actual SSH connection to this host before updating — prevents a
+    // failed or wrong `ssh <target>` from stealing the "acting on" host.
     for (let i = li; i >= 0; i--) {
       const target = detectSshFromLine(lines[i]);
       if (target) {
-        if (t.host !== target) t.host = target;
-        checkAndHintAgent(id, t.host); // idempotent per host per session
+        const promptHostMatch = last.match(/@([^:]+):/);
+        const promptHost = promptHostMatch?.[1] ?? "";
+        const targetHost = target.includes("@") ? target.split("@").pop() ?? target : target;
+        if (promptHost && (promptHost === targetHost || promptHost.endsWith("." + targetHost))) {
+          if (t.host !== target) t.host = target;
+          checkAndHintAgent(id, t.host); // idempotent per host per session
+        }
         return;
       }
     }

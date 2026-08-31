@@ -83,6 +83,8 @@
   let modelsLoading = $state(false);
   let modelsError = $state<string | null>(null);
   let enabledModels = $state<string[]>([]);
+  let modelFreeMap = $state<Record<string, boolean>>({});
+  let modelPaidFilter = $state<"all" | "free" | "paid">("all");
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -164,11 +166,17 @@
     const l = id.toLowerCase();
     if (l.includes("embedding") || l.includes("vision") || l.includes("audio") || l.includes("imagen") || l.includes("whisper") || l.includes("tts") || l.includes("stt") || l.includes("transcription") || l.includes("dall-e"))
       return false;
-    if (l.includes("gemini-2.0-flash")) return false; // deprecated, requires thought_signature and 404s
+    if (l.includes("gemini-2.0-flash") || l.includes("gemini-2.5-pro")) return false; // deprecated (404)
     return true;
   }
   let showNonToolModels = $state(false);
   let toolCapableModels = $derived(modelsList.filter((m) => isToolCapable(m)));
+  let visibleModels = $derived.by(() => {
+    const base = showNonToolModels ? modelsList : toolCapableModels;
+    if (modelPaidFilter === "free") return base.filter((m) => modelFreeMap[m]);
+    if (modelPaidFilter === "paid") return base.filter((m) => !modelFreeMap[m]);
+    return base;
+  });
 
   // Models from the active provider's preset + fetched provider list.
   // Disable-all-by-default: once models have been fetched (modelsList non-empty),
@@ -327,7 +335,13 @@
     modelsError = null;
     try {
       const r = await call<any>("list_ai_models");
-      const list: string[] = r.models ?? [];
+      const raw = r.models ?? [];
+      const list: string[] = raw.map((m: any) => (typeof m === "string" ? m : m.id)).filter(Boolean);
+      const freeMap: Record<string, boolean> = {};
+      for (const m of raw) {
+        if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
+      }
+      modelFreeMap = freeMap;
       modelsList = list;
       if (list.length === 0) modelsError = "No models returned.";
     } catch (e) {
@@ -2923,20 +2937,29 @@
                   {#if modelsError}<span class="ai-test err">{modelsError}</span>{/if}
                 </div>
                 <div class="modal-inline" style="margin-top:6px">
-                  <button type="button" onclick={() => (enabledModels = [...toolCapableModels])} disabled={!toolCapableModels.length}>Enable all</button>
+                  <button type="button" onclick={() => (enabledModels = [...visibleModels])} disabled={!visibleModels.length}>Enable all</button>
                   <button type="button" onclick={() => (enabledModels = [])} disabled={!enabledModels.length}>Disable all</button>
+                  <label class="modal-field" style="margin:0; min-width:120px">
+                    <select bind:value={modelPaidFilter} style="padding:4px 8px; font-size:12px">
+                      <option value="all">All pricing</option>
+                      <option value="free">Free only</option>
+                      <option value="paid">Paid only</option>
+                    </select>
+                  </label>
                   <label class="model-row" style="margin-left:8px; padding:0; background:transparent; border:none">
                     <input type="checkbox" bind:checked={showNonToolModels} />
                     <span class="modal-hint" style="margin:0">Show non-tool ({modelsList.length - toolCapableModels.length} hidden)</span>
                   </label>
-                  <span class="modal-hint" style="margin-left:auto">{enabledModels.length}/{toolCapableModels.length} enabled</span>
+                  <span class="modal-hint" style="margin-left:auto">{enabledModels.length}/{visibleModels.length} enabled</span>
                 </div>
-                {#if (showNonToolModels ? modelsList : toolCapableModels).length}
+                {#if visibleModels.length}
                   <div class="model-list">
-                    {#each (showNonToolModels ? modelsList : toolCapableModels) as m (m)}
+                    {#each visibleModels as m (m)}
                       <label class="model-row">
                         <input type="checkbox" checked={enabledModels.includes(m)} onchange={() => toggleModel(m)} />
                         <span>{m}</span>
+                        {#if modelFreeMap[m]}<span class="modal-hint" style="margin-left:6px; color:#3fb950">free</span>
+                        {:else if modelFreeMap[m] === false}<span class="modal-hint" style="margin-left:6px">paid</span>{/if}
                         {#if !isToolCapable(m)}<span class="modal-hint" style="margin-left:auto">non-tool</span>{/if}
                       </label>
                     {/each}

@@ -873,38 +873,48 @@ pub async fn test_config(
     if api_key.is_empty() {
         return Err("api_key is required (or log in first)".into());
     }
-    if model.is_empty() {
-        let cfg = AiConfig {
-            base_url: base_url.clone(),
-            api_key: api_key.clone(),
-            model: String::new(),
-            provider: provider.clone(),
-            api_key_enc: None,
-            auth_method: default_auth_method(),
-            oauth: AiOAuthMeta::default(),
-            refresh_token: String::new(),
-            refresh_token_enc: None,
-            token_expires_at: None,
-        };
-        let models = list_models(&cfg).await?;
-        return Ok(format!(
-            "Connected · {} · {} models available (pick one in Settings → Models)",
-            provider,
-            models.len()
-        ));
-    }
-    let cfg = AiConfig {
+    // A typed API key means the `key` auth method — this tells list_models to
+    // use x-goog-api-key / ?key= on Google's native endpoint (defaulting to
+    // OAuth here would make it send a Bearer header that Google rejects).
+    let mk_cfg = |base_url: String, model: String, provider: String, api_key: String| AiConfig {
         base_url,
         api_key,
-        model: model.clone(),
-        provider: provider.clone(),
+        model,
+        provider,
         api_key_enc: None,
-        auth_method: default_auth_method(),
+        auth_method: AUTH_METHOD_KEY.to_string(),
         oauth: AiOAuthMeta::default(),
         refresh_token: String::new(),
         refresh_token_enc: None,
         token_expires_at: None,
     };
+    // Prefer a real chat completion as the definitive test. If the user left
+    // the model blank, auto-discover one via the provider's /models; if that
+    // endpoint isn't reachable we still report the raw connection error rather
+    // than a misleading "not authenticated".
+    let (_discovered, model) = if model.is_empty() {
+        match list_models(&mk_cfg(base_url.clone(), String::new(), provider.clone(), api_key.clone())).await {
+            Ok(models) if !models.is_empty() => (true, models[0].id.clone()),
+            Ok(_) => {
+                return Ok(format!(
+                    "Connected · {} · 0 models available (pick one in Settings → Models)",
+                    provider
+                ))
+            }
+            Err(list_err) if !stored.as_ref().map(|c| !c.model.is_empty()).unwrap_or(false) => {
+                // No stored model to fall back to and /models failed — the
+                // endpoint/key can't be verified for chat, so surface it.
+                return Err(format!("{list_err} (no model set — set a model and test again, or use Refresh in the Models tab)"));
+            }
+            Err(_list_err) => {
+                // A stored model exists: fall back to it for a completion test.
+                (false, stored.as_ref().map(|c| c.model.clone()).unwrap_or_default())
+            }
+        }
+    } else {
+        (false, model.clone())
+    };
+    let cfg = mk_cfg(base_url, model.clone(), provider.clone(), api_key);
     let resp = chat_completion(
         &cfg,
         vec![ChatMessage {

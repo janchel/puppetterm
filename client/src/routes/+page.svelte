@@ -160,6 +160,16 @@
     },
   };
 
+  function isToolCapable(id: string): boolean {
+    const l = id.toLowerCase();
+    if (l.includes("embedding") || l.includes("vision") || l.includes("audio") || l.includes("imagen") || l.includes("whisper") || l.includes("tts") || l.includes("stt") || l.includes("transcription") || l.includes("dall-e"))
+      return false;
+    if (l.includes("gemini-2.0-flash")) return false; // deprecated, requires thought_signature and 404s
+    return true;
+  }
+  let showNonToolModels = $state(false);
+  let toolCapableModels = $derived(modelsList.filter((m) => isToolCapable(m)));
+
   // Models from the active provider's preset + fetched provider list.
   // Disable-all-by-default: once models have been fetched (modelsList non-empty),
   // only explicitly enabled models appear (plus the current aiModel).
@@ -167,8 +177,10 @@
     const set = new Set<string>();
     const preset = AI_PROVIDERS[aiProvider];
     if (preset) for (const m of preset.models) set.add(m);
-    for (const m of modelsList) set.add(m);
-    if (aiModel) set.add(aiModel);
+    for (const m of toolCapableModels) set.add(m);
+    if (aiModel && isToolCapable(aiModel)) set.add(aiModel);
+    // keep current model even if it was fetched as non-tool, so it stays selectable
+    if (aiModel && !isToolCapable(aiModel) && modelsList.includes(aiModel)) set.add(aiModel);
     let arr = [...set];
     if (modelsList.length > 0) {
       const enabled = new Set(enabledModels);
@@ -2911,21 +2923,26 @@
                   {#if modelsError}<span class="ai-test err">{modelsError}</span>{/if}
                 </div>
                 <div class="modal-inline" style="margin-top:6px">
-                  <button type="button" onclick={() => (enabledModels = [...modelsList])} disabled={!modelsList.length}>Enable all</button>
+                  <button type="button" onclick={() => (enabledModels = [...toolCapableModels])} disabled={!toolCapableModels.length}>Enable all</button>
                   <button type="button" onclick={() => (enabledModels = [])} disabled={!enabledModels.length}>Disable all</button>
-                  <span class="modal-hint" style="margin-left:6px">{enabledModels.length}/{modelsList.length} enabled</span>
+                  <label class="model-row" style="margin-left:8px; padding:0; background:transparent; border:none">
+                    <input type="checkbox" bind:checked={showNonToolModels} />
+                    <span class="modal-hint" style="margin:0">Show non-tool ({modelsList.length - toolCapableModels.length} hidden)</span>
+                  </label>
+                  <span class="modal-hint" style="margin-left:auto">{enabledModels.length}/{toolCapableModels.length} enabled</span>
                 </div>
-                {#if modelsList.length}
+                {#if (showNonToolModels ? modelsList : toolCapableModels).length}
                   <div class="model-list">
-                    {#each modelsList as m (m)}
+                    {#each (showNonToolModels ? modelsList : toolCapableModels) as m (m)}
                       <label class="model-row">
                         <input type="checkbox" checked={enabledModels.includes(m)} onchange={() => toggleModel(m)} />
                         <span>{m}</span>
+                        {#if !isToolCapable(m)}<span class="modal-hint" style="margin-left:auto">non-tool</span>{/if}
                       </label>
                     {/each}
                   </div>
                 {:else if !modelsError}
-                  <p class="modal-hint">No models fetched yet — click Refresh.</p>
+                  <p class="modal-hint">No tool-capable models found — tick “Show non-tool” or click Refresh.</p>
                 {/if}
                 <p class="modal-hint" style="margin-top:8px">Disabled models are hidden from the chat model switcher. The current model ({aiModel || "none"}) always stays visible.</p>
               {/if}

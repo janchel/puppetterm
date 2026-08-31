@@ -1371,9 +1371,10 @@
           // corrected typo (e.g. `user2<BS>@host`) detects as `user@host`.
           const target = parseSshTarget(cleanTyped(line));
           // Only update the tracked host if there is no active SSH
-          // session yet — a wrong `ssh <target>` typed mid-session
+          // session yet, OR if the host field is still empty (first
+          // connection). A wrong `ssh <target>` typed mid-session
           // must not displace the already-established connection.
-          if (target && target !== t.host && !t.sessionId) {
+          if (target && target !== t.host && (!t.sessionId || !t.host)) {
             // Set the host immediately, but DON'T check for the agent here —
             // on password-only remotes the check would run before the user has
             // connected (no ControlMaster yet) and fail. The prompt-gated

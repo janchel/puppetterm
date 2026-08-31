@@ -437,6 +437,20 @@
           const v = await call<any>("get_ai_config");
           if (v.auth_method === "oauth" && v.has_api_key) {
             clearInterval(timer);
+            // Register this provider in the saved list if not already present
+            if (aiBaseUrl.trim() && !savedProviders.some((p: any) => p.base_url.trim() === aiBaseUrl.trim())) {
+              try {
+                await call("add_provider", {
+                  label: AI_PROVIDERS[aiProvider]?.label ?? aiBaseUrl,
+                  base_url: aiBaseUrl,
+                  model: aiModel,
+                  provider: aiProvider,
+                  api_key: aiKey,
+                  auth_method: "oauth",
+                });
+              } catch {}
+              await loadProviders();
+            }
             aiHasKey = true;
             aiReady = true;
             pushChat("ai", "(AI logged in via OAuth — token stored, encrypted)");
@@ -3389,6 +3403,24 @@
                   </span>
                 {/if}
               </div>
+              <div class="modal-section">Saved providers</div>
+              {#if savedProviders.length === 0}
+                <p class="modal-hint">No saved providers yet.</p>
+              {:else}
+                {#each savedProviders as p (p.id)}
+                  <div class="provider-card" style="flex-direction:row; align-items:center; gap:10px">
+                    <div style="flex:1; min-width:0">
+                      <div class="pc-title">{p.label}</div>
+                      <div class="pc-meta" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis">{p.base_url} · {p.model || "no model"} {p.has_api_key ? "· key" : ""}</div>
+                    </div>
+                    <label class="model-row" style="margin:0; padding:0; background:transparent; border:none">
+                      <input type="checkbox" checked={p.enabled} onchange={() => toggleProvider(p.id, !p.enabled)} />
+                      <span class="modal-hint" style="margin:0">{p.enabled ? "enabled" : "disabled"}</span>
+                    </label>
+                    <button class="danger" onclick={() => deleteProvider(p.id)} style="padding:4px 10px; font-size:12px">Delete</button>
+                  </div>
+                {/each}
+              {/if}
             {:else if activeSettingsTab === "models"}
               <div class="modal-section">Models — fetched from enabled providers</div>
               {#if !savedProviders.some((p: any) => p.enabled)}

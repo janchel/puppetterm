@@ -774,8 +774,12 @@ pub async fn complete_oauth(state: &str, code: &str) -> Result<(), String> {
             &text.chars().take(400).collect::<String>()
         ));
     }
-    let tr: TokenResponse =
-        serde_json::from_str(&text).map_err(|e| format!("bad token response: {e}"))?;
+    let tr: TokenResponse = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "bad token response: {e} — provider said: {}",
+            &text.chars().take(300).collect::<String>()
+        )
+    })?;
 
     let mut cfg = load_config().map_err(|e| format!("save AI settings before logging in: {e}"))?;
     cfg.api_key = tr.access_token;

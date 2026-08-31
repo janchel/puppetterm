@@ -264,27 +264,28 @@
     if (showSettings) loadProviders();
   });
 
-  // Snapshot for dirty checking (Save only when modified) — wait a tick so the
-  // async get_ai_config / loadProviders have populated the form before we snapshot
+  function captureSettingsSnapshot() {
+    initialSettingsSnapshot = JSON.stringify({
+      aiBaseUrl,
+      aiModel,
+      aiProvider,
+      aiAuthMethod,
+      oauthAuthUrl,
+      oauthTokenUrl,
+      oauthClientId,
+      oauthScope,
+      oauthRedirectUri,
+      oauthFlow,
+      autonomy,
+      themeName,
+      aiKey: aiKey ? "pending" : "",
+    });
+  }
+  // Baseline the snapshot once the async populate (loadProviders) has finished,
+  // so Save reflects a true diff rather than a pre-load empty form.
   $effect(() => {
     if (showSettings) {
-      const t = setTimeout(() => {
-        initialSettingsSnapshot = JSON.stringify({
-          aiBaseUrl,
-          aiModel,
-          aiProvider,
-          aiAuthMethod,
-          oauthAuthUrl,
-          oauthTokenUrl,
-          oauthClientId,
-          oauthScope,
-          oauthRedirectUri,
-          oauthFlow,
-          autonomy,
-          themeName,
-          aiKey: aiKey ? "pending" : "",
-        });
-      }, 250);
+      const t = setTimeout(captureSettingsSnapshot, 50);
       return () => clearTimeout(t);
     } else {
       initialSettingsSnapshot = "";
@@ -514,6 +515,9 @@
     } catch (e) {
       console.warn("load providers", e);
     }
+    // Base the dirty snapshot only after the async provider load settles,
+    // so Save reflects a true diff rather than a pre-load empty form.
+    if (showSettings) captureSettingsSnapshot();
   }
   async function addProvider() {
     if (addProviderBusy) return;
@@ -605,12 +609,19 @@
           aiModel = next.model;
           aiProvider = next.provider;
           await call("set_ai_config", { base_url: aiBaseUrl, model: aiModel, provider: aiProvider }).catch(() => {});
-        } else if (!savedProviders.length) {
-          // No saved providers left — keep current active as is (ai.json still holds it)
         }
       }
-      modelsList = [];
-      await loadModels();
+      // Rebuild the model list from what's actually still saved+enabled.
+      // Don't re-fetch from a provider that no longer exists.
+      if (savedProviders.length === 0) {
+        modelsList = [];
+        modelFreeMap = {};
+        enabledModels = [];
+        modelsError = null;
+      } else {
+        modelsList = [];
+        await loadModels();
+      }
       notify("Provider deleted");
     } catch (e) {
       notify(`Failed to delete: ${e}`, "err");
@@ -1731,21 +1742,7 @@
   async function saveSettings() {
     await saveAiConfig();
     // refresh dirty snapshot so Save disables until next edit
-    initialSettingsSnapshot = JSON.stringify({
-      aiBaseUrl,
-      aiModel,
-      aiProvider,
-      aiAuthMethod,
-      oauthAuthUrl,
-      oauthTokenUrl,
-      oauthClientId,
-      oauthScope,
-      oauthRedirectUri,
-      oauthFlow,
-      autonomy,
-      themeName,
-      aiKey: aiKey ? "pending" : "",
-    });
+    captureSettingsSnapshot();
     // stay open so the user can switch tabs (Models etc.) — close only via Cancel / × / Esc
   }
 

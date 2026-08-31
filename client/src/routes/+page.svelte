@@ -265,6 +265,17 @@
     if (showSettings) loadProviders();
   });
 
+  function providersSnapshot() {
+    return savedProviders.map((p: any) => ({
+      id: p.id,
+      base_url: p.base_url,
+      model: p.model,
+      label: p.label,
+      provider: p.provider,
+      enabled: !!p.enabled,
+      has_api_key: !!p.has_api_key,
+    }));
+  }
   function captureSettingsSnapshot() {
     initialSettingsSnapshot = JSON.stringify({
       aiBaseUrl,
@@ -280,17 +291,28 @@
       autonomy,
       themeName,
       aiKey: aiKey ? "pending" : "",
+      providers: providersSnapshot(),
     });
   }
   // Baseline the snapshot once the async populate (loadProviders) has finished,
-  // so Save reflects a true diff rather than a pre-load empty form.
+  // so Save reflects a true diff against loaded provider state rather than a
+  // pre-load empty form. Toggling a provider on/off then changes the snapshot
+  // and correctly enables Save / gives feedback.
   $effect(() => {
-    if (showSettings) {
-      const t = setTimeout(captureSettingsSnapshot, 50);
-      return () => clearTimeout(t);
-    } else {
+    if (!showSettings) {
       initialSettingsSnapshot = "";
+      return;
     }
+    let cancelled = false;
+    (async () => {
+      try { await loadProviders(); } catch {}
+      if (cancelled) return;
+      initialSettingsSnapshot = "";
+      captureSettingsSnapshot();
+    })();
+    return () => {
+      cancelled = true;
+    };
   });
   let isSettingsDirty = $derived.by(() => {
     if (!showSettings || !initialSettingsSnapshot) return false;
@@ -309,6 +331,7 @@
         autonomy,
         themeName,
         aiKey: aiKey ? "pending" : "",
+        providers: providersSnapshot(),
       });
       return cur !== initialSettingsSnapshot;
     } catch {
@@ -1777,7 +1800,12 @@
     await saveAiConfig();
     // refresh dirty snapshot so Save disables until next edit
     captureSettingsSnapshot();
-    notify(`Settings saved — ${AI_PROVIDERS[aiProvider]?.label ?? "Custom"}${aiModel ? ` · ${aiModel}` : ""}`);
+    const enabledP = savedProviders.filter((p: any) => p.enabled);
+    const enabledTxt = enabledP.length > 0
+      ? `${enabledP.length} provider${enabledP.length > 1 ? "s" : ""} enabled`
+      : "no providers enabled";
+    const modelTxt = aiModel ? ` · model ${aiModel}` : "";
+    notify(`Settings saved ✅ ${enabledTxt} · ${aiAuthMethod === "oauth" ? "OAuth" : "API key"}${modelTxt}`);
     // stay open so the user can switch tabs (Models etc.) — close only via Cancel / × / Esc
   }
 
@@ -3572,19 +3600,20 @@
   }
   .toast {
     position: fixed;
-    bottom: 18px;
+    top: 16px;
     left: 50%;
     transform: translateX(-50%);
-    z-index: 1000;
+    z-index: 3000;
     max-width: 90vw;
     background: #1c2128;
     border: 1px solid #3d444d;
     border-left: 3px solid #2f81f7;
     color: #e6edf3;
     border-radius: 8px;
-    padding: 8px 14px;
+    padding: 10px 16px;
     font-size: 13px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    font-weight: 600;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
     animation: toast-in 0.15s ease-out;
   }
   .toast.err {
@@ -3593,7 +3622,7 @@
   @keyframes toast-in {
     from {
       opacity: 0;
-      transform: translate(-50%, 8px);
+      transform: translate(-50%, -8px);
     }
     to {
       opacity: 1;

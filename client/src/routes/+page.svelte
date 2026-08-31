@@ -3158,7 +3158,7 @@
                 Model
                 <input
                   bind:value={addModel}
-                  placeholder={modelsList.length ? "select a model" : "model-name — save to auto-fetch"}
+                  placeholder="model-name (required to test)"
                   list="ai-model-list"
                 />
                 <datalist id="ai-model-list">
@@ -3188,7 +3188,7 @@
                       aiTest = r.ok ? { ok: true, msg: r.summary } : { ok: false, msg: r.error ?? "failed" };
                     } catch (e) { aiTest = { ok: false, msg: String(e) }; } finally { aiTestBusy = false; }
                   }}
-                  disabled={aiTestBusy || !addBaseUrl.trim() || !addApiKey.trim()}
+                  disabled={aiTestBusy || !addBaseUrl.trim() || !addApiKey.trim() || !addModel.trim()}
                 >
                   {aiTestBusy ? "Testing…" : "Test connection"}
                 </button>

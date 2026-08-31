@@ -401,8 +401,13 @@
                 }
               }
             } catch (e) {
+              const msg = String(e);
               console.warn("list models for", p.id, e);
-              modelsError = String(e);
+              if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+                modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
+              } else {
+                modelsError = msg;
+              }
             }
           }
         }
@@ -425,9 +430,14 @@
       }
       modelFreeMap = freeMap;
       modelsList = list;
-      if (list.length === 0) modelsError = "No models returned.";
+      if (list.length === 0 && !modelsError) modelsError = "No models returned.";
     } catch (e) {
-      modelsError = String(e);
+      const msg = String(e);
+      if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+        modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
+      } else {
+        modelsError = msg;
+      }
     } finally {
       modelsLoading = false;
     }
@@ -3266,13 +3276,6 @@
         </div>
 
         <div class="modal-btns">
-          {#if activeSettingsTab === "api"}
-            <button class="danger" type="button" onclick={deleteAiConfig}>
-              Delete provider
-            </button>
-          {:else}
-            <div></div>
-          {/if}
           <div class="spacer"></div>
           <button onclick={() => (showSettings = false)}>Cancel</button>
           <button class="primary" onclick={saveSettings} disabled={!aiBaseUrl.trim()}>Save</button>

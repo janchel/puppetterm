@@ -718,10 +718,18 @@ pub async fn test_config(
     // Start from any stored config so an already-saved key (or field the user
     // didn't retype) is still used for the probe.
     let stored = load_config().ok();
-    let base_url = base_url.trim().to_string();
-    let model = model.trim().to_string();
-    let base_url = if base_url.is_empty() { stored.as_ref().map(|c| c.base_url.clone()).unwrap_or_default() } else { base_url };
-    let model = if model.is_empty() { stored.as_ref().map(|c| c.model.clone()).unwrap_or_default() } else { model };
+    let mut base_url = base_url.trim().to_string();
+    let mut model = model.trim().to_string();
+    // For Test: an explicitly blank model means "verify endpoint/key only"
+    // (list models), so don't fall back to the stored model. Only fall back
+    // when the caller sent nothing useful and we have a stored base_url.
+    let from_stored_base = base_url.is_empty();
+    if base_url.is_empty() {
+        base_url = stored.as_ref().map(|c| c.base_url.clone()).unwrap_or_default();
+    }
+    if from_stored_base && model.is_empty() {
+        model = stored.as_ref().map(|c| c.model.clone()).unwrap_or_default();
+    }
     if base_url.is_empty() {
         return Err("base_url is required".into());
     }

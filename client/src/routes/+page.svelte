@@ -2797,7 +2797,7 @@
                 <button
                   type="button"
                   onclick={testAiConfig}
-                  disabled={aiTestBusy || !aiBaseUrl.trim() || !aiModel.trim()}
+                  disabled={aiTestBusy || !aiBaseUrl.trim() || (!aiKey.trim() && !aiHasKey)}
                 >
                   {aiTestBusy ? "Testing…" : "Test connection"}
                 </button>
@@ -2885,7 +2885,7 @@
                 <button
                   type="button"
                   onclick={testAiConfig}
-                  disabled={aiTestBusy || !aiBaseUrl.trim() || !aiModel.trim()}
+                  disabled={aiTestBusy || !aiBaseUrl.trim() || (!aiKey.trim() && !aiHasKey)}
                 >
                   {aiTestBusy ? "Testing…" : "Test connection"}
                 </button>
@@ -2945,13 +2945,7 @@
           </button>
           <div class="spacer"></div>
           <button onclick={() => (showSettings = false)}>Cancel</button>
-          <button
-            class="primary"
-            onclick={saveSettings}
-            disabled={!aiBaseUrl.trim() || !aiModel.trim()}
-          >
-            Save
-          </button>
+          <button class="primary" onclick={saveSettings} disabled={!aiBaseUrl.trim()}>Save</button>
         </div>
       </div>
     </div>

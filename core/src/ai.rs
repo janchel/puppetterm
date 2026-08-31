@@ -310,6 +310,49 @@ pub fn add_saved_provider(
     Ok(p)
 }
 
+pub fn sync_active_oauth_provider() -> Result<(), String> {
+    let cfg = load_config()?;
+    if cfg.auth_method != AUTH_METHOD_OAUTH || cfg.api_key.trim().is_empty() {
+        return Ok(());
+    }
+    let mut providers = load_providers().unwrap_or_default();
+    let label = match (cfg.provider.trim(), cfg.model.trim()) {
+        (_, model) if !model.is_empty() => format!("{} · {}", cfg.provider, model),
+        _ => cfg.base_url.trim().to_string(),
+    };
+    let existing = providers.iter_mut().find(|p| {
+        p.auth_method == AUTH_METHOD_OAUTH
+            && p.base_url == cfg.base_url
+            && p.model == cfg.model
+            && p.oauth.token_url == cfg.oauth.token_url
+    });
+    if let Some(p) = existing {
+        p.label = label;
+        p.provider = cfg.provider.clone();
+        p.oauth = cfg.oauth.clone();
+        p.api_key = cfg.api_key.clone();
+        p.enabled = true;
+        save_providers(&providers)?;
+        return Ok(());
+    }
+    let id = urlsafe_no_pad(&random_bytes(8));
+    let provider = SavedProvider {
+        id: id.clone(),
+        label,
+        base_url: cfg.base_url.clone(),
+        model: cfg.model.clone(),
+        provider: cfg.provider.clone(),
+        auth_method: AUTH_METHOD_OAUTH.to_string(),
+        oauth: cfg.oauth.clone(),
+        api_key_enc: None,
+        enabled: true,
+        api_key: cfg.api_key.clone(),
+    };
+    providers.push(provider);
+    save_providers(&providers)?;
+    Ok(())
+}
+
 pub fn delete_saved_provider(id: &str) -> Result<(), String> {
     let mut providers = load_providers()?;
     let before = providers.len();
@@ -751,21 +794,23 @@ pub async fn complete_oauth(state: &str, code: &str) -> Result<(), String> {
     }
 
     // Standard authorization-code + PKCE exchange (form-encoded, JSON response).
+    // NOTE: include client_secret in the SAME params vector — calling .form()
+    // twice replaces the body, wiping the OAuth params (GitHub then 404s).
     let params: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", &pending.redirect_uri),
         ("client_id", &pending.client_id),
         ("code_verifier", &pending.verifier),
+        ("client_secret", &pending.client_secret),
     ];
-    let mut req = client
+    let resp = client
         .post(&pending.token_url)
         .header(reqwest::header::ACCEPT, "application/json")
-        .form(&params);
-    if !pending.client_secret.is_empty() {
-        req = req.form(&[("client_secret", pending.client_secret.as_str())]);
-    }
-    let resp = req.send().await.map_err(|e| format!("token exchange failed: {e}"))?;
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("token exchange failed: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
@@ -801,13 +846,18 @@ async fn refresh_access_token(cfg: &mut AiConfig) -> Result<(), String> {
         ("refresh_token", &cfg.refresh_token),
         ("client_id", &cfg.oauth.client_id),
     ];
-    let mut req = client
+    let mut params = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &cfg.refresh_token),
+        ("client_id", &cfg.oauth.client_id),
+    ];
+    if !cfg.oauth.client_secret.is_empty() {
+        params.push(("client_secret", cfg.oauth.client_secret.as_str()));
+    }
+    let req = client
         .post(&cfg.oauth.token_url)
         .header(reqwest::header::ACCEPT, "application/json")
         .form(&params);
-    if !cfg.oauth.client_secret.is_empty() {
-        req = req.form(&[("client_secret", cfg.oauth.client_secret.as_str())]);
-    }
     let resp = req.send().await.map_err(|e| format!("token refresh failed: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.map_err(|e| e.to_string())?;

@@ -15,6 +15,7 @@
     sessionId: number | null;
     connecting: boolean;
     buf: string; // input buffer used to detect `ssh <target>` commands
+    pendingSshTarget?: string; // ssh target from user input, awaiting prompt verification
   };
 
   // ---- reactive state ----------------------------------------------------
@@ -547,6 +548,7 @@
       } else {
         modelsError = msg;
       }
+      hasAutoFetchedModels = false;
     } finally {
       modelsLoading = false;
     }
@@ -1323,7 +1325,7 @@
     }
 
     const id = nextTabId++;
-    tabs = [...tabs, { id, host: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "" }];
+    tabs = [...tabs, { id, host: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "", pendingSshTarget: undefined }];
     activeTabId = id;
     showHostMenu = false;
     await tick();
@@ -1371,11 +1373,10 @@
           // Apply backspaces / drop arrow-key sequences BEFORE parsing, so a
           // corrected typo (e.g. `user2<BS>@host`) detects as `user@host`.
           const target = parseSshTarget(cleanTyped(line));
-          // Host detection is deferred to maybeDetectSshFromBuffer which
-          // verifies actual SSH connection traffic (shell prompt + connection)
-          // before updating the "acting on" display, so a wrong `ssh <target>`
-          // cannot displace the current session.
-          maybeDetectSshFromBuffer(id);
+          // Store typed ssh target as pending; it will be confirmed by
+          // maybeDetectSshFromBuffer when the remote prompt appears.
+          if (target) t.pendingSshTarget = target;
+          requestAnimationFrame(() => maybeDetectSshFromBuffer(id));
         } else if (t.buf.length > 4096) {
           t.buf = "";
         }
@@ -2224,10 +2225,28 @@
       checkAndHintAgent(id, t.host); // idempotent per host per session
       return;
     }
-    // Otherwise discover an ssh target from the buffer (a command typed or
-    // recalled into the live terminal). Verify the current prompt confirms
-    // an actual SSH connection to this host before updating — prevents a
-    // failed or wrong `ssh <target>` from stealing the "acting on" host.
+    // 1) If user typed `ssh <target>` (stored in pendingSshTarget), verify
+    //    the current prompt matches that target — this handles manual ssh
+    //    connections where the command isn't echoed in the PTY output.
+    if (t.pendingSshTarget) {
+      const promptHostMatch = last.match(/@([^:]+):/);
+      const promptHost = promptHostMatch?.[1] ?? "";
+      const targetHost = t.pendingSshTarget.includes("@")
+        ? t.pendingSshTarget.split("@").pop() ?? t.pendingSshTarget
+        : t.pendingSshTarget;
+      if (promptHost && (promptHost === targetHost || promptHost.endsWith("." + targetHost))) {
+        t.host = t.pendingSshTarget;
+        t.pendingSshTarget = undefined;
+        checkAndHintAgent(id, t.host);
+        return;
+      }
+      // Prompt doesn't match — connection failed or wrong target; keep pending
+      // so a subsequent successful connection can still match, but don't scan
+      // the buffer for other ssh commands (would pick up the failed one).
+      return;
+    }
+    // 2) No pending target — scan buffer for recalled `ssh <target>` (e.g.
+    //    history recall where the command never passed through onData).
     for (let i = li; i >= 0; i--) {
       const target = detectSshFromLine(lines[i]);
       if (target) {
@@ -2843,6 +2862,7 @@
               t.sessionId = null;
               if (t.host) agentChecked.delete(t.host);
               t.host = ""; // the session is gone — drop the host so the dot goes grey
+              t.pendingSshTarget = undefined;
               termByTab
                 .get(t.id)
                 ?.term.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");

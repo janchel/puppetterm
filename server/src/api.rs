@@ -294,17 +294,26 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
         })
         .await,
         "list_ai_models" => {
-            match puppetterm_core::ai::load_config() {
-                Ok(mut cfg) => {
-                    if let Err(e) = puppetterm_core::ai::ensure_valid_token(&mut cfg).await {
-                        return err(e);
-                    }
-                    match puppetterm_core::ai::list_models(&cfg).await {
-                        Ok(models) => ok(json!({ "models": models })),
-                        Err(e) => err(e),
-                    }
+            // If a specific provider is requested (for per-provider Models tab), use it.
+            // Otherwise fall back to the active config (ai.json).
+            if let Some(id) = args.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                match puppetterm_core::ai::list_provider_models(id).await {
+                    Ok(models) => ok(json!({ "models": models })),
+                    Err(e) => err(e),
                 }
-                Err(e) => err(e),
+            } else {
+                match puppetterm_core::ai::load_config() {
+                    Ok(mut cfg) => {
+                        if let Err(e) = puppetterm_core::ai::ensure_valid_token(&mut cfg).await {
+                            return err(e);
+                        }
+                        match puppetterm_core::ai::list_models(&cfg).await {
+                            Ok(models) => ok(json!({ "models": models })),
+                            Err(e) => err(e),
+                        }
+                    }
+                    Err(e) => err(e),
+                }
             }
         }
         "list_providers" => run_blocking(|| {

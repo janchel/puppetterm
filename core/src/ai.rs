@@ -984,10 +984,23 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<ModelInfo>, String> {
         .map_err(|e| e.to_string())?;
     let mut last_err = String::new();
     let mut v: Option<serde_json::Value> = None;
-    for url in urls {
-        let resp = client
-            .get(&url)
-            .bearer_auth(&cfg.api_key)
+    for mut url in urls {
+        // Google AI Studio expects the API key as `x-goog-api-key` / `?key=` rather than Bearer.
+        // For OAuth (token) we still use Bearer. Detect API-key vs token by auth_method.
+        let is_google = url.contains("generativelanguage.googleapis.com");
+        let use_api_key_header = is_google && cfg.auth_method != AUTH_METHOD_OAUTH;
+        if use_api_key_header {
+            // Append ?key= for Google's REST API
+            let sep = if url.contains('?') { '&' } else { '?' };
+            url = format!("{}{}key={}", url, sep, cfg.api_key);
+        }
+        let mut req = client.get(&url);
+        if use_api_key_header {
+            req = req.header("x-goog-api-key", &cfg.api_key);
+        } else {
+            req = req.bearer_auth(&cfg.api_key);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| format!("list models request failed: {e}"))?;
@@ -1000,6 +1013,10 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<ModelInfo>, String> {
             );
             // 404 on the /openai variant → try the fallback; otherwise surface it
             if status.as_u16() == 404 {
+                continue;
+            }
+            // Google sometimes returns 400 INVALID_ARGUMENT for Bearer vs x-goog-api-key mismatch — try fallback once
+            if is_google && url.contains("/openai/") {
                 continue;
             }
             return Err(last_err);
@@ -1078,6 +1095,38 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<ModelInfo>, String> {
         }
     }
     Err("could not parse models list (unexpected response shape)".into())
+}
+
+pub async fn list_provider_models(id: &str) -> Result<Vec<ModelInfo>, String> {
+    let providers = load_providers()?;
+    let p = providers
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "provider not found".to_string())?;
+    if !p.enabled {
+        return Err("provider is disabled".into());
+    }
+    if !p.model.is_empty() {
+        // Provider was added with a specific model — only that one, no fetch
+        return Ok(vec![ModelInfo { id: p.model.clone(), is_free: false }]);
+    }
+    // Blank model — fetch all available from this provider's endpoint
+    let mut cfg = AiConfig {
+        base_url: p.base_url.clone(),
+        api_key: p.api_key.clone(),
+        model: String::new(),
+        provider: p.provider.clone(),
+        api_key_enc: None,
+        auth_method: p.auth_method.clone(),
+        oauth: p.oauth.clone(),
+        refresh_token: String::new(),
+        refresh_token_enc: None,
+        token_expires_at: None,
+    };
+    // Reuse the same Google API-key handling as list_models (via cfg)
+    // For OAuth providers, refresh if needed (load full provider's refresh token if any)
+    // Note: saved providers store refresh_token_enc separately if needed — for now we just use api_key
+    list_models(&cfg).await
 }
 
 /// Call an OpenAI-compatible `/chat/completions` endpoint (custom + DeepSeek).

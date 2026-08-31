@@ -364,13 +364,54 @@
   }
 
   async function loadModels() {
-    if (!aiHasKey) {
-      modelsError = "Configure a provider and authenticate first.";
-      return;
+    // Ensure saved providers are loaded before deciding per-provider vs active
+    if (savedProviders.length === 0) {
+      try { await loadProviders(); } catch {}
     }
     modelsLoading = true;
     modelsError = null;
     try {
+      // If there are saved providers, list per-provider (blank model -> fetch all, specific -> single)
+      if (savedProviders.length > 0) {
+        const enabled = savedProviders.filter((p: any) => p.enabled);
+        if (enabled.length === 0) {
+          modelsList = [];
+          modelFreeMap = {};
+          modelsError = "No enabled providers — enable one in API Providers.";
+          return;
+        }
+        const all = new Set<string>();
+        const freeMap: Record<string, boolean> = {};
+        for (const p of enabled) {
+          if (p.model && p.model.trim()) {
+            all.add(p.model.trim());
+          } else {
+            try {
+              const r = await call<any>("list_ai_models", { provider_id: p.id });
+              const raw = r.models ?? [];
+              for (const m of raw) {
+                const id = typeof m === "string" ? m : m.id;
+                if (id) {
+                  all.add(id);
+                  if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
+                }
+              }
+            } catch (e) {
+              console.warn("list models for", p.id, e);
+              modelsError = String(e);
+            }
+          }
+        }
+        modelFreeMap = freeMap;
+        modelsList = [...all];
+        if (modelsList.length === 0 && !modelsError) modelsError = "No models returned.";
+        return;
+      }
+      // No saved providers — use the active config (ai.json)
+      if (!aiHasKey) {
+        modelsError = "Configure a provider and authenticate first.";
+        return;
+      }
       const r = await call<any>("list_ai_models");
       const raw = r.models ?? [];
       const list: string[] = raw.map((m: any) => (typeof m === "string" ? m : m.id)).filter(Boolean);

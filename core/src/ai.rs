@@ -858,7 +858,16 @@ pub async fn test_config(
         PROVIDER_ANTHROPIC | PROVIDER_DEEPSEEK | PROVIDER_OPENAI => provider,
         _ => PROVIDER_OPENAI.to_string(),
     };
-    let api_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+    // Resolve the key: explicit > saved provider (matching base_url) > stored ai.json.
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_string();
+    let mut api_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+        .or_else(|| {
+            load_providers()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| p.enabled && !p.base_url.is_empty() && norm(&p.base_url) == norm(&base_url))
+                .map(|p| p.api_key)
+        })
         .or_else(|| stored.as_ref().map(|c| c.api_key.clone()))
         .unwrap_or_default();
     if api_key.is_empty() {

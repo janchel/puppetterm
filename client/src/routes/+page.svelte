@@ -202,9 +202,11 @@
   let showNonToolModels = $state(false);
   let toolCapableModels = $derived(modelsList.filter((m) => isToolCapable(m)));
   let visibleModels = $derived.by(() => {
-    const base = showNonToolModels ? modelsList : toolCapableModels;
+    const baseSet = new Set<string>(showNonToolModels ? modelsList : toolCapableModels);
+    for (const p of savedProviders) if (p.enabled && p.model) baseSet.add(p.model);
+    let base = [...baseSet];
     if (modelPaidFilter === "free") return base.filter((m) => modelFreeMap[m]);
-    if (modelPaidFilter === "paid") return base.filter((m) => !modelFreeMap[m]);
+    if (modelPaidFilter === "paid") return base.filter((m) => modelFreeMap[m] === false);
     return base;
   });
 
@@ -216,6 +218,7 @@
     const preset = AI_PROVIDERS[aiProvider];
     if (preset) for (const m of preset.models) set.add(m);
     for (const m of toolCapableModels) set.add(m);
+    for (const p of savedProviders) if (p.enabled && p.model) set.add(p.model);
     if (aiModel && isToolCapable(aiModel)) set.add(aiModel);
     // keep current model even if it was fetched as non-tool, so it stays selectable
     if (aiModel && !isToolCapable(aiModel) && modelsList.includes(aiModel)) set.add(aiModel);
@@ -445,6 +448,12 @@
         },
       });
       notify("Provider added");
+      // auto-enable the specific model so it appears in Models and the chat switcher
+      if (model && !enabledModels.includes(model) && isToolCapable(model)) {
+        const s = new Set(enabledModels);
+        s.add(model);
+        enabledModels = [...s];
+      }
       // clean the add-form so it's ready for the next provider
       newProviderLabel = "";
       addBaseUrl = "";

@@ -254,11 +254,14 @@
     } catch {}
   });
 
-  // Auto-fetch models when Settings opens and the provider is already authenticated
+  let hasAutoFetchedModels = $state(false);
+  // Auto-fetch models only when the Models tab is opened and the provider is authenticated
   $effect(() => {
-    if (showSettings && aiHasKey && !modelsList.length && !modelsLoading && aiBaseUrl.trim()) {
+    if (showSettings && activeSettingsTab === "models" && aiHasKey && !modelsList.length && !modelsLoading && !hasAutoFetchedModels && aiBaseUrl.trim()) {
+      hasAutoFetchedModels = true;
       loadModels();
     }
+    if (!showSettings) hasAutoFetchedModels = false;
   });
 
   $effect(() => {
@@ -3263,9 +3266,13 @@
         </div>
 
         <div class="modal-btns">
-          <button class="danger" type="button" onclick={deleteAiConfig}>
-            Delete provider
-          </button>
+          {#if activeSettingsTab === "api"}
+            <button class="danger" type="button" onclick={deleteAiConfig}>
+              Delete provider
+            </button>
+          {:else}
+            <div></div>
+          {/if}
           <div class="spacer"></div>
           <button onclick={() => (showSettings = false)}>Cancel</button>
           <button class="primary" onclick={saveSettings} disabled={!aiBaseUrl.trim()}>Save</button>

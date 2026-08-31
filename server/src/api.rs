@@ -294,6 +294,11 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
             })
         })
         .await,
+        "sync_oauth_provider" => run_blocking(|| {
+            puppetterm_core::ai::sync_active_oauth_provider()?;
+            Ok(json!(null))
+        })
+        .await,
         "list_ai_models" => {
             // If a specific provider is requested (for per-provider Models tab), use it.
             // Otherwise fall back to the active config (ai.json).

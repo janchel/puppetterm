@@ -520,7 +520,10 @@
       return;
     }
     const label = newProviderLabel.trim() || base;
-    const model = addModel.trim() || aiModel.trim();
+    // Use exactly what was filled in the Add form. An EMPTY model is meaningful:
+    // it means "parse all models on save" — do NOT fall back to a stale active
+    // model, or the provider would be pinned to the wrong model.
+    const model = addModel.trim();
     const provider = addProviderSel || aiProvider;
     const key = addApiKey.trim() || aiKey.trim();
     try {
@@ -572,7 +575,17 @@
       addApiKey = "";
       addProviderSel = "openai";
       await loadProviders();
+      // Populate Models: a specific model shows only that one; an empty model
+      // causes all models to be parsed. This keeps the Models page in sync with
+      // how the provider was just added.
+      modelsList = [];
+      await loadModels().catch(() => {});
+      // Sync the main Settings form to the just-added provider so Save is
+      // "ready" (endpoint/model/key reflect what was just added).
       const v = await call<any>("get_ai_config");
+      aiBaseUrl = v.base_url;
+      aiModel = v.model || aiModel;
+      aiProvider = v.provider ?? "openai";
       aiHasKey = v.has_api_key;
       aiReady = true;
     } catch (e) {

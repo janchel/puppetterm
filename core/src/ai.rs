@@ -722,8 +722,8 @@ pub async fn test_config(
     let model = model.trim().to_string();
     let base_url = if base_url.is_empty() { stored.as_ref().map(|c| c.base_url.clone()).unwrap_or_default() } else { base_url };
     let model = if model.is_empty() { stored.as_ref().map(|c| c.model.clone()).unwrap_or_default() } else { model };
-    if base_url.is_empty() || model.is_empty() {
-        return Err("base_url and model are required".into());
+    if base_url.is_empty() {
+        return Err("base_url is required".into());
     }
     let provider = provider.map(|p| p.trim().to_string()).filter(|p| !p.is_empty())
         .or_else(|| stored.as_ref().map(|c| c.provider.clone()))
@@ -735,6 +735,29 @@ pub async fn test_config(
     let api_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
         .or_else(|| stored.as_ref().map(|c| c.api_key.clone()))
         .unwrap_or_default();
+    if api_key.is_empty() {
+        return Err("api_key is required (or log in first)".into());
+    }
+    if model.is_empty() {
+        let cfg = AiConfig {
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            model: String::new(),
+            provider: provider.clone(),
+            api_key_enc: None,
+            auth_method: default_auth_method(),
+            oauth: AiOAuthMeta::default(),
+            refresh_token: String::new(),
+            refresh_token_enc: None,
+            token_expires_at: None,
+        };
+        let models = list_models(&cfg).await?;
+        return Ok(format!(
+            "Connected · {} · {} models available (pick one in Settings → Models)",
+            provider,
+            models.len()
+        ));
+    }
     let cfg = AiConfig {
         base_url,
         api_key,

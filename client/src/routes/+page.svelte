@@ -78,6 +78,7 @@
   let oauthFlow = $state("standard");
   let oauthHasSecret = $state(false);
   let aiOauthBusy = $state(false);
+  let activeSettingsTab = $state<"api" | "oauth" | "general">("api");
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -2656,153 +2657,175 @@
       }}
     >
       <div
-        class="modal"
+        class="modal modal-large"
         role="dialog"
         aria-label="Settings"
         tabindex="-1"
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.stopPropagation()}
       >
-        <div class="modal-title">Settings</div>
-
-        <div class="modal-section">AI model</div>
-        <label class="modal-field">
-          AI provider
-          <select
-            value={aiProvider}
-            onchange={(e) => applyAiProvider((e.currentTarget as HTMLSelectElement).value)}
-          >
-            {#each Object.entries(AI_PROVIDERS) as [key, p] (key)}
-              <option value={key}>{p.label}</option>
-            {/each}
-          </select>
-        </label>
-        <label class="modal-field">
-          Endpoint
-          <input
-            bind:value={aiBaseUrl}
-            placeholder="http://host:port/v1"
-            oninput={() => {
-              if (aiProvider === "openai") customBaseUrl = aiBaseUrl;
-            }}
-          />
-        </label>
-        <label class="modal-field">
-          Model
-          <input bind:value={aiModel} placeholder="model-name" list="ai-model-list" />
-          <datalist id="ai-model-list">
-            {#each AI_PROVIDERS[aiProvider]?.models ?? [] as m (m)}
-              <option value={m}></option>
-            {/each}
-          </datalist>
-        </label>
-        <label class="modal-field">
-          Authentication
-          <select
-            value={aiAuthMethod}
-            onchange={(e) => setAiAuthMethod((e.currentTarget as HTMLSelectElement).value)}
-          >
-            <option value="key">API key</option>
-            <option value="oauth">Web login (OAuth — no key)</option>
-          </select>
-        </label>
-        {#if aiAuthMethod === "oauth"}
-          <label class="modal-field">
-            Provider preset
-            <select
-              value=""
-              onchange={(e) => {
-                const v = (e.currentTarget as HTMLSelectElement).value;
-                if (v) applyOauthPreset(v);
-                e.currentTarget.value = "";
-              }}
-            >
-              <option value="" disabled>Choose a preset…</option>
-              {#each Object.entries(AI_OAUTH_PRESETS) as [key, p] (key)}
-                <option value={key}>{p.label}</option>
-              {/each}
-            </select>
-          </label>
-          <label class="modal-field">
-            OAuth authorize URL
-            <input bind:value={oauthAuthUrl} placeholder="https://provider.example/oauth/authorize" />
-          </label>
-          <label class="modal-field">
-            OAuth token URL
-            <input bind:value={oauthTokenUrl} placeholder="https://provider.example/oauth/token" />
-          </label>
-          <label class="modal-field">
-            Client ID
-            <input bind:value={oauthClientId} placeholder="client id from your OAuth app" />
-          </label>
-          <label class="modal-field">
-            Client secret (optional — confidential clients only)
-            <input
-              bind:value={oauthClientSecret}
-              type="password"
-              placeholder={oauthHasSecret ? "••• (set — encrypted)" : "leave blank for PKCE public clients"}
-            />
-          </label>
-          <label class="modal-field">
-            Scope (optional)
-            <input bind:value={oauthScope} placeholder="e.g. openid profile email" />
-          </label>
-          <label class="modal-field">
-            Redirect URI (auto-filled — must match the OAuth app)
-            <input bind:value={oauthRedirectUri} placeholder="http://host:8080/oauth/callback" />
-          </label>
-          <div class="modal-inline">
-            <button
-              type="button"
-              onclick={startOauthLogin}
-              disabled={aiOauthBusy || !oauthAuthUrl.trim() || !oauthTokenUrl.trim() || !oauthClientId.trim() || !aiBaseUrl.trim() || !aiModel.trim()}
-            >
-              {aiOauthBusy ? "Opening login…" : (aiHasKey ? "Log in again" : "Log in")}
-            </button>
-            {#if aiHasKey && aiAuthMethod === "oauth"}
-              <span class="ai-test ok">✓ token set (encrypted)</span>
+        <div class="modal-header">
+          <div class="modal-title">Settings</div>
+          <button class="modal-close" onclick={() => (showSettings = false)} aria-label="Close">×</button>
+        </div>
+        <div class="modal-body">
+          <nav class="settings-nav">
+            <button class:active={activeSettingsTab === "api"} onclick={() => { activeSettingsTab = "api"; setAiAuthMethod("key"); }}>API Providers</button>
+            <button class:active={activeSettingsTab === "oauth"} onclick={() => { activeSettingsTab = "oauth"; setAiAuthMethod("oauth"); }}>Web Login</button>
+            <button class:active={activeSettingsTab === "general"} onclick={() => (activeSettingsTab = "general")}>General</button>
+          </nav>
+          <div class="settings-content">
+            {#if activeSettingsTab === "api"}
+              <div class="modal-section">API Providers — per-provider presets</div>
+              <div class="provider-grid">
+                {#each Object.entries(AI_PROVIDERS) as [key, p] (key)}
+                  <div class="provider-card" class:active={aiProvider === key}>
+                    <div class="pc-title">{p.label}</div>
+                    <div class="pc-meta">{p.baseUrl || "custom endpoint"} · {(p.models[0] ?? "custom model")}</div>
+                    <button class:active={aiProvider === key} onclick={() => applyAiProvider(key)}>{aiProvider === key ? "Selected" : "Select"}</button>
+                  </div>
+                {/each}
+              </div>
+              <label class="modal-field">
+                Endpoint
+                <input
+                  bind:value={aiBaseUrl}
+                  placeholder="http://host:port/v1"
+                  oninput={() => {
+                    if (aiProvider === "openai") customBaseUrl = aiBaseUrl;
+                  }}
+                />
+              </label>
+              <label class="modal-field">
+                Model
+                <input bind:value={aiModel} placeholder="model-name" list="ai-model-list" />
+                <datalist id="ai-model-list">
+                  {#each AI_PROVIDERS[aiProvider]?.models ?? [] as m (m)}
+                    <option value={m}></option>
+                  {/each}
+                </datalist>
+              </label>
+              <label class="modal-field">
+                API key
+                <input
+                  bind:value={aiKey}
+                  type="password"
+                  placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
+                />
+              </label>
+              <div class="modal-inline">
+                <button
+                  type="button"
+                  onclick={testAiConfig}
+                  disabled={aiTestBusy || !aiBaseUrl.trim() || !aiModel.trim()}
+                >
+                  {aiTestBusy ? "Testing…" : "Test connection"}
+                </button>
+                {#if aiTest}
+                  <span class="ai-test {aiTest.ok ? 'ok' : 'err'}">
+                    {aiTest.ok ? "✓ " : "✗ "}{aiTest.msg}
+                  </span>
+                {/if}
+              </div>
+            {:else if activeSettingsTab === "oauth"}
+              <div class="modal-section">Web Login (OAuth) — per-provider presets</div>
+              <p class="modal-hint">Log in through the provider's browser page — the bearer token is stored encrypted. If you use Chrome, it reuses the Google account already signed in.</p>
+              <div class="provider-grid">
+                {#each Object.entries(AI_OAUTH_PRESETS) as [key, p] (key)}
+                  <div class="provider-card" class:active={oauthFlow === p.flow && oauthAuthUrl === p.authUrl}>
+                    <div class="pc-title">{p.label}</div>
+                    <div class="pc-meta">{p.baseUrl}</div>
+                    <button onclick={() => applyOauthPreset(key)}>Use</button>
+                  </div>
+                {/each}
+                <div class="provider-card">
+                  <div class="pc-title">Custom OAuth</div>
+                  <div class="pc-meta">any OpenAI-compatible provider with standard PKCE</div>
+                  <button onclick={() => { oauthAuthUrl = ""; oauthTokenUrl = ""; oauthClientId = ""; oauthScope = ""; oauthFlow = "standard"; }}>Clear</button>
+                </div>
+              </div>
+              <label class="modal-field">
+                Endpoint
+                <input bind:value={aiBaseUrl} placeholder="http://host:port/v1" />
+              </label>
+              <label class="modal-field">
+                Model
+                <input bind:value={aiModel} placeholder="model-name" list="ai-model-list" />
+              </label>
+              <label class="modal-field">
+                OAuth authorize URL
+                <input bind:value={oauthAuthUrl} placeholder="https://provider.example/oauth/authorize" />
+              </label>
+              <label class="modal-field">
+                OAuth token URL
+                <input bind:value={oauthTokenUrl} placeholder="https://provider.example/oauth/token" />
+              </label>
+              <label class="modal-field">
+                Client ID
+                <input bind:value={oauthClientId} placeholder="client id from your OAuth app" />
+              </label>
+              <label class="modal-field">
+                Client secret (optional — confidential clients only)
+                <input
+                  bind:value={oauthClientSecret}
+                  type="password"
+                  placeholder={oauthHasSecret ? "••• (set — encrypted)" : "leave blank for PKCE public clients"}
+                />
+              </label>
+              <label class="modal-field">
+                Scope (optional)
+                <input bind:value={oauthScope} placeholder="e.g. openid profile email" />
+              </label>
+              <label class="modal-field">
+                Redirect URI (auto-filled — must match the OAuth app)
+                <input bind:value={oauthRedirectUri} placeholder="http://host:8080/oauth/callback" />
+              </label>
+              <div class="modal-inline">
+                <button
+                  type="button"
+                  onclick={startOauthLogin}
+                  disabled={aiOauthBusy || !oauthAuthUrl.trim() || !oauthTokenUrl.trim() || (!oauthClientId.trim() && oauthFlow !== "openrouter") || !aiBaseUrl.trim() || !aiModel.trim()}
+                >
+                  {aiOauthBusy ? "Opening login…" : aiHasKey && aiAuthMethod === "oauth" ? "Log in again" : "Log in"}
+                </button>
+                {#if aiHasKey && aiAuthMethod === "oauth"}
+                  <span class="ai-test ok">✓ token set (encrypted)</span>
+                {/if}
+              </div>
+              <div class="modal-inline" style="margin-top:4px">
+                <button
+                  type="button"
+                  onclick={testAiConfig}
+                  disabled={aiTestBusy || !aiBaseUrl.trim() || !aiModel.trim()}
+                >
+                  {aiTestBusy ? "Testing…" : "Test connection"}
+                </button>
+                {#if aiTest}
+                  <span class="ai-test {aiTest.ok ? 'ok' : 'err'}">
+                    {aiTest.ok ? "✓ " : "✗ "}{aiTest.msg}
+                  </span>
+                {/if}
+              </div>
+            {:else}
+              <div class="modal-section">General</div>
+              <label class="modal-field">
+                Autonomy
+                <select bind:value={autonomy}>
+                  <option value="ask-first">Ask first (default)</option>
+                  <option value="propose-first">Propose first (approve every command)</option>
+                  <option value="read-only-auto">Read-only auto</option>
+                </select>
+              </label>
+              <div class="modal-section">Appearance</div>
+              <label class="modal-field">
+                Theme
+                <select bind:value={themeName}>
+                  <option value="dark">Dark (default)</option>
+                </select>
+              </label>
             {/if}
           </div>
-        {:else}
-          <label class="modal-field">
-            API key
-            <input
-              bind:value={aiKey}
-              type="password"
-              placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
-            />
-          </label>
-        {/if}
-        <div class="modal-inline">
-          <button
-            type="button"
-            onclick={testAiConfig}
-            disabled={aiTestBusy || !aiBaseUrl.trim() || !aiModel.trim()}
-          >
-            {aiTestBusy ? "Testing…" : "Test connection"}
-          </button>
-          {#if aiTest}
-            <span class="ai-test {aiTest.ok ? 'ok' : 'err'}">
-              {aiTest.ok ? "✓ " : "✗ "}{aiTest.msg}
-            </span>
-          {/if}
         </div>
-        <label class="modal-field">
-          Autonomy
-          <select bind:value={autonomy}>
-            <option value="ask-first">Ask first (default)</option>
-            <option value="propose-first">Propose first (approve every command)</option>
-            <option value="read-only-auto">Read-only auto</option>
-          </select>
-        </label>
-
-        <div class="modal-section">Appearance</div>
-        <label class="modal-field">
-          Theme
-          <select bind:value={themeName}>
-            <option value="dark">Dark (default)</option>
-          </select>
-        </label>
 
         <div class="modal-btns">
           <button class="danger" type="button" onclick={deleteAiConfig}>
@@ -3400,6 +3423,141 @@
     border-radius: 10px;
     padding: 18px 20px;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .modal.modal-large {
+    width: 900px;
+    max-width: 92vw;
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+  }
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px 12px;
+    border-bottom: 1px solid #21262d;
+    flex: none;
+  }
+  .modal-header .modal-title {
+    margin-bottom: 0;
+  }
+  .modal-close {
+    background: transparent;
+    border: 1px solid #30363d;
+    color: #8b949e;
+    border-radius: 6px;
+    width: 28px;
+    height: 28px;
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    display: grid;
+    place-items: center;
+  }
+  .modal-close:hover {
+    background: #21262d;
+    color: #e6edf3;
+  }
+  .modal-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .settings-nav {
+    width: 160px;
+    flex: none;
+    background: #010409;
+    border-right: 1px solid #21262d;
+    display: flex;
+    flex-direction: column;
+    padding: 12px 8px;
+    gap: 6px;
+  }
+  .settings-nav button {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #8b949e;
+    border-radius: 6px;
+    padding: 8px 10px;
+    text-align: left;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .settings-nav button.active {
+    background: #21262d;
+    border-color: #30363d;
+    color: #e6edf3;
+  }
+  .settings-nav button:hover {
+    background: #161b22;
+  }
+  .settings-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+  }
+  .modal-hint {
+    font-size: 12.5px;
+    color: #8b949e;
+    margin: -4px 0 12px;
+    line-height: 1.4;
+  }
+  .provider-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .provider-card {
+    background: #010409;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .provider-card.active {
+    border-color: #1f6feb;
+    background: #0d1a33;
+  }
+  .provider-card .pc-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #e6edf3;
+  }
+  .provider-card .pc-meta {
+    font-size: 11.5px;
+    color: #8b949e;
+    line-height: 1.3;
+    min-height: 28px;
+    word-break: break-word;
+  }
+  .provider-card button {
+    align-self: flex-start;
+    border: 1px solid #30363d;
+    background: #21262d;
+    color: #e6edf3;
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .provider-card button.active {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+  }
+  .settings-content .modal-section:first-child {
+    margin-top: 0;
+    border-top: none;
+    padding-top: 0;
   }
   .modal-title {
     font-size: 16px;

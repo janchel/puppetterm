@@ -1642,6 +1642,23 @@
   async function saveAiConfig() {
     try {
       if (aiProvider === "openai") customBaseUrl = aiBaseUrl; // remember the custom endpoint
+      // Ensure the configured provider is registered in the saved-provider list
+      // (Add Provider = "add to cart"; Save commits it). If the current endpoint
+      // isn't already saved, register it so it shows up in the provider list and
+      // its models load by the empty->all / specific->only rule.
+      if (aiBaseUrl.trim() && !savedProviders.some((p: any) => p.base_url.trim() === aiBaseUrl.trim())) {
+        try {
+          await call("add_provider", {
+            label: AI_PROVIDERS[aiProvider]?.label ?? aiBaseUrl,
+            base_url: aiBaseUrl,
+            model: aiModel,
+            provider: aiProvider,
+            api_key: aiKey,
+            auth_method: aiAuthMethod,
+          });
+        } catch {}
+        await loadProviders();
+      }
       await call("set_ai_config", {
         base_url: aiBaseUrl,
         model: aiModel,
@@ -3201,7 +3218,7 @@
                       aiTest = r.ok ? { ok: true, msg: r.summary } : { ok: false, msg: r.error ?? "failed" };
                     } catch (e) { aiTest = { ok: false, msg: String(e) }; } finally { aiTestBusy = false; }
                   }}
-                  disabled={aiTestBusy || !addBaseUrl.trim() || !addApiKey.trim() || !addModel.trim()}
+                  disabled={aiTestBusy || !addBaseUrl.trim() || !addApiKey.trim()}
                 >
                   {aiTestBusy ? "Testing…" : "Test connection"}
                 </button>

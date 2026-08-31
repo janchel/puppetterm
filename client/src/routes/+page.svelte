@@ -213,28 +213,23 @@
   });
 
   // Models from the active provider's preset + fetched provider list.
-  // Disable-all-by-default: once models have been fetched (modelsList non-empty),
-  // only explicitly enabled models appear (plus the current aiModel).
+  // Disable-all-by-default: only explicitly enabled models appear in the chat switcher.
   let allModels = $derived.by(() => {
     const set = new Set<string>();
     const preset = AI_PROVIDERS[aiProvider];
     if (preset) for (const m of preset.models) set.add(m);
     for (const m of toolCapableModels) set.add(m);
     for (const p of savedProviders) if (p.enabled && p.model) set.add(p.model);
-    if (aiModel && isToolCapable(aiModel)) set.add(aiModel);
-    // keep current model even if it was fetched as non-tool, so it stays selectable
-    if (aiModel && !isToolCapable(aiModel) && modelsList.includes(aiModel)) set.add(aiModel);
+    // Don't automatically keep the current model if it's disabled — it should disappear
     let arr = [...set];
     if (modelsList.length > 0) {
       const enabled = new Set(enabledModels);
-      arr = arr.filter((m) => enabled.has(m) || m === aiModel);
-      if (aiModel && !arr.includes(aiModel)) arr.push(aiModel);
+      arr = arr.filter((m) => enabled.has(m));
       return arr.sort();
     }
     if (enabledModels.length > 0) {
       const enabled = new Set(enabledModels);
       arr = arr.filter((m) => enabled.has(m));
-      if (aiModel && !enabled.has(aiModel)) arr.push(aiModel);
     }
     return arr.sort();
   });
@@ -269,10 +264,11 @@
     if (showSettings) loadProviders();
   });
 
-  // Snapshot for dirty checking (Save only when modified)
+  // Snapshot for dirty checking (Save only when modified) — wait a tick so the
+  // async get_ai_config / loadProviders have populated the form before we snapshot
   $effect(() => {
     if (showSettings) {
-      queueMicrotask(() => {
+      const t = setTimeout(() => {
         initialSettingsSnapshot = JSON.stringify({
           aiBaseUrl,
           aiModel,
@@ -288,7 +284,10 @@
           themeName,
           aiKey: aiKey ? "pending" : "",
         });
-      });
+      }, 250);
+      return () => clearTimeout(t);
+    } else {
+      initialSettingsSnapshot = "";
     }
   });
   let isSettingsDirty = $derived.by(() => {
@@ -495,9 +494,17 @@
   }
   function toggleModel(m: string) {
     const s = new Set(enabledModels);
-    if (s.has(m)) s.delete(m);
+    const wasEnabled = s.has(m);
+    if (wasEnabled) s.delete(m);
     else s.add(m);
     enabledModels = [...s];
+    // If the current chat model was just disabled, clear it so it disappears from the switcher
+    if (wasEnabled && m === aiModel) {
+      const next = enabledModels.find((x) => x !== m) || "";
+      // Use applyAiModel to keep provider/endpoint in sync, or clear if nothing left
+      if (next) applyAiModel(next);
+      else aiModel = "";
+    }
   }
 
   async function loadProviders() {

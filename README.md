@@ -214,6 +214,10 @@ stored encrypted at rest** (same slot as an API key) — the chat path is unchan
     `https://models.inference.ai.azure.com/openai/v1` (scope `read:models`).
   - **OpenRouter** — OpenRouter's PKCE flow: logs in at `https://openrouter.ai/auth`,
     then exchanges the code for a long-lived API key at `https://openrouter.ai/api/v1/auth/keys`.
+  - **Google (Chrome account)** — standard OAuth via the Google account already
+    signed into Chrome: `accounts.google.com` → `generativelanguage.googleapis.com/v1beta/openai/`
+    (model `gemini-2.0-flash`, scope `generative-language.retriever` + `cloud-platform`).
+    Chrome reuses your existing Google session, so no extra password if you're already logged in.
 - **Manual OAuth** — any OpenAI-compatible provider that exposes a standard
   authorization-code + PKCE endpoint: fill **Auth URL**, **Token URL**, **Client ID**,
   **Scope** (optional), and **Redirect URI** yourself.

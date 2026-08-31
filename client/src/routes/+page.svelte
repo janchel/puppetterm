@@ -93,6 +93,8 @@
   let addProviderSel = $state("openai");
   let addProviderBusy = $state(false);
   let initialSettingsSnapshot = $state<string>("");
+  // Confirmation summary shown before applying settings (Save opens this first).
+  let settingsConfirm = $state<{ summary: string[] } | null>(null);
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -253,7 +255,7 @@
   let hasAutoFetchedModels = $state(false);
   // Auto-fetch models only when the Models tab is opened and the provider is authenticated
   $effect(() => {
-    if (showSettings && activeSettingsTab === "models" && aiHasKey && !modelsList.length && !modelsLoading && !hasAutoFetchedModels && aiBaseUrl.trim()) {
+    if (showSettings && activeSettingsTab === "models" && savedProviders.some((p: any) => p.enabled) && !modelsList.length && !modelsLoading && !hasAutoFetchedModels) {
       hasAutoFetchedModels = true;
       loadModels();
     }
@@ -426,62 +428,51 @@
     modelsLoading = true;
     modelsError = null;
     try {
-      // If there are saved providers, list per-provider (blank model -> fetch all, specific -> single)
-      if (savedProviders.length > 0) {
-        const enabled = savedProviders.filter((p: any) => p.enabled);
-        if (enabled.length === 0) {
-          modelsList = [];
-          modelFreeMap = {};
-          modelsError = "No enabled providers — enable one in API Providers.";
-          return;
-        }
-        const all = new Set<string>();
-        const freeMap: Record<string, boolean> = {};
-        for (const p of enabled) {
-          if (p.model && p.model.trim()) {
-            all.add(p.model.trim());
-          } else {
-            try {
-              const r = await call<any>("list_ai_models", { provider_id: p.id });
-              const raw = r.models ?? [];
-              for (const m of raw) {
-                const id = typeof m === "string" ? m : m.id;
-                if (id) {
-                  all.add(id);
-                  if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
-                }
+      // Models come only from saved providers. If none are saved, don't fetch
+      // from a possibly-orphaned active config — show the configure hint instead.
+      if (savedProviders.length === 0) {
+        modelsList = [];
+        modelFreeMap = {};
+        modelsError = null;
+        return;
+      }
+      const enabled = savedProviders.filter((p: any) => p.enabled);
+      if (enabled.length === 0) {
+        modelsList = [];
+        modelFreeMap = {};
+        modelsError = "No enabled providers — enable one in API Providers.";
+        return;
+      }
+      const all = new Set<string>();
+      const freeMap: Record<string, boolean> = {};
+      for (const p of enabled) {
+        if (p.model && p.model.trim()) {
+          all.add(p.model.trim());
+        } else {
+          try {
+            const r = await call<any>("list_ai_models", { provider_id: p.id });
+            const raw = r.models ?? [];
+            for (const m of raw) {
+              const id = typeof m === "string" ? m : m.id;
+              if (id) {
+                all.add(id);
+                if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
               }
-            } catch (e) {
-              const msg = String(e);
-              console.warn("list models for", p.id, e);
-              if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
-                modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
-              } else {
-                modelsError = msg;
-              }
+            }
+          } catch (e) {
+            const msg = String(e);
+            console.warn("list models for", p.id, e);
+            if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+              modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
+            } else {
+              modelsError = msg;
             }
           }
         }
-        modelFreeMap = freeMap;
-        modelsList = [...all];
-        if (modelsList.length === 0 && !modelsError) modelsError = "No models returned.";
-        return;
-      }
-      // No saved providers — use the active config (ai.json)
-      if (!aiHasKey) {
-        modelsError = "Configure a provider and authenticate first.";
-        return;
-      }
-      const r = await call<any>("list_ai_models");
-      const raw = r.models ?? [];
-      const list: string[] = raw.map((m: any) => (typeof m === "string" ? m : m.id)).filter(Boolean);
-      const freeMap: Record<string, boolean> = {};
-      for (const m of raw) {
-        if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
       }
       modelFreeMap = freeMap;
-      modelsList = list;
-      if (list.length === 0 && !modelsError) modelsError = "No models returned.";
+      modelsList = [...all];
+      if (modelsList.length === 0 && !modelsError) modelsError = "No models returned.";
     } catch (e) {
       const msg = String(e);
       if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
@@ -1738,8 +1729,46 @@
     }
   }
 
-  /** Save everything from the Settings modal and close it. */
-  async function saveSettings() {
+  // Whether a usable provider endpoint + auth is actually configured. If not,
+  // Save must not persist default/blank selections.
+  function hasUsableProvider(): boolean {
+    if (savedProviders.some((p: any) => p.enabled && p.has_api_key)) return true;
+    if (savedProviders.length === 0 && aiBaseUrl.trim() && aiHasKey) return true;
+    return false;
+  }
+
+  /** Save everything from the Settings modal. First confirm via a summary
+   *  dialog; block saving default selections when no provider is configured. */
+  function saveSettings() {
+    const lines: string[] = [];
+    const enabled = savedProviders.filter((p: any) => p.enabled);
+    if (enabled.length > 0) {
+      lines.push(`Providers: ${enabled.map((p: any) => p.label || p.base_url).join(", ")}`);
+      const models = enabled.filter((p: any) => p.model).map((p: any) => p.model).join(", ");
+      if (models) lines.push(`Models: ${models}`);
+    } else if (aiBaseUrl.trim()) {
+      lines.push(`Endpoint: ${aiBaseUrl}`);
+      if (aiModel) lines.push(`Model: ${aiModel}`);
+    } else {
+      lines.push("Endpoint: (none)");
+    }
+    if (aiAuthMethod) lines.push(`Auth: ${aiAuthMethod === "oauth" ? "Web login (OAuth)" : "API key"}`);
+    lines.push(`Autonomy: ${autonomy}`);
+    lines.push(`Theme: ${themeName}`);
+    // Block saving default/blank selections with no provider
+    if (!hasUsableProvider()) {
+      lines.push("");
+      lines.push("⚠ No provider with a valid API key is configured — saving would store blank/default settings.");
+    }
+    settingsConfirm = { summary: lines };
+  }
+
+  async function confirmSettingsSave() {
+    settingsConfirm = null;
+    if (!hasUsableProvider()) {
+      notify("Nothing saved — add a provider with an API key first.", "err");
+      return;
+    }
     await saveAiConfig();
     // refresh dirty snapshot so Save disables until next edit
     captureSettingsSnapshot();
@@ -3284,9 +3313,9 @@
                 {/if}
               </div>
             {:else if activeSettingsTab === "models"}
-              <div class="modal-section">Models — fetched from the provider</div>
-              {#if !aiHasKey}
-                <p class="modal-hint">Configure and authenticate a provider first, then refresh.</p>
+              <div class="modal-section">Models — fetched from enabled providers</div>
+              {#if !savedProviders.some((p: any) => p.enabled)}
+                <p class="modal-hint">No enabled providers yet — add one in API Providers, then its models appear here.</p>
               {:else}
                 <div class="modal-inline">
                   <button type="button" onclick={loadModels} disabled={modelsLoading}>{modelsLoading ? "Loading…" : "Refresh from provider"}</button>
@@ -3350,6 +3379,35 @@
           <div class="spacer"></div>
           <button onclick={() => tryCloseSettings()}>Cancel</button>
           <button class="primary" onclick={saveSettings} disabled={!aiBaseUrl.trim() || !isSettingsDirty}>Save</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if settingsConfirm}
+    <div class="modal-overlay" onclick={() => (settingsConfirm = null)}>
+      <div class="modal modal-confirm" onclick={(e) => e.stopPropagation()}>
+        <div class="modal-header">
+          <div class="modal-title">Apply these settings?</div>
+          <button class="modal-close" onclick={() => (settingsConfirm = null)} aria-label="Close">×</button>
+        </div>
+        <div class="modal-confirm-body">
+          <div class="settings-summary">
+            {#each settingsConfirm.summary as line (line)}
+              <div>{line}</div>
+            {/each}
+          </div>
+          {#if !hasUsableProvider()}
+            <p class="ai-test err" style="margin-top:10px">
+              No provider has a valid API key. Add a provider in API Providers (or an endpoint + key
+              here) before saving — otherwise the saved config will be unusable.
+            </p>
+          {/if}
+        </div>
+        <div class="modal-btns">
+          <div class="spacer"></div>
+          <button onclick={() => (settingsConfirm = null)}>Cancel</button>
+          <button class="primary" onclick={confirmSettingsSave}>Apply</button>
         </div>
       </div>
     </div>
@@ -3976,6 +4034,28 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
+  }
+  .modal-confirm {
+    max-width: 520px;
+  }
+  .modal-confirm-body {
+    padding: 18px 22px;
+    overflow-y: auto;
+    max-height: 50vh;
+  }
+  .settings-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 13px;
+    color: #c9d1d9;
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .settings-summary div {
+    word-break: break-word;
   }
   .settings-nav {
     width: 160px;

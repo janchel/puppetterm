@@ -92,6 +92,7 @@
   let addApiKey = $state("");
   let addProviderSel = $state("openai");
   let addProviderBusy = $state(false);
+  let initialSettingsSnapshot = $state<string>("");
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -267,6 +268,56 @@
   $effect(() => {
     if (showSettings) loadProviders();
   });
+
+  // Snapshot for dirty checking (Save only when modified)
+  $effect(() => {
+    if (showSettings) {
+      queueMicrotask(() => {
+        initialSettingsSnapshot = JSON.stringify({
+          aiBaseUrl,
+          aiModel,
+          aiProvider,
+          aiAuthMethod,
+          oauthAuthUrl,
+          oauthTokenUrl,
+          oauthClientId,
+          oauthScope,
+          oauthRedirectUri,
+          oauthFlow,
+          autonomy,
+          themeName,
+          aiKey: aiKey ? "pending" : "",
+        });
+      });
+    }
+  });
+  let isSettingsDirty = $derived.by(() => {
+    if (!showSettings || !initialSettingsSnapshot) return false;
+    try {
+      const cur = JSON.stringify({
+        aiBaseUrl,
+        aiModel,
+        aiProvider,
+        aiAuthMethod,
+        oauthAuthUrl,
+        oauthTokenUrl,
+        oauthClientId,
+        oauthScope,
+        oauthRedirectUri,
+        oauthFlow,
+        autonomy,
+        themeName,
+        aiKey: aiKey ? "pending" : "",
+      });
+      return cur !== initialSettingsSnapshot;
+    } catch {
+      return false;
+    }
+  });
+  function tryCloseSettings() {
+    if (isSettingsDirty && !confirm("You have unsaved changes — discard them?")) return;
+    showSettings = false;
+  }
 
   function applyAiProvider(p: string) {
     aiProvider = p;
@@ -1672,6 +1723,22 @@
   /** Save everything from the Settings modal and close it. */
   async function saveSettings() {
     await saveAiConfig();
+    // refresh dirty snapshot so Save disables until next edit
+    initialSettingsSnapshot = JSON.stringify({
+      aiBaseUrl,
+      aiModel,
+      aiProvider,
+      aiAuthMethod,
+      oauthAuthUrl,
+      oauthTokenUrl,
+      oauthClientId,
+      oauthScope,
+      oauthRedirectUri,
+      oauthFlow,
+      autonomy,
+      themeName,
+      aiKey: aiKey ? "pending" : "",
+    });
     // stay open so the user can switch tabs (Models etc.) — close only via Cancel / × / Esc
   }
 
@@ -3011,9 +3078,9 @@
       role="button"
       tabindex="-1"
       aria-label="Close settings"
-      onclick={() => (showSettings = false)}
+      onclick={() => tryCloseSettings()}
       onkeydown={(e) => {
-        if (e.key === "Escape") showSettings = false;
+        if (e.key === "Escape") tryCloseSettings();
       }}
     >
       <div
@@ -3026,7 +3093,7 @@
       >
         <div class="modal-header">
           <div class="modal-title">Settings</div>
-          <button class="modal-close" onclick={() => (showSettings = false)} aria-label="Close">×</button>
+          <button class="modal-close" onclick={() => tryCloseSettings()} aria-label="Close">×</button>
         </div>
         <div class="modal-body">
           <nav class="settings-nav">
@@ -3277,8 +3344,8 @@
 
         <div class="modal-btns">
           <div class="spacer"></div>
-          <button onclick={() => (showSettings = false)}>Cancel</button>
-          <button class="primary" onclick={saveSettings} disabled={!aiBaseUrl.trim()}>Save</button>
+          <button onclick={() => tryCloseSettings()}>Cancel</button>
+          <button class="primary" onclick={saveSettings} disabled={!aiBaseUrl.trim() || !isSettingsDirty}>Save</button>
         </div>
       </div>
     </div>

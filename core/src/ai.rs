@@ -439,6 +439,7 @@ pub fn apply_ai_config(
     api_key: Option<String>,
     auth_method: Option<String>,
     oauth: Option<AiOAuthMeta>,
+    provider_id: Option<String>,
 ) -> Result<(), String> {
     let mut cfg = match load_config() {
         Ok(c) => c,
@@ -455,6 +456,32 @@ pub fn apply_ai_config(
             token_expires_at: None,
         },
     };
+    // If a saved provider is referenced (provider_id), adopt its credentials so
+    // the chat uses the real API key / auth method that the user actually
+    // configured and Test-verified — not a stale active config. Explicit args
+    // below still take priority and can override any of these fields.
+    if let Some(pid) = provider_id.as_deref().filter(|s| !s.is_empty()) {
+        if let Ok(providers) = load_providers() {
+            if let Some(p) = providers.into_iter().find(|p| p.id == pid) {
+                if !p.base_url.trim().is_empty() {
+                    cfg.base_url = p.base_url.clone();
+                }
+                if !p.model.trim().is_empty() {
+                    cfg.model = p.model.clone();
+                }
+                if !p.provider.trim().is_empty() {
+                    cfg.provider = p.provider.clone();
+                }
+                if !p.api_key.is_empty() {
+                    cfg.api_key = p.api_key.clone();
+                }
+                if !p.auth_method.is_empty() {
+                    cfg.auth_method = p.auth_method.clone();
+                }
+                cfg.oauth = p.oauth.clone();
+            }
+        }
+    }
     if !base_url.trim().is_empty() {
         cfg.base_url = base_url.trim().to_string();
     }

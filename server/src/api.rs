@@ -293,6 +293,20 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
             })
         })
         .await,
+        "list_ai_models" => {
+            match puppetterm_core::ai::load_config() {
+                Ok(mut cfg) => {
+                    if let Err(e) = puppetterm_core::ai::ensure_valid_token(&mut cfg).await {
+                        return err(e);
+                    }
+                    match puppetterm_core::ai::list_models(&cfg).await {
+                        Ok(models) => ok(json!({ "models": models })),
+                        Err(e) => err(e),
+                    }
+                }
+                Err(e) => err(e),
+            }
+        }
         "delete_ai_config" => run_blocking(|| {
             puppetterm_core::ai::delete_config()?;
             Ok(json!(null))

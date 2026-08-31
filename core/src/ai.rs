@@ -765,6 +765,73 @@ pub async fn test_config(
     Ok(format!("Connected · {} · {}", provider, model))
 }
 
+/// List available models from the provider's `/models` endpoint (OpenAI-compatible).
+/// Returns model IDs. For Anthropic we return its preset list (no standard `/models`).
+pub async fn list_models(cfg: &AiConfig) -> Result<Vec<String>, String> {
+    if cfg.base_url.trim().is_empty() {
+        return Err("base_url is required".into());
+    }
+    if cfg.api_key.trim().is_empty() {
+        return Err("not authenticated — configure a provider or log in first".into());
+    }
+    if cfg.provider == PROVIDER_ANTHROPIC {
+        return Ok(vec![
+            "claude-sonnet-4-20250514".into(),
+            "claude-3-5-haiku-latest".into(),
+            "claude-opus-4-20250514".into(),
+        ]);
+    }
+    let base = cfg.base_url.trim_end_matches('/');
+    // Most OpenAI-compatible gateways expose GET /models or /v1/models; the
+    // base_url already contains the version prefix (e.g. .../v1), so we just
+    // append /models.
+    let url = format!("{}/models", base);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(&cfg.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("list models request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let snippet = text.chars().take(400).collect::<String>();
+        return Err(format!("list models failed ({status}): {snippet}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad models response: {e}"))?;
+    // OpenAI shape: {data:[{id:"gpt-4o",...}]}
+    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        let ids: Vec<String> = arr
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+            .collect();
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+    // Fallback: {models:[{id:...}]} or {models:["a","b"]}
+    if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+        let ids: Vec<String> = arr
+            .iter()
+            .filter_map(|e| {
+                if let Some(s) = e.as_str() {
+                    Some(s.to_string())
+                } else {
+                    e.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())
+                }
+            })
+            .collect();
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+    Err("could not parse models list (unexpected response shape)".into())
+}
+
 /// Call an OpenAI-compatible `/chat/completions` endpoint (custom + DeepSeek).
 async fn openai_completion(
     cfg: &AiConfig,

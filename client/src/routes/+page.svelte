@@ -130,6 +130,30 @@
       model: "claude-sonnet-4-20250514",
       models: ["claude-sonnet-4-20250514", "claude-3-5-haiku-latest", "claude-opus-4-20250514"],
     },
+    "google-ai-studio": {
+      label: "Google AI Studio",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model: "",
+      models: ["gemini-3.6-flash", "gemini-3.1-pro-preview", "gemini-1.5-pro"],
+    },
+    openrouter_api: {
+      label: "OpenRouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "",
+      models: ["openai/gpt-4o", "openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet", "google/gemini-2.0-flash-001"],
+    },
+    groq: {
+      label: "Groq",
+      baseUrl: "https://api.groq.com/openai/v1",
+      model: "",
+      models: ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"],
+    },
+    nvidia: {
+      label: "NVIDIA",
+      baseUrl: "https://integrate.api.nvidia.com/v1",
+      model: "",
+      models: ["meta/llama-3.1-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct", "meta/llama-3.1-405b-instruct"],
+    },
   };
 
   // OAuth provider presets — one click fills the endpoint + OAuth metadata so

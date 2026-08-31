@@ -283,6 +283,7 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
                 args.get("api_key").and_then(|v| v.as_str()).map(String::from),
                 auth_method,
                 oauth,
+                args.get("provider_id").and_then(|v| v.as_str()).map(String::from),
             )?;
             Ok(json!(null))
         })

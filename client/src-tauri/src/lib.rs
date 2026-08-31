@@ -261,7 +261,7 @@ fn set_ai_config(
     provider: Option<String>,
     api_key: Option<String>,
 ) -> Result<(), String> {
-    core::ai::apply_ai_config(base_url, model, provider, api_key)
+    core::ai::apply_ai_config(base_url, model, provider, api_key, None, None, None)
 }
 
 /// Send a chat completion to the configured OpenAI-compatible endpoint,

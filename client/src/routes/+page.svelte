@@ -714,24 +714,38 @@
    *  saved provider, switch the endpoint/provider too. */
   function applyAiModel(m: string) {
     aiModel = m;
-    // 1) Check saved providers first (covers custom single-model providers)
+    // 1) Check saved providers first (covers custom single-model providers).
+    // Track the owning provider id so its real credentials (API key / auth) are
+    // copied into the active config the chat uses.
     let found = false;
+    let foundId: string | null = null;
     for (const p of savedProviders) {
       if (p.enabled && p.model === m) {
         aiBaseUrl = p.base_url;
         aiProvider = p.provider;
+        foundId = p.id;
         found = true;
         break;
       }
       // For blank-model providers, the model came from fetched list — find which provider's fetched list contains it
-      // We don't track per-provider fetched lists, so fall back to checking if this provider is enabled and blank-model and modelsList contains m
       if (p.enabled && !p.model && modelsList.includes(m)) {
-        // Assume the fetched model belongs to the first enabled blank-model provider
-        // (good enough for single-provider case; for multi, the baseUrl will be that provider's)
         aiBaseUrl = p.base_url;
         aiProvider = p.provider;
+        foundId = p.id;
         found = true;
         break;
+      }
+    }
+    if (!found && savedProviders.length > 0) {
+      // Prefer the enabled provider that owns this model (per the Models-tab
+      // owner map) even when it's a fetched model, so credentials match.
+      const ownerIds = modelOwner[m] || [];
+      const own = savedProviders.find((p: any) => p.enabled && ownerIds.includes(p.id));
+      if (own) {
+        aiBaseUrl = own.base_url;
+        aiProvider = own.provider;
+        foundId = own.id;
+        found = true;
       }
     }
     if (!found) {
@@ -751,6 +765,7 @@
       base_url: aiBaseUrl,
       model: aiModel,
       provider: aiProvider,
+      provider_id: foundId,
     }).catch((e) => console.error("save model", e));
   }
   let chatBusy = $state(false);

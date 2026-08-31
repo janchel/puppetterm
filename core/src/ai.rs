@@ -218,6 +218,124 @@ pub fn save_config(cfg: &AiConfig) -> Result<(), String> {
     std::fs::write(&path, data).map_err(|e| e.to_string())
 }
 
+// ---- saved providers (multi-provider management) -----------------------------
+
+pub fn providers_path() -> PathBuf {
+    if let Ok(p) = std::env::var("PUPPETTERM_AI_PROVIDERS") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config").join("puppetterm").join("providers.json")
+}
+
+pub fn load_providers() -> Result<Vec<SavedProvider>, String> {
+    let path = providers_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| format!("cannot read providers: {e}"))?;
+    let mut providers: Vec<SavedProvider> =
+        serde_json::from_str(&data).map_err(|e| format!("invalid providers file: {e}"))?;
+    for p in &mut providers {
+        if let Some(enc) = &p.api_key_enc {
+            p.api_key = decrypt_key(enc).unwrap_or_default();
+        }
+        if p.auth_method.is_empty() {
+            p.auth_method = default_auth_method();
+        }
+    }
+    Ok(providers)
+}
+
+pub fn save_providers(providers: &[SavedProvider]) -> Result<(), String> {
+    let mut out = providers.to_vec();
+    for p in &mut out {
+        if !p.api_key.is_empty() {
+            p.api_key_enc = Some(encrypt_key(&p.api_key)?);
+        }
+        p.api_key = String::new();
+    }
+    let path = providers_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let data = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+pub fn add_saved_provider(
+    label: String,
+    base_url: String,
+    model: String,
+    provider: Option<String>,
+    api_key: Option<String>,
+    auth_method: Option<String>,
+    oauth: Option<AiOAuthMeta>,
+) -> Result<SavedProvider, String> {
+    let mut providers = load_providers().unwrap_or_default();
+    let id = urlsafe_no_pad(&random_bytes(8));
+    let label = {
+        let l = label.trim();
+        if !l.is_empty() {
+            l.to_string()
+        } else if !base_url.trim().is_empty() {
+            base_url.trim().to_string()
+        } else {
+            format!("provider-{}", &id[..6])
+        }
+    };
+    let mut p = SavedProvider {
+        id: id.clone(),
+        label,
+        base_url: base_url.trim().to_string(),
+        model: model.trim().to_string(),
+        provider: provider.unwrap_or_else(default_provider),
+        auth_method: auth_method.unwrap_or_else(default_auth_method),
+        oauth: oauth.unwrap_or_default(),
+        api_key_enc: None,
+        enabled: true,
+        api_key: api_key.unwrap_or_default().trim().to_string(),
+    };
+    if p.provider != PROVIDER_ANTHROPIC && p.provider != PROVIDER_DEEPSEEK && p.provider != PROVIDER_OPENAI {
+        p.provider = PROVIDER_OPENAI.into();
+    }
+    if p.auth_method != AUTH_METHOD_OAUTH {
+        p.auth_method = AUTH_METHOD_KEY.into();
+    }
+    if p.base_url.is_empty() {
+        return Err("base_url is required".into());
+    }
+    providers.push(p.clone());
+    save_providers(&providers)?;
+    Ok(p)
+}
+
+pub fn delete_saved_provider(id: &str) -> Result<(), String> {
+    let mut providers = load_providers()?;
+    let before = providers.len();
+    providers.retain(|p| p.id != id);
+    if providers.len() == before {
+        return Err("provider not found".into());
+    }
+    save_providers(&providers)
+}
+
+pub fn toggle_saved_provider(id: &str, enabled: bool) -> Result<(), String> {
+    let mut providers = load_providers()?;
+    let mut found = false;
+    for p in &mut providers {
+        if p.id == id {
+            p.enabled = enabled;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Err("provider not found".into());
+    }
+    save_providers(&providers)
+}
+
 // ---- OpenAI chat completion types -----------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -800,6 +918,35 @@ pub async fn test_config(
 pub struct ModelInfo {
     pub id: String,
     pub is_free: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SavedProvider {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub provider: String,
+    pub auth_method: String,
+    pub oauth: AiOAuthMeta,
+    #[serde(default)]
+    pub api_key_enc: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(skip_serializing, default)]
+    pub api_key: String,
+}
+
+#[derive(Serialize)]
+pub struct SavedProviderView {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub provider: String,
+    pub auth_method: String,
+    pub enabled: bool,
+    pub has_api_key: bool,
 }
 
 /// List available models from the provider's `/models` endpoint (OpenAI-compatible).

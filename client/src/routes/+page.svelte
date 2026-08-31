@@ -85,6 +85,12 @@
   let enabledModels = $state<string[]>([]);
   let modelFreeMap = $state<Record<string, boolean>>({});
   let modelPaidFilter = $state<"all" | "free" | "paid">("all");
+  let savedProviders = $state<any[]>([]);
+  let newProviderLabel = $state("");
+  let addBaseUrl = $state("");
+  let addModel = $state("");
+  let addApiKey = $state("");
+  let addProviderSel = $state("openai");
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -227,6 +233,10 @@
     }
   });
 
+  $effect(() => {
+    if (showSettings) loadProviders();
+  });
+
   function applyAiProvider(p: string) {
     aiProvider = p;
     const preset = AI_PROVIDERS[p];
@@ -355,6 +365,93 @@
     if (s.has(m)) s.delete(m);
     else s.add(m);
     enabledModels = [...s];
+  }
+
+  async function loadProviders() {
+    try {
+      const r = await call<any>("list_providers");
+      savedProviders = r.providers ?? [];
+    } catch (e) {
+      console.warn("load providers", e);
+    }
+  }
+  async function addProvider() {
+    const base = addBaseUrl.trim() || aiBaseUrl.trim();
+    if (!base) {
+      notify("Endpoint is required", "err");
+      return;
+    }
+    const label = newProviderLabel.trim() || base;
+    const model = addModel.trim() || aiModel.trim();
+    const provider = addProviderSel || aiProvider;
+    const key = addApiKey.trim() || aiKey.trim();
+    try {
+      await call("add_provider", {
+        label,
+        base_url: base,
+        model,
+        provider,
+        api_key: key,
+        auth_method: aiAuthMethod,
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
+        },
+      });
+      // also set as active for chat
+      await call("set_ai_config", {
+        base_url: base,
+        model,
+        provider,
+        api_key: key,
+        auth_method: aiAuthMethod,
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
+        },
+      });
+      notify("Provider added");
+      // clean the add-form so it's ready for the next provider
+      newProviderLabel = "";
+      addBaseUrl = "";
+      addModel = "";
+      addApiKey = "";
+      addProviderSel = "openai";
+      await loadProviders();
+      const v = await call<any>("get_ai_config");
+      aiHasKey = v.has_api_key;
+      aiReady = true;
+    } catch (e) {
+      notify(`Failed to add provider: ${e}`, "err");
+    }
+  }
+  async function deleteProvider(id: string) {
+    if (!confirm("Delete this provider?")) return;
+    try {
+      await call("delete_provider", { id });
+      await loadProviders();
+      notify("Provider deleted");
+    } catch (e) {
+      notify(`Failed to delete: ${e}`, "err");
+    }
+  }
+  async function toggleProvider(id: string, enabled: boolean) {
+    try {
+      await call("toggle_provider", { id, enabled });
+      await loadProviders();
+    } catch (e) {
+      notify(`Failed to toggle: ${e}`, "err");
+    }
   }
 
   /** Pick a model in the chat panel. If it belongs to a provider preset,
@@ -2784,30 +2881,27 @@
           </nav>
           <div class="settings-content">
             {#if activeSettingsTab === "api"}
-              <div class="modal-section">API Providers — per-provider presets</div>
+              <div class="modal-section">Add new provider — fields stay clean for the next one</div>
               <div class="provider-grid">
                 {#each Object.entries(AI_PROVIDERS) as [key, p] (key)}
-                  <div class="provider-card" class:active={aiProvider === key}>
+                  <div class="provider-card" class:active={addProviderSel === key}>
                     <div class="pc-title">{p.label}</div>
                     <div class="pc-meta">{p.baseUrl || "custom endpoint"} · {(p.models[0] ?? "custom model")}</div>
-                    <button class:active={aiProvider === key} onclick={() => applyAiProvider(key)}>{aiProvider === key ? "Selected" : "Select"}</button>
+                    <button class:active={addProviderSel === key} onclick={() => { addProviderSel = key; const pr = AI_PROVIDERS[key]; if (pr.baseUrl) addBaseUrl = pr.baseUrl; if (pr.model) addModel = pr.model; }}>{addProviderSel === key ? "Selected" : "Select"}</button>
                   </div>
                 {/each}
               </div>
               <label class="modal-field">
                 Endpoint
                 <input
-                  bind:value={aiBaseUrl}
+                  bind:value={addBaseUrl}
                   placeholder="http://host:port/v1"
-                  oninput={() => {
-                    if (aiProvider === "openai") customBaseUrl = aiBaseUrl;
-                  }}
                 />
               </label>
               <label class="modal-field">
                 Model
                 <input
-                  bind:value={aiModel}
+                  bind:value={addModel}
                   placeholder={modelsList.length ? "select a model" : "model-name — save to auto-fetch"}
                   list="ai-model-list"
                 />
@@ -2820,16 +2914,25 @@
               <label class="modal-field">
                 API key
                 <input
-                  bind:value={aiKey}
+                  bind:value={addApiKey}
                   type="password"
-                  placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
+                  placeholder="sk-…"
                 />
               </label>
               <div class="modal-inline">
                 <button
                   type="button"
-                  onclick={testAiConfig}
-                  disabled={aiTestBusy || !aiBaseUrl.trim() || (!aiKey.trim() && !aiHasKey)}
+                  onclick={async () => {
+                    const base = addBaseUrl.trim() || aiBaseUrl.trim();
+                    const model = addModel.trim() || aiModel.trim();
+                    const key = addApiKey.trim() || aiKey.trim();
+                    aiTestBusy = true; aiTest = null;
+                    try {
+                      const r = await call<any>("test_ai_config", { base_url: base, model, provider: addProviderSel, api_key: key });
+                      aiTest = r.ok ? { ok: true, msg: r.summary } : { ok: false, msg: r.error ?? "failed" };
+                    } catch (e) { aiTest = { ok: false, msg: String(e) }; } finally { aiTestBusy = false; }
+                  }}
+                  disabled={aiTestBusy || !addBaseUrl.trim() || !addApiKey.trim()}
                 >
                   {aiTestBusy ? "Testing…" : "Test connection"}
                 </button>
@@ -2839,6 +2942,32 @@
                   </span>
                 {/if}
               </div>
+              <div class="modal-inline">
+                <label class="modal-field" style="flex:1; margin:0">
+                  Label (optional)
+                  <input bind:value={newProviderLabel} placeholder="e.g. My OpenRouter" />
+                </label>
+                <button type="button" onclick={addProvider} disabled={!addBaseUrl.trim() || !addApiKey.trim()}>Add provider</button>
+              </div>
+              <p class="modal-hint">Adds to the saved list below — fields stay clean for the next provider. Also sets it as active for chat.</p>
+              <div class="modal-section">Saved providers</div>
+              {#if savedProviders.length === 0}
+                <p class="modal-hint">No saved providers yet.</p>
+              {:else}
+                {#each savedProviders as p (p.id)}
+                  <div class="provider-card" style="flex-direction:row; align-items:center; gap:10px">
+                    <div style="flex:1; min-width:0">
+                      <div class="pc-title">{p.label}</div>
+                      <div class="pc-meta" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis">{p.base_url} · {p.model || "no model"} {p.has_api_key ? "· key" : ""}</div>
+                    </div>
+                    <label class="model-row" style="margin:0; padding:0; background:transparent; border:none">
+                      <input type="checkbox" checked={p.enabled} onchange={() => toggleProvider(p.id, !p.enabled)} />
+                      <span class="modal-hint" style="margin:0">{p.enabled ? "enabled" : "disabled"}</span>
+                    </label>
+                    <button class="danger" onclick={() => deleteProvider(p.id)} style="padding:4px 10px; font-size:12px">Delete</button>
+                  </div>
+                {/each}
+              {/if}
             {:else if activeSettingsTab === "oauth"}
               <div class="modal-section">Web Login (OAuth) — per-provider presets</div>
               <p class="modal-hint">Log in through the provider's browser page — the bearer token is stored encrypted. If you use Chrome, it reuses the Google account already signed in.</p>

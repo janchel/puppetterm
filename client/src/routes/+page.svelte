@@ -526,6 +526,18 @@
         enabledModels = [...s];
       }
       await loadProviders();
+      // If the deleted provider was active, switch to first enabled or clear
+      if (doomed && aiBaseUrl === doomed.base_url) {
+        const next = savedProviders.find((p: any) => p.enabled);
+        if (next) {
+          aiBaseUrl = next.base_url;
+          aiModel = next.model;
+          aiProvider = next.provider;
+          await call("set_ai_config", { base_url: aiBaseUrl, model: aiModel, provider: aiProvider }).catch(() => {});
+        } else if (!savedProviders.length) {
+          // No saved providers left — keep current active as is (ai.json still holds it)
+        }
+      }
       modelsList = [];
       await loadModels();
       notify("Provider deleted");
@@ -544,6 +556,16 @@
         enabledModels = [...s];
       }
       await loadProviders();
+      // If the toggled provider was active and is now disabled, switch active
+      if (target && aiBaseUrl === target.base_url && !enabled) {
+        const next = savedProviders.find((p: any) => p.enabled);
+        if (next) {
+          aiBaseUrl = next.base_url;
+          aiModel = next.model;
+          aiProvider = next.provider;
+          await call("set_ai_config", { base_url: aiBaseUrl, model: aiModel, provider: aiProvider }).catch(() => {});
+        }
+      }
       // refresh the Models list so disabled providers' fetched models disappear
       modelsList = [];
       await loadModels();
@@ -552,19 +574,42 @@
     }
   }
 
-  /** Pick a model in the chat panel. If it belongs to a provider preset,
-   *  switch the provider + endpoint too (the custom/openai preset restores the
-   *  remembered custom endpoint); then persist. */
+  /** Pick a model in the chat panel. If it belongs to a provider preset or a
+   *  saved provider, switch the endpoint/provider too. */
   function applyAiModel(m: string) {
     aiModel = m;
-    for (const [key, p] of Object.entries(AI_PROVIDERS)) {
-      if (p.models.includes(m)) {
-        aiProvider = key;
-        if (p.baseUrl) aiBaseUrl = p.baseUrl;
-        else if (key === "openai") aiBaseUrl = customBaseUrl;
+    // 1) Check saved providers first (covers custom single-model providers)
+    let found = false;
+    for (const p of savedProviders) {
+      if (p.enabled && p.model === m) {
+        aiBaseUrl = p.base_url;
+        aiProvider = p.provider;
+        found = true;
+        break;
+      }
+      // For blank-model providers, the model came from fetched list — find which provider's fetched list contains it
+      // We don't track per-provider fetched lists, so fall back to checking if this provider is enabled and blank-model and modelsList contains m
+      if (p.enabled && !p.model && modelsList.includes(m)) {
+        // Assume the fetched model belongs to the first enabled blank-model provider
+        // (good enough for single-provider case; for multi, the baseUrl will be that provider's)
+        aiBaseUrl = p.base_url;
+        aiProvider = p.provider;
+        found = true;
         break;
       }
     }
+    if (!found) {
+      for (const [key, p] of Object.entries(AI_PROVIDERS)) {
+        if (p.models.includes(m)) {
+          aiProvider = key;
+          if (p.baseUrl) aiBaseUrl = p.baseUrl;
+          else if (key === "openai") aiBaseUrl = customBaseUrl;
+          found = true;
+          break;
+        }
+      }
+    }
+    // Fallback: if model is from fetched list and no saved provider matched, keep current baseUrl
     aiReady = true;
     call("set_ai_config", {
       base_url: aiBaseUrl,

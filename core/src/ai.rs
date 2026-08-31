@@ -782,27 +782,47 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<String>, String> {
         ]);
     }
     let base = cfg.base_url.trim_end_matches('/');
-    // Most OpenAI-compatible gateways expose GET /models or /v1/models; the
-    // base_url already contains the version prefix (e.g. .../v1), so we just
-    // append /models.
-    let url = format!("{}/models", base);
+    // Most OpenAI-compatible gateways expose GET /models (base already contains
+    // the version prefix, e.g. .../v1). For Google's OpenAI-compatible base
+    // (.../v1beta/openai) the canonical models endpoint is without the trailing
+    // /openai, so we try both.
+    let mut urls = vec![format!("{}/models", base)];
+    if base.ends_with("/openai") {
+        urls.push(format!(
+            "{}/models",
+            base.trim_end_matches("/openai").trim_end_matches('/')
+        ));
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(&cfg.api_key)
-        .send()
-        .await
-        .map_err(|e| format!("list models request failed: {e}"))?;
-    let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        let snippet = text.chars().take(400).collect::<String>();
-        return Err(format!("list models failed ({status}): {snippet}"));
+    let mut last_err = String::new();
+    let mut v: Option<serde_json::Value> = None;
+    for url in urls {
+        let resp = client
+            .get(&url)
+            .bearer_auth(&cfg.api_key)
+            .send()
+            .await
+            .map_err(|e| format!("list models request failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            last_err = format!(
+                "list models failed ({status}): {}",
+                text.chars().take(400).collect::<String>()
+            );
+            // 404 on the /openai variant → try the fallback; otherwise surface it
+            if status.as_u16() == 404 {
+                continue;
+            }
+            return Err(last_err);
+        }
+        v = Some(serde_json::from_str(&text).map_err(|e| format!("bad models response: {e}"))?);
+        break;
     }
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad models response: {e}"))?;
+    let v = v.ok_or_else(|| last_err.clone()).map_err(|e| e)?;
     // OpenAI shape: {data:[{id:"gpt-4o",...}]}
     if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
         let ids: Vec<String> = arr

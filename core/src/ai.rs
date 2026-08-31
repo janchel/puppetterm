@@ -796,9 +796,16 @@ pub async fn test_config(
     Ok(format!("Connected · {} · {}", provider, model))
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    pub is_free: bool,
+}
+
 /// List available models from the provider's `/models` endpoint (OpenAI-compatible).
-/// Returns model IDs. For Anthropic we return its preset list (no standard `/models`).
-pub async fn list_models(cfg: &AiConfig) -> Result<Vec<String>, String> {
+/// Returns model IDs with a best-effort free/paid flag. For Anthropic we return
+/// its preset list (no standard `/models`).
+pub async fn list_models(cfg: &AiConfig) -> Result<Vec<ModelInfo>, String> {
     if cfg.base_url.trim().is_empty() {
         return Err("base_url is required".into());
     }
@@ -807,9 +814,9 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<String>, String> {
     }
     if cfg.provider == PROVIDER_ANTHROPIC {
         return Ok(vec![
-            "claude-sonnet-4-20250514".into(),
-            "claude-3-5-haiku-latest".into(),
-            "claude-opus-4-20250514".into(),
+            ModelInfo { id: "claude-sonnet-4-20250514".into(), is_free: false },
+            ModelInfo { id: "claude-3-5-haiku-latest".into(), is_free: false },
+            ModelInfo { id: "claude-opus-4-20250514".into(), is_free: false },
         ]);
     }
     let base = cfg.base_url.trim_end_matches('/');
@@ -854,30 +861,73 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<String>, String> {
         break;
     }
     let v = v.ok_or_else(|| last_err.clone()).map_err(|e| e)?;
-    // OpenAI shape: {data:[{id:"gpt-4o",...}]}
+    // OpenAI shape: {data:[{id:"gpt-4o", pricing:{prompt:"0",completion:"0"}, ...}]}
     if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-        let ids: Vec<String> = arr
+        let infos: Vec<ModelInfo> = arr
             .iter()
-            .filter_map(|e| e.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+            .filter_map(|e| {
+                let id = e.get("id").and_then(|id| id.as_str())?.to_string();
+                // Hide deprecated Gemini models that 404
+                let l = id.to_lowercase();
+                if l.contains("gemini-2.0-flash") || l.contains("gemini-2.5-pro") {
+                    return None;
+                }
+                let is_free = {
+                    if l.contains(":free") || l.contains("-free") {
+                        true
+                    } else if let Some(pricing) = e.get("pricing") {
+                        let pf = pricing.get("prompt").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        let cf = pricing.get("completion").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        pf && cf
+                    } else {
+                        false
+                    }
+                };
+                Some(ModelInfo { id, is_free })
+            })
             .collect();
-        if !ids.is_empty() {
-            return Ok(ids);
+        if !infos.is_empty() {
+            return Ok(infos);
         }
     }
     // Fallback: {models:[{id:...}]} or {models:["a","b"]}
     if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
-        let ids: Vec<String> = arr
+        let infos: Vec<ModelInfo> = arr
             .iter()
             .filter_map(|e| {
-                if let Some(s) = e.as_str() {
-                    Some(s.to_string())
+                let (id, pricing) = if let Some(s) = e.as_str() {
+                    (s.to_string(), None)
                 } else {
-                    e.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())
+                    (e.get("id").and_then(|id| id.as_str())?.to_string(), e.get("pricing"))
+                };
+                let l = id.to_lowercase();
+                if l.contains("gemini-2.0-flash") || l.contains("gemini-2.5-pro") {
+                    return None;
                 }
+                let is_free = {
+                    if l.contains(":free") || l.contains("-free") {
+                        true
+                    } else if let Some(pricing) = pricing {
+                        let pf = pricing.get("prompt").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        let cf = pricing.get("completion").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        pf && cf
+                    } else {
+                        false
+                    }
+                };
+                Some(ModelInfo { id, is_free })
             })
             .collect();
-        if !ids.is_empty() {
-            return Ok(ids);
+        if !infos.is_empty() {
+            return Ok(infos);
         }
     }
     Err("could not parse models list (unexpected response shape)".into())

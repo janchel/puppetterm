@@ -153,7 +153,7 @@
       label: "Google (Chrome account)",
       flow: "standard",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
-      model: "gemini-2.0-flash",
+      model: "gemini-3.6-flash",
       authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
       tokenUrl: "https://oauth2.googleapis.com/token",
       scope: "https://www.googleapis.com/auth/generative-language.retriever https://www.googleapis.com/auth/cloud-platform",

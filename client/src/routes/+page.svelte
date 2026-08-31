@@ -161,7 +161,8 @@
   };
 
   // Models from the active provider's preset + fetched provider list.
-  // If the user toggled models in the Models tab, only enabled ones appear.
+  // Disable-all-by-default: once models have been fetched (modelsList non-empty),
+  // only explicitly enabled models appear (plus the current aiModel).
   let allModels = $derived.by(() => {
     const set = new Set<string>();
     const preset = AI_PROVIDERS[aiProvider];
@@ -169,6 +170,12 @@
     for (const m of modelsList) set.add(m);
     if (aiModel) set.add(aiModel);
     let arr = [...set];
+    if (modelsList.length > 0) {
+      const enabled = new Set(enabledModels);
+      arr = arr.filter((m) => enabled.has(m) || m === aiModel);
+      if (aiModel && !arr.includes(aiModel)) arr.push(aiModel);
+      return arr.sort();
+    }
     if (enabledModels.length > 0) {
       const enabled = new Set(enabledModels);
       arr = arr.filter((m) => enabled.has(m));
@@ -310,7 +317,6 @@
       const r = await call<any>("list_ai_models");
       const list: string[] = r.models ?? [];
       modelsList = list;
-      if (enabledModels.length === 0 && list.length) enabledModels = [...list];
       if (list.length === 0) modelsError = "No models returned.";
     } catch (e) {
       modelsError = String(e);
@@ -1387,7 +1393,7 @@
   /** Save everything from the Settings modal and close it. */
   async function saveSettings() {
     await saveAiConfig();
-    showSettings = false;
+    // stay open so the user can switch tabs (Models etc.) — close only via Cancel / × / Esc
   }
 
   async function sendChat() {
@@ -2904,11 +2910,16 @@
                   <button type="button" onclick={loadModels} disabled={modelsLoading}>{modelsLoading ? "Loading…" : "Refresh from provider"}</button>
                   {#if modelsError}<span class="ai-test err">{modelsError}</span>{/if}
                 </div>
+                <div class="modal-inline" style="margin-top:6px">
+                  <button type="button" onclick={() => (enabledModels = [...modelsList])} disabled={!modelsList.length}>Enable all</button>
+                  <button type="button" onclick={() => (enabledModels = [])} disabled={!enabledModels.length}>Disable all</button>
+                  <span class="modal-hint" style="margin-left:6px">{enabledModels.length}/{modelsList.length} enabled</span>
+                </div>
                 {#if modelsList.length}
                   <div class="model-list">
                     {#each modelsList as m (m)}
                       <label class="model-row">
-                        <input type="checkbox" checked={enabledModels.length === 0 || enabledModels.includes(m)} onchange={() => toggleModel(m)} />
+                        <input type="checkbox" checked={enabledModels.includes(m)} onchange={() => toggleModel(m)} />
                         <span>{m}</span>
                       </label>
                     {/each}

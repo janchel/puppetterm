@@ -94,7 +94,6 @@
   let addProviderBusy = $state(false);
   let initialSettingsSnapshot = $state<string>("");
   // Confirmation summary shown before applying settings (Save opens this first).
-  let settingsConfirm = $state<{ summary: string[] } | null>(null);
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -1767,34 +1766,10 @@
     return false;
   }
 
-  /** Save everything from the Settings modal. First confirm via a summary
-   *  dialog; block saving default selections when no provider is configured. */
-  function saveSettings() {
-    const lines: string[] = [];
-    const enabled = savedProviders.filter((p: any) => p.enabled);
-    if (enabled.length > 0) {
-      lines.push(`Providers: ${enabled.map((p: any) => p.label || p.base_url).join(", ")}`);
-      const models = enabled.filter((p: any) => p.model).map((p: any) => p.model).join(", ");
-      if (models) lines.push(`Models: ${models}`);
-    } else if (aiBaseUrl.trim()) {
-      lines.push(`Endpoint: ${aiBaseUrl}`);
-      if (aiModel) lines.push(`Model: ${aiModel}`);
-    } else {
-      lines.push("Endpoint: (none)");
-    }
-    if (aiAuthMethod) lines.push(`Auth: ${aiAuthMethod === "oauth" ? "Web login (OAuth)" : "API key"}`);
-    lines.push(`Autonomy: ${autonomy}`);
-    lines.push(`Theme: ${themeName}`);
-    // Block saving default/blank selections with no provider
-    if (!hasUsableProvider()) {
-      lines.push("");
-      lines.push("⚠ No provider with a valid API key is configured — saving would store blank/default settings.");
-    }
-    settingsConfirm = { summary: lines };
-  }
-
-  async function confirmSettingsSave() {
-    settingsConfirm = null;
+  /** Save everything from the Settings modal. Shows a watermark notification
+   *  on success (no blocking confirmation popup) and blocks saving when no
+   *  usable provider is configured. */
+  async function saveSettings() {
     if (!hasUsableProvider()) {
       notify("Nothing saved — add a provider with an API key first.", "err");
       return;
@@ -1802,6 +1777,7 @@
     await saveAiConfig();
     // refresh dirty snapshot so Save disables until next edit
     captureSettingsSnapshot();
+    notify(`Settings saved — ${AI_PROVIDERS[aiProvider]?.label ?? "Custom"}${aiModel ? ` · ${aiModel}` : ""}`);
     // stay open so the user can switch tabs (Models etc.) — close only via Cancel / × / Esc
   }
 
@@ -3413,35 +3389,6 @@
       </div>
     </div>
   {/if}
-
-  {#if settingsConfirm}
-    <div class="modal-overlay" onclick={() => (settingsConfirm = null)}>
-      <div class="modal modal-confirm" onclick={(e) => e.stopPropagation()}>
-        <div class="modal-header">
-          <div class="modal-title">Apply these settings?</div>
-          <button class="modal-close" onclick={() => (settingsConfirm = null)} aria-label="Close">×</button>
-        </div>
-        <div class="modal-confirm-body">
-          <div class="settings-summary">
-            {#each settingsConfirm.summary as line (line)}
-              <div>{line}</div>
-            {/each}
-          </div>
-          {#if !hasUsableProvider()}
-            <p class="ai-test err" style="margin-top:10px">
-              No provider has a valid API key. Add a provider in API Providers (or an endpoint + key
-              here) before saving — otherwise the saved config will be unusable.
-            </p>
-          {/if}
-        </div>
-        <div class="modal-btns">
-          <div class="spacer"></div>
-          <button onclick={() => (settingsConfirm = null)}>Cancel</button>
-          <button class="primary" onclick={confirmSettingsSave}>Apply</button>
-        </div>
-      </div>
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -4064,28 +4011,6 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
-  }
-  .modal-confirm {
-    max-width: 520px;
-  }
-  .modal-confirm-body {
-    padding: 18px 22px;
-    overflow-y: auto;
-    max-height: 50vh;
-  }
-  .settings-summary {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    font-size: 13px;
-    color: #c9d1d9;
-    background: #0d1117;
-    border: 1px solid #21262d;
-    border-radius: 8px;
-    padding: 12px 14px;
-  }
-  .settings-summary div {
-    word-break: break-word;
   }
   .settings-nav {
     width: 160px;

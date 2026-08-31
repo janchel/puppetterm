@@ -78,7 +78,11 @@
   let oauthFlow = $state("standard");
   let oauthHasSecret = $state(false);
   let aiOauthBusy = $state(false);
-  let activeSettingsTab = $state<"api" | "oauth" | "general">("api");
+  let activeSettingsTab = $state<"api" | "oauth" | "models" | "general">("api");
+  let modelsList = $state<string[]>([]);
+  let modelsLoading = $state(false);
+  let modelsError = $state<string | null>(null);
+  let enabledModels = $state<string[]>([]);
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -156,12 +160,36 @@
     },
   };
 
-  // Every model across all provider presets, plus whatever is currently saved.
+  // Every model across all provider presets, plus fetched provider models.
+  // If the user has toggled models in the Models tab, only enabled ones appear.
   let allModels = $derived.by(() => {
     const set = new Set<string>();
     for (const p of Object.values(AI_PROVIDERS)) for (const m of p.models) set.add(m);
+    for (const m of modelsList) set.add(m);
     if (aiModel) set.add(aiModel);
-    return [...set];
+    let arr = [...set];
+    if (enabledModels.length > 0) {
+      const enabled = new Set(enabledModels);
+      arr = arr.filter((m) => enabled.has(m));
+      if (aiModel && !enabled.has(aiModel)) arr.push(aiModel);
+    }
+    return arr.sort();
+  });
+
+  // Persist the enabled-models filter
+  try {
+    const raw = localStorage.getItem("pp.ai.enabledModels");
+    if (raw) {
+      const v = JSON.parse(raw);
+      if (Array.isArray(v)) enabledModels = v;
+    }
+  } catch {}
+  $effect(() => {
+    try {
+      // touch enabledModels to make this reactive
+      const _ = enabledModels;
+      localStorage.setItem("pp.ai.enabledModels", JSON.stringify(enabledModels));
+    } catch {}
   });
 
   function applyAiProvider(p: string) {
@@ -233,6 +261,7 @@
           client_secret: oauthClientSecret,
           scope: oauthScope,
           redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
         },
       });
       const r = await call<any>("ai_oauth_begin");
@@ -259,6 +288,32 @@
     } finally {
       aiOauthBusy = false;
     }
+  }
+
+  async function loadModels() {
+    if (!aiHasKey) {
+      modelsError = "Configure a provider and authenticate first.";
+      return;
+    }
+    modelsLoading = true;
+    modelsError = null;
+    try {
+      const r = await call<any>("list_ai_models");
+      const list: string[] = r.models ?? [];
+      modelsList = list;
+      if (enabledModels.length === 0 && list.length) enabledModels = [...list];
+      if (list.length === 0) modelsError = "No models returned.";
+    } catch (e) {
+      modelsError = String(e);
+    } finally {
+      modelsLoading = false;
+    }
+  }
+  function toggleModel(m: string) {
+    const s = new Set(enabledModels);
+    if (s.has(m)) s.delete(m);
+    else s.add(m);
+    enabledModels = [...s];
   }
 
   /** Pick a model in the chat panel. If it belongs to a provider preset,
@@ -2672,6 +2727,7 @@
           <nav class="settings-nav">
             <button class:active={activeSettingsTab === "api"} onclick={() => { activeSettingsTab = "api"; setAiAuthMethod("key"); }}>API Providers</button>
             <button class:active={activeSettingsTab === "oauth"} onclick={() => { activeSettingsTab = "oauth"; setAiAuthMethod("oauth"); }}>Web Login</button>
+            <button class:active={activeSettingsTab === "models"} onclick={() => (activeSettingsTab = "models")}>Models</button>
             <button class:active={activeSettingsTab === "general"} onclick={() => (activeSettingsTab = "general")}>General</button>
           </nav>
           <div class="settings-content">
@@ -2806,6 +2862,29 @@
                   </span>
                 {/if}
               </div>
+            {:else if activeSettingsTab === "models"}
+              <div class="modal-section">Models — fetched from the provider</div>
+              {#if !aiHasKey}
+                <p class="modal-hint">Configure and authenticate a provider first, then refresh.</p>
+              {:else}
+                <div class="modal-inline">
+                  <button type="button" onclick={loadModels} disabled={modelsLoading}>{modelsLoading ? "Loading…" : "Refresh from provider"}</button>
+                  {#if modelsError}<span class="ai-test err">{modelsError}</span>{/if}
+                </div>
+                {#if modelsList.length}
+                  <div class="model-list">
+                    {#each modelsList as m (m)}
+                      <label class="model-row">
+                        <input type="checkbox" checked={enabledModels.length === 0 || enabledModels.includes(m)} onchange={() => toggleModel(m)} />
+                        <span>{m}</span>
+                      </label>
+                    {/each}
+                  </div>
+                {:else if !modelsError}
+                  <p class="modal-hint">No models fetched yet — click Refresh.</p>
+                {/if}
+                <p class="modal-hint" style="margin-top:8px">Disabled models are hidden from the chat model switcher. The current model ({aiModel || "none"}) always stays visible.</p>
+              {/if}
             {:else}
               <div class="modal-section">General</div>
               <label class="modal-field">
@@ -3558,6 +3637,32 @@
     margin-top: 0;
     border-top: none;
     padding-top: 0;
+  }
+  .model-list {
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    padding: 6px;
+    background: #010409;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .model-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #e6edf3;
+    padding: 4px 6px;
+    border-radius: 6px;
+  }
+  .model-row:hover {
+    background: #161b22;
+  }
+  .model-row input {
+    accent-color: #1f6feb;
   }
   .modal-title {
     font-size: 16px;

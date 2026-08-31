@@ -144,6 +144,15 @@
       tokenUrl: "https://openrouter.ai/api/v1/auth/keys",
       scope: "",
     },
+    google: {
+      label: "Google (Chrome account)",
+      flow: "standard",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model: "gemini-2.0-flash",
+      authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      scope: "https://www.googleapis.com/auth/generative-language.retriever https://www.googleapis.com/auth/cloud-platform",
+    },
   };
 
   // Every model across all provider presets, plus whatever is currently saved.

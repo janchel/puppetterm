@@ -522,6 +522,10 @@ pub fn begin_oauth() -> Result<AiOAuthBegin, String> {
         if !o.scope.trim().is_empty() {
             u.push_str(&format!("&scope={}", qenc(&o.scope)));
         }
+        // Google benefits from offline access so a refresh token is issued.
+        if o.auth_url.contains("accounts.google.com") {
+            u.push_str("&access_type=offline&prompt=consent");
+        }
         u
     };
 

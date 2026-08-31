@@ -85,6 +85,10 @@
   let enabledModels = $state<string[]>([]);
   let modelFreeMap = $state<Record<string, boolean>>({});
   let modelPaidFilter = $state<"all" | "free" | "paid">("all");
+  // model -> provider ids that expose it (used for the per-provider filter view).
+  let modelOwner = $state<Record<string, string[]>>({});
+  // Models-tab provider filter: "all" or a saved-provider id.
+  let modelProviderFilter = $state("all");
   let savedProviders = $state<any[]>([]);
   let newProviderLabel = $state("");
   let addBaseUrl = $state("");
@@ -208,6 +212,9 @@
     const baseSet = new Set<string>(showNonToolModels ? modelsList : toolCapableModels);
     for (const p of savedProviders) if (p.enabled && p.model) baseSet.add(p.model);
     let base = [...baseSet];
+    if (modelProviderFilter && modelProviderFilter !== "all") {
+      base = base.filter((m) => (modelOwner[m] || []).includes(modelProviderFilter));
+    }
     if (modelPaidFilter === "free") return base.filter((m) => modelFreeMap[m]);
     if (modelPaidFilter === "paid") return base.filter((m) => modelFreeMap[m] === false);
     return base;
@@ -275,6 +282,13 @@
       enabled: !!p.enabled,
       has_api_key: !!p.has_api_key,
     }));
+  }
+  function providerLabelFor(id: string): string {
+    const p = savedProviders.find((x: any) => x.id === id);
+    return p ? (p.label || p.base_url) : id;
+  }
+  function modelOwnerLabels(m: string): string {
+    return (modelOwner[m] || []).map(providerLabelFor).join(", ");
   }
   function captureSettingsSnapshot() {
     initialSettingsSnapshot = JSON.stringify({
@@ -467,9 +481,15 @@
       }
       const all = new Set<string>();
       const freeMap: Record<string, boolean> = {};
+      const owner: Record<string, string[]> = {};
+      const addOwner = (id: string, pid: string) => {
+        const list = owner[id] || (owner[id] = []);
+        if (!list.includes(pid)) list.push(pid);
+      };
       for (const p of enabled) {
         if (p.model && p.model.trim()) {
           all.add(p.model.trim());
+          addOwner(p.model.trim(), p.id);
         } else {
           try {
             const r = await call<any>("list_ai_models", { provider_id: p.id });
@@ -478,6 +498,7 @@
               const id = typeof m === "string" ? m : m.id;
               if (id) {
                 all.add(id);
+                addOwner(id, p.id);
                 if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
               }
             }
@@ -493,7 +514,14 @@
         }
       }
       modelFreeMap = freeMap;
+      modelOwner = owner;
       modelsList = [...all];
+      // Keep the provider filter valid — if the selected provider no longer has
+      // models, fall back to showing all.
+      if (modelProviderFilter !== "all") {
+        const stillOwns = Object.values(modelOwner).some((ids) => ids.includes(modelProviderFilter));
+        if (!stillOwns) modelProviderFilter = "all";
+      }
       if (modelsList.length === 0 && !modelsError) modelsError = "No models returned.";
     } catch (e) {
       const msg = String(e);
@@ -3359,6 +3387,14 @@
                   <button type="button" onclick={() => (enabledModels = [...visibleModels])} disabled={!visibleModels.length}>Enable all</button>
                   <button type="button" onclick={() => (enabledModels = [])} disabled={!enabledModels.length}>Disable all</button>
                   <label class="modal-field" style="margin:0; min-width:120px">
+                    <select bind:value={modelProviderFilter} style="padding:4px 8px; font-size:12px">
+                      <option value="all">All providers</option>
+                      {#each savedProviders.filter((p: any) => p.enabled) as p (p.id)}
+                        <option value={p.id}>{p.label || p.base_url}</option>
+                      {/each}
+                    </select>
+                  </label>
+                  <label class="modal-field" style="margin:0; min-width:120px">
                     <select bind:value={modelPaidFilter} style="padding:4px 8px; font-size:12px">
                       <option value="all">All pricing</option>
                       <option value="free">Free only</option>
@@ -3377,6 +3413,9 @@
                       <label class="model-row">
                         <input type="checkbox" checked={enabledModels.includes(m)} onchange={() => toggleModel(m)} />
                         <span>{m}</span>
+                        {#if modelOwner[m]?.length > 0 && modelProviderFilter === "all"}
+                          <span class="modal-hint" style="margin-left:6px; opacity:.8">{modelOwnerLabels(m)}</span>
+                        {/if}
                         {#if modelFreeMap[m]}<span class="modal-hint" style="margin-left:6px; color:#3fb950">free</span>
                         {:else if modelFreeMap[m] === false}<span class="modal-hint" style="margin-left:6px">paid</span>{/if}
                         {#if !isToolCapable(m)}<span class="modal-hint" style="margin-left:auto">non-tool</span>{/if}

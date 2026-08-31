@@ -108,7 +108,7 @@
       label: "Custom (OpenAI-compatible)",
       baseUrl: "",
       model: "",
-      models: ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
+      models: [],
     },
     deepseek: {
       label: "DeepSeek",
@@ -160,11 +160,12 @@
     },
   };
 
-  // Every model across all provider presets, plus fetched provider models.
-  // If the user has toggled models in the Models tab, only enabled ones appear.
+  // Models from the active provider's preset + fetched provider list.
+  // If the user toggled models in the Models tab, only enabled ones appear.
   let allModels = $derived.by(() => {
     const set = new Set<string>();
-    for (const p of Object.values(AI_PROVIDERS)) for (const m of p.models) set.add(m);
+    const preset = AI_PROVIDERS[aiProvider];
+    if (preset) for (const m of preset.models) set.add(m);
     for (const m of modelsList) set.add(m);
     if (aiModel) set.add(aiModel);
     let arr = [...set];
@@ -190,6 +191,13 @@
       const _ = enabledModels;
       localStorage.setItem("pp.ai.enabledModels", JSON.stringify(enabledModels));
     } catch {}
+  });
+
+  // Auto-fetch models when Settings opens and the provider is already authenticated
+  $effect(() => {
+    if (showSettings && aiHasKey && !modelsList.length && !modelsLoading && aiBaseUrl.trim()) {
+      loadModels();
+    }
   });
 
   function applyAiProvider(p: string) {
@@ -276,6 +284,7 @@
             aiReady = true;
             pushChat("ai", "(AI logged in via OAuth — token stored, encrypted)");
             notify("OAuth login successful");
+            loadModels().catch(() => {});
           }
         } catch {
           /* keep polling */
@@ -1311,6 +1320,17 @@
         if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
       pushChat("ai", "(AI settings saved)");
       notify(`AI settings saved — ${AI_PROVIDERS[aiProvider]?.label ?? "Custom"} · ${aiModel}`);
+      // Auto-discover models for Custom / OAuth so the dropdown isn't stale/empty
+      try {
+        await loadModels();
+        if (!aiModel && modelsList.length) aiModel = modelsList[0];
+      } catch {}
+      // keep the newly discovered model persisted
+      if (aiModel && modelsList.includes(aiModel)) {
+        try {
+          await call("set_ai_config", { base_url: aiBaseUrl, model: aiModel, provider: aiProvider });
+        } catch {}
+      }
     } catch (e) {
       pushChat("ai", `(failed to save AI settings: ${e})`);
       notify(`Failed to save AI settings: ${e}`, "err");
@@ -2754,9 +2774,13 @@
               </label>
               <label class="modal-field">
                 Model
-                <input bind:value={aiModel} placeholder="model-name" list="ai-model-list" />
+                <input
+                  bind:value={aiModel}
+                  placeholder={modelsList.length ? "select a model" : "model-name — save to auto-fetch"}
+                  list="ai-model-list"
+                />
                 <datalist id="ai-model-list">
-                  {#each AI_PROVIDERS[aiProvider]?.models ?? [] as m (m)}
+                  {#each allModels as m (m)}
                     <option value={m}></option>
                   {/each}
                 </datalist>
@@ -2806,7 +2830,16 @@
               </label>
               <label class="modal-field">
                 Model
-                <input bind:value={aiModel} placeholder="model-name" list="ai-model-list" />
+                <input
+                  bind:value={aiModel}
+                  placeholder={modelsList.length ? "select a model" : "model-name — save to auto-fetch"}
+                  list="ai-model-list-oauth"
+                />
+                <datalist id="ai-model-list-oauth">
+                  {#each allModels as m (m)}
+                    <option value={m}></option>
+                  {/each}
+                </datalist>
               </label>
               <label class="modal-field">
                 OAuth authorize URL

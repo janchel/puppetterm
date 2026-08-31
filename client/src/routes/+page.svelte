@@ -397,6 +397,8 @@
     oauthScope = p.scope;
     oauthFlow = p.flow;
     aiAuthMethod = "oauth";
+    oauthClientId = "";
+    oauthClientSecret = "";
     if (!oauthRedirectUri.trim()) {
       try {
         oauthRedirectUri = `${location.origin}/oauth/callback`;
@@ -3329,7 +3331,7 @@
                 <div class="provider-card">
                   <div class="pc-title">Custom OAuth</div>
                   <div class="pc-meta">any OpenAI-compatible provider with standard PKCE</div>
-                  <button onclick={() => { oauthAuthUrl = ""; oauthTokenUrl = ""; oauthClientId = ""; oauthScope = ""; oauthFlow = "standard"; }}>Clear</button>
+                  <button onclick={() => { oauthAuthUrl = ""; oauthTokenUrl = ""; oauthClientId = ""; oauthClientSecret = ""; oauthScope = ""; oauthFlow = "standard"; }}>Clear</button>
                 </div>
               </div>
               <label class="modal-field">

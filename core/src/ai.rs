@@ -984,17 +984,18 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<ModelInfo>, String> {
         .map_err(|e| e.to_string())?;
     let mut last_err = String::new();
     let mut v: Option<serde_json::Value> = None;
-    for mut url in urls {
-        // Google AI Studio expects the API key as `x-goog-api-key` / `?key=` rather than Bearer.
-        // For OAuth (token) we still use Bearer. Detect API-key vs token by auth_method.
-        let is_google = url.contains("generativelanguage.googleapis.com");
-        let use_api_key_header = is_google && cfg.auth_method != AUTH_METHOD_OAUTH;
+    for url in urls {
+        // Google's OpenAI-compatible endpoint (.../v1beta/openai/...) accepts
+        // Bearer like everyone else; the native Google endpoint (.../v1beta/...)
+        // expects `x-goog-api-key` / `?key=`.
+        let is_native_google = url.contains("generativelanguage.googleapis.com") && !url.contains("/openai/");
+        let use_api_key_header = is_native_google && cfg.auth_method != AUTH_METHOD_OAUTH;
+        let mut req_url = url.clone();
         if use_api_key_header {
-            // Append ?key= for Google's REST API
-            let sep = if url.contains('?') { '&' } else { '?' };
-            url = format!("{}{}key={}", url, sep, cfg.api_key);
+            let sep = if req_url.contains('?') { '&' } else { '?' };
+            req_url = format!("{}{}key={}", req_url, sep, cfg.api_key);
         }
-        let mut req = client.get(&url);
+        let mut req = client.get(&req_url);
         if use_api_key_header {
             req = req.header("x-goog-api-key", &cfg.api_key);
         } else {
@@ -1015,8 +1016,11 @@ pub async fn list_models(cfg: &AiConfig) -> Result<Vec<ModelInfo>, String> {
             if status.as_u16() == 404 {
                 continue;
             }
-            // Google sometimes returns 400 INVALID_ARGUMENT for Bearer vs x-goog-api-key mismatch — try fallback once
-            if is_google && url.contains("/openai/") {
+            // Google OpenAI endpoint with Bearer sometimes 400s with API_KEY_INVALID — try the native endpoint with x-goog-api-key
+            if url.contains("generativelanguage.googleapis.com")
+                && url.contains("/openai/")
+                && status.as_u16() == 400
+            {
                 continue;
             }
             return Err(last_err);

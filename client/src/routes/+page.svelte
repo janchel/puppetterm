@@ -91,6 +91,7 @@
   let addModel = $state("");
   let addApiKey = $state("");
   let addProviderSel = $state("openai");
+  let addProviderBusy = $state(false);
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -444,9 +445,12 @@
     }
   }
   async function addProvider() {
+    if (addProviderBusy) return;
+    addProviderBusy = true;
     const base = addBaseUrl.trim() || aiBaseUrl.trim();
     if (!base) {
       notify("Endpoint is required", "err");
+      addProviderBusy = false;
       return;
     }
     const label = newProviderLabel.trim() || base;
@@ -507,6 +511,8 @@
       aiReady = true;
     } catch (e) {
       notify(`Failed to add provider: ${e}`, "err");
+    } finally {
+      addProviderBusy = false;
     }
   }
   async function deleteProvider(id: string) {
@@ -3039,7 +3045,7 @@
                   Label (optional)
                   <input bind:value={newProviderLabel} placeholder="e.g. My OpenRouter" />
                 </label>
-                <button type="button" onclick={addProvider} disabled={!addBaseUrl.trim() || !addApiKey.trim()}>Add provider</button>
+                <button type="button" onclick={addProvider} disabled={addProviderBusy || !addBaseUrl.trim() || !addApiKey.trim()}>{addProviderBusy ? "Adding…" : "Add provider"}</button>
               </div>
               <p class="modal-hint">Adds to the saved list below — fields stay clean for the next provider. Also sets it as active for chat.</p>
               <div class="modal-section">Saved providers</div>

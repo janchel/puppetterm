@@ -873,22 +873,18 @@ pub async fn test_config(
     if api_key.is_empty() {
         return Err("api_key is required (or log in first)".into());
     }
-    // Test connection verifies the endpoint + key with the specific model the
-    // user picked — it never enumerates/parses the provider's full model list
-    // (that is the Models tab / "Refresh" job). Fall back to a stored model
-    // only if the caller supplied no model at all.
-    if model.is_empty() {
-        model = stored.as_ref().map(|c| c.model.clone()).unwrap_or_default();
-    }
-    if model.is_empty() {
-        return Err("a model is required to test the connection — set one in the Model field".into());
-    }
+    // Test connection is a pure connectivity probe: it validates that the
+    // endpoint + API key work, without requiring a model and without pulling the
+    // full model list into the Models page. The standard way to check auth is
+    // the provider's /models endpoint — we report the count, not a parsed list.
+    //
     // A typed API key means the `key` auth method, which is how these tests
-    // authenticate (OAuth tokens come from the Web Login flow instead).
+    // authenticate (OAuth tokens come from the Web Login flow instead). This
+    // also selects the correct Google headers (x-goog-api-key / ?key=).
     let cfg = AiConfig {
         base_url,
         api_key,
-        model: model.clone(),
+        model: String::new(),
         provider: provider.clone(),
         api_key_enc: None,
         auth_method: AUTH_METHOD_KEY.to_string(),
@@ -897,22 +893,12 @@ pub async fn test_config(
         refresh_token_enc: None,
         token_expires_at: None,
     };
-    let resp = chat_completion(
-        &cfg,
-        vec![ChatMessage {
-            role: Role::User,
-            content: Some("Reply with exactly the single word: PONG".into()),
-            tool_call_id: None,
-            tool_calls: None,
-        }],
-        None,
-        Some(16),
-    )
-    .await?;
-    if resp.choices.is_empty() {
-        return Err("provider returned an empty response".into());
-    }
-    Ok(format!("Connected · {} · {}", provider, model))
+    let models = list_models(&cfg).await?;
+    Ok(format!(
+        "Connected · {} · {} models (endpoint + API key OK)",
+        provider,
+        models.len()
+    ))
 }
 
 #[derive(Serialize, Deserialize, Clone)]

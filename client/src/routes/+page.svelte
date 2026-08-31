@@ -511,18 +511,36 @@
   }
   async function deleteProvider(id: string) {
     if (!confirm("Delete this provider?")) return;
+    const doomed = savedProviders.find((p: any) => p.id === id);
     try {
       await call("delete_provider", { id });
+      if (doomed?.model) {
+        const s = new Set(enabledModels);
+        s.delete(doomed.model);
+        enabledModels = [...s];
+      }
       await loadProviders();
+      modelsList = [];
+      await loadModels();
       notify("Provider deleted");
     } catch (e) {
       notify(`Failed to delete: ${e}`, "err");
     }
   }
   async function toggleProvider(id: string, enabled: boolean) {
+    const target = savedProviders.find((p: any) => p.id === id);
     try {
       await call("toggle_provider", { id, enabled });
+      if (target?.model) {
+        const s = new Set(enabledModels);
+        if (!enabled) s.delete(target.model);
+        else if (!s.has(target.model) && isToolCapable(target.model)) s.add(target.model);
+        enabledModels = [...s];
+      }
       await loadProviders();
+      // refresh the Models list so disabled providers' fetched models disappear
+      modelsList = [];
+      await loadModels();
     } catch (e) {
       notify(`Failed to toggle: ${e}`, "err");
     }

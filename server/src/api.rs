@@ -307,6 +307,61 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
                 Err(e) => err(e),
             }
         }
+        "list_providers" => run_blocking(|| {
+            let providers = puppetterm_core::ai::load_providers()?;
+            let views: Vec<Value> = providers
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "id": p.id,
+                        "label": p.label,
+                        "base_url": p.base_url,
+                        "model": p.model,
+                        "provider": p.provider,
+                        "auth_method": p.auth_method,
+                        "enabled": p.enabled,
+                        "has_api_key": !p.api_key.is_empty(),
+                    })
+                })
+                .collect();
+            Ok(json!({ "providers": views }))
+        })
+        .await,
+        "add_provider" => run_blocking(move || {
+            let label = arg_str(&args, "label");
+            let base_url = arg_str(&args, "base_url");
+            let model = arg_str(&args, "model");
+            let provider = args.get("provider").and_then(|v| v.as_str()).map(String::from);
+            let api_key = args.get("api_key").and_then(|v| v.as_str()).map(String::from);
+            let auth_method = args.get("auth_method").and_then(|v| v.as_str()).map(String::from);
+            let oauth: Option<puppetterm_core::ai::AiOAuthMeta> = args
+                .get("oauth")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let p = puppetterm_core::ai::add_saved_provider(
+                label, base_url, model, provider, api_key, auth_method, oauth,
+            )?;
+            Ok(json!({ "id": p.id }))
+        })
+        .await,
+        "delete_provider" => run_blocking(move || {
+            let id = arg_str(&args, "id");
+            if id.is_empty() {
+                return Err("id is required".into());
+            }
+            puppetterm_core::ai::delete_saved_provider(&id)?;
+            Ok(json!(null))
+        })
+        .await,
+        "toggle_provider" => run_blocking(move || {
+            let id = arg_str(&args, "id");
+            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            if id.is_empty() {
+                return Err("id is required".into());
+            }
+            puppetterm_core::ai::toggle_saved_provider(&id, enabled)?;
+            Ok(json!(null))
+        })
+        .await,
         "delete_ai_config" => run_blocking(|| {
             puppetterm_core::ai::delete_config()?;
             Ok(json!(null))

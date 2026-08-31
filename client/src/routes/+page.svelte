@@ -229,15 +229,17 @@
     if (preset) for (const m of preset.models) set.add(m);
     for (const m of toolCapableModels) set.add(m);
     for (const p of savedProviders) if (p.enabled && p.model) set.add(p.model);
-    // Don't automatically keep the current model if it's disabled — it should disappear
+    if (aiModel && aiModel.trim()) set.add(aiModel.trim());
     let arr = [...set];
     if (modelsList.length > 0) {
       const enabled = new Set(enabledModels);
+      if (aiModel) enabled.add(aiModel);
       arr = arr.filter((m) => enabled.has(m));
       return arr.sort();
     }
     if (enabledModels.length > 0) {
       const enabled = new Set(enabledModels);
+      if (aiModel) enabled.add(aiModel);
       arr = arr.filter((m) => enabled.has(m));
     }
     return arr.sort();
@@ -485,9 +487,24 @@
       // Models come only from saved providers. If none are saved, don't fetch
       // from a possibly-orphaned active config — show the configure hint instead.
       if (savedProviders.length === 0) {
-        modelsList = [];
-        modelFreeMap = {};
-        modelsError = null;
+        if (aiHasKey || aiReady) {
+          try {
+            const r = await call<any>("list_ai_models");
+            const raw = r.models ?? [];
+            const all = new Set<string>();
+            for (const m of raw) {
+              const id = typeof m === "string" ? m : m.id;
+              if (id) all.add(id);
+            }
+            modelsList = [...all];
+          } catch {
+            modelsList = [];
+          }
+        } else {
+          modelsList = [];
+          modelFreeMap = {};
+          modelsError = null;
+        }
         return;
       }
       const enabled = savedProviders.filter((p: any) => p.enabled);
@@ -908,7 +925,7 @@
   // Messages route to the pinned task's host when one is running, else the
   // active host (so streaming during a tab switch lands in the right chat).
   function pushChat(role: string, text: string) {
-    const host = chatTarget?.host ? chatHostOf(chatTarget.host) : (activeHost ?? "__local__");
+    const host = chatTarget != null ? chatHostOf(chatTarget.host) : chatHostOf(activeHost);
     appendChat(host, role, text);
   }
 
@@ -1064,7 +1081,11 @@
   function chatConfigFor(host: string | null | undefined, cwd?: string | null) {
     const hasAgent = hostHasAgent(host);
     const tools = hasAgent ? AGENT_TOOLS : TERMINAL_ONLY_TOOLS;
-    const base = hasAgent ? AGENT_SYSTEM_PROMPT : TERMINAL_SYSTEM_PROMPT;
+    const base = !host
+      ? LOCAL_SYSTEM_PROMPT
+      : hasAgent
+        ? AGENT_SYSTEM_PROMPT
+        : TERMINAL_SYSTEM_PROMPT;
     // History is a terminal app's working context, NOT ground truth. Explicitly
     // tell the model to re-query the live server rather than trust stale chat
     // or activity output — keeps it honest about current config and avoids
@@ -1072,7 +1093,7 @@
     const historyCaveat =
       "\n\nHISTORY IS EPHEMERAL — the chat and Activity log are working context only, never the source of truth about the server. Do NOT treat prior tool output or chat history as the host's CURRENT state. Whenever you need current config or status, re-query the LIVE server with the tools (run_command / config / snapshot / service, or the terminal tool). This is a terminal app: trust the server's CURRENT state, not stale history.";
     const cwdLine = cwd
-      ? `\n\nYou are currently working in the directory \`${cwd}\` on ${host || "this host"}. Prefer commands relative to that directory (or reference the full path) when the user asks about files/folders there.`
+      ? `\n\nYou are currently working in the directory \`${cwd}\` on ${host || "the local terminal"}. Prefer commands relative to that directory (or reference the full path) when the user asks about files/folders there.`
       : "";
     const prompt = base + historyCaveat + cwdLine;
     return { tools, prompt, hasAgent };
@@ -1080,6 +1101,19 @@
 
   // Agent-aware system prompts: the AI is told which mode it's in so it uses
   // the right tools instead of guessing.
+  const LOCAL_SYSTEM_PROMPT =
+    "You are puppetterm, an AI assistant inside a terminal app.\n\n" +
+    "LOCAL CONTAINER ENVIRONMENT: You are attached to the LOCAL container shell session " +
+    "(user `pp` inside the puppetterm container), NOT a remote SSH target server. " +
+    "Do NOT attempt to modify, reconfigure, or perform system administration / management tasks on " +
+    "this local container environment. If the user asks to manage a server or perform system administration, " +
+    "advise them to connect to their remote target host via SSH (e.g. `ssh user@host`).\n\n" +
+    "You can answer general questions, help formulate commands, inspect the local terminal screen using " +
+    "`read_terminal`, or assist the user in connecting to a remote SSH target.\n\n" +
+    "ANSWER QUESTIONS FIRST. When the user asks a question, answer it directly from your own " +
+    "knowledge in text BEFORE calling any tool. Only run a command when genuinely requested. " +
+    "Before running anything, explain in text what you'll run and why. Be concise.";
+
   const TERMINAL_SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
     "using the provided tools.\n\n" +
@@ -1165,7 +1199,7 @@
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
-  const SYSTEM_PROMPT = TERMINAL_SYSTEM_PROMPT; // default until a host is detected
+  const SYSTEM_PROMPT = LOCAL_SYSTEM_PROMPT; // default until a host is detected
 
   const TOOL_TO_ACTION: Record<string, string> = {
     run_command: "run",
@@ -2203,61 +2237,67 @@
     // prompt carries it, e.g. `user@host:/opt/docker/mcp-rag$`).
     const dir = cwdFromPrompt(last);
     if (dir) t.cwd = dir;
+    const recent = lines.slice(Math.max(0, li - 15), li + 1).join("\n");
+
     // If the remote session has ended (e.g. the user typed `exit`, or ssh
     // dropped), OpenSSH prints "Connection to <host> closed." — forget the
     // host so the status dot turns grey and the AI no longer targets it.
-    // (The pty itself stays alive — it's the local shell — so pty-exit never
-    // fires here; this is the reliable signal.)
     if (t.host) {
-      const recent = lines.slice(Math.max(0, li - 12), li + 1).join("\n");
       if (/Connection (?:to .+? )?(?:closed|reset)|closed by remote host|Connection reset/i.test(recent)) {
         agentChecked.delete(t.host);
         t.host = "";
         return;
       }
     }
-    // A host may already be known WITHOUT an `ssh` line in the buffer — e.g.
-    // when connected directly via the host menu (`openTab(host)`), which starts
-    // the session over SSH without echoing the command into the pty. In that
-    // case we MUST still probe for the agent, or the app would stay stuck in
-    // terminal mode even though the agent is installed.
+    // Check if recent output contains an explicit SSH failure error
+    const sshFailed = /ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection timed out/i.test(recent);
+
+    // 1) If user typed `ssh <target>` (stored in pendingSshTarget), process it
+    // even if t.host was set, so a new or corrected ssh command updates t.host.
+    if (t.pendingSshTarget) {
+      const target = t.pendingSshTarget;
+      t.pendingSshTarget = undefined;
+      if (!sshFailed) {
+        t.host = target;
+        checkAndHintAgent(id, t.host);
+      } else if (t.host === target) {
+        agentChecked.delete(t.host);
+        t.host = "";
+      }
+      return;
+    }
+
+    // 2) If a host connection failed recently and prompt is back at local shell, clear stale target
+    if (sshFailed && t.host) {
+      const failedTargetMatch = recent.match(/ssh: (?:connect to host|Could not resolve|Name or service not known) ([^\s:]+)/i);
+      const failedHost = failedTargetMatch?.[1];
+      if (!failedHost || t.host.includes(failedHost)) {
+        agentChecked.delete(t.host);
+        t.host = "";
+        return;
+      }
+    }
+
+    // 3) A host is already known (e.g. host menu or active SSH session) and no pending target/failure — probe agent if needed
     if (t.host) {
       checkAndHintAgent(id, t.host); // idempotent per host per session
       return;
     }
-    // 1) If user typed `ssh <target>` (stored in pendingSshTarget), verify
-    //    the current prompt matches that target — this handles manual ssh
-    //    connections where the command isn't echoed in the PTY output.
-    if (t.pendingSshTarget) {
-      const promptHostMatch = last.match(/@([^:]+):/);
-      const promptHost = promptHostMatch?.[1] ?? "";
-      const targetHost = t.pendingSshTarget.includes("@")
-        ? t.pendingSshTarget.split("@").pop() ?? t.pendingSshTarget
-        : t.pendingSshTarget;
-      if (promptHost && (promptHost === targetHost || promptHost.endsWith("." + targetHost))) {
-        t.host = t.pendingSshTarget;
-        t.pendingSshTarget = undefined;
-        checkAndHintAgent(id, t.host);
-        return;
-      }
-      // Prompt doesn't match — connection failed or wrong target; keep pending
-      // so a subsequent successful connection can still match, but don't scan
-      // the buffer for other ssh commands (would pick up the failed one).
-      return;
-    }
-    // 2) No pending target — scan buffer for recalled `ssh <target>` (e.g.
-    //    history recall where the command never passed through onData).
-    for (let i = li; i >= 0; i--) {
-      const target = detectSshFromLine(lines[i]);
-      if (target) {
-        const promptHostMatch = last.match(/@([^:]+):/);
-        const promptHost = promptHostMatch?.[1] ?? "";
-        const targetHost = target.includes("@") ? target.split("@").pop() ?? target : target;
-        if (promptHost && (promptHost === targetHost || promptHost.endsWith("." + targetHost))) {
+
+    // 4) No host tracked — scan buffer for recalled `ssh <target>` from scrollback,
+    // stopping if we hit a closed connection message (so past exited sessions aren't re-detected).
+    if (!sshFailed) {
+      for (let i = li; i >= 0; i--) {
+        const line = lines[i];
+        if (/Connection (?:to .+? )?(?:closed|reset)|closed by remote host|Connection reset/i.test(line)) {
+          break;
+        }
+        const target = detectSshFromLine(line);
+        if (target) {
           if (t.host !== target) t.host = target;
           checkAndHintAgent(id, t.host); // idempotent per host per session
+          return;
         }
-        return;
       }
     }
   }
@@ -2881,6 +2921,7 @@
       }
       await loadHosts();
       loadActivity();
+      try { await loadProviders(); } catch {}
       try {
         const v = await call<any>("get_ai_config");
         aiBaseUrl = v.base_url;
@@ -2900,6 +2941,7 @@
         aiReady = true;
         if (aiProvider === "openai") customBaseUrl = v.base_url || "";
         setHistory(chatHostOf(activeHost), [{ role: "system", content: SYSTEM_PROMPT }]);
+        loadModels().catch(() => {});
       } catch (e) {
         console.warn("ai config unavailable:", e);
       }
@@ -3068,7 +3110,7 @@
           <div class="approval-cmd">
             {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
             <div class="approval-host">
-              {pendingApproval.danger ? 'on ' : 'on '}{chatTarget?.host ?? activeHost}
+              on {(chatTarget?.host || activeHost) || "local terminal"}
             </div>
           </div>
           <div class="approval-btns">

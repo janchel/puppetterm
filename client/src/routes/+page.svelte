@@ -2630,21 +2630,27 @@
     // stable-window approach (fast commands, no giant streams).
     const isRead = isFileReadCommand(cmd);
     const deadline = Date.now() + (isRead ? 60000 : 30000);
-    const stableMs = isRead ? 2500 : 800;
     const lastLine = (s: string) => (s.split("\n").filter(Boolean).pop() ?? "").trimEnd();
     const isPromptLine = (s: string) => /[$#>]\s*$/.test(s);
     let last = terminalText(term, 2000);
     let stableSince = Date.now();
     let markerLine = -1;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 200));
       const nowText = terminalText(term, 2000);
       const line = lastLine(nowText);
-      markerLine = lastLineStartingWith(term, markerPrefix);
-      // Prompt returned after the echo + output → command is done.
-      if (isRead && markerLine >= 0 && isPromptLine(line)) break;
+      const foundMarker = lastLineStartingWith(term, markerPrefix);
+      if (foundMarker >= 0) markerLine = foundMarker;
+
+      // Primary completion: AI marker rendered AND shell prompt returned after command output
+      if (markerLine >= 0 && isPromptLine(line)) {
+        await new Promise((r) => setTimeout(r, 100));
+        break;
+      }
+
+      // Fallback completion: output has stopped changing for 1.5s AFTER marker rendered
       if (nowText === last) {
-        if (Date.now() - stableSince > stableMs) break;
+        if (markerLine >= 0 && Date.now() - stableSince > 1500) break;
       } else {
         last = nowText;
         stableSince = Date.now();

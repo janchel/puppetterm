@@ -2197,93 +2197,117 @@
     return clean && (clean.startsWith("/") || clean.startsWith("~")) ? clean : null;
   }
 
+  function extractUserHostFromPrompt(line: string): { user: string; host: string; full: string } | null {
+    const m = line.match(/(?:^|[\s\[\(])([A-Za-z0-9_.\-]+)@([A-Za-z0-9_.\-]+)(?:[:\s\]\)]|\s*[$#>])/);
+    if (!m) return null;
+    return { user: m[1], host: m[2], full: `${m[1]}@${m[2]}` };
+  }
+
   /** Detect an ssh target from what's on screen. This catches commands that
    *  never passed through onData — e.g. recalled with the up-arrow — because
    *  the shell echoes them into the pty output. Only scans when the shell is
    *  back at a prompt (i.e. the connection has been established / command done).
-   *  This is ALSO where the agent check/hint happens (once per host per
-   *  session), so on password-only remotes the check runs only after the user's
-   *  interactive ssh has authenticated and created the ControlMaster socket. */
+   *  Supports nested SSH sessions (e.g. hostA -> hostB) and automatically
+   *  restores parent host context when nested sessions exit. */
   function maybeDetectSshFromBuffer(id: number) {
     const t = tabs.find((x) => x.id === id);
     const term = termByTab.get(id)?.term;
     if (!t || !term) return;
-    // Scan a generous window: a recalled `ssh …` can sit many lines up in the
-    // buffer behind a long MOTD/scrollback (especially after history recall,
-    // where the command never passes through onData).
+
     const lines = terminalText(term, 200).split("\n");
-    // The shell prompt is the last non-empty line (a trailing blank line can
-    // follow the prompt, e.g. after a redraw — skip it before gating).
     let li = lines.length - 1;
     while (li >= 0 && lines[li].trim() === "") li--;
     const last = (lines[li] ?? "").trim();
-    if (!/[\$#>] ?$/.test(last)) return; // only when at a shell prompt
-    // Track the working directory so the AI knows WHERE it's working (the
-    // prompt carries it, e.g. `user@host:/opt/docker/mcp-rag$`).
+    if (!/[\$#>] ?$/.test(last)) return; // only evaluate when at a shell prompt
+
     const dir = cwdFromPrompt(last);
     if (dir) t.cwd = dir;
     const recent = lines.slice(Math.max(0, li - 15), li + 1).join("\n");
+    const promptInfo = extractUserHostFromPrompt(last);
 
-    // If the remote session has ended (e.g. the user typed `exit`, or ssh
-    // dropped), OpenSSH prints "Connection to <host> closed." — forget the
-    // host so the status dot turns grey and the AI no longer targets it.
-    if (t.host) {
-      if (/Connection (?:to .+? )?(?:closed|reset)|closed by remote host|Connection reset/i.test(recent)) {
-        agentChecked.delete(t.host);
-        t.host = "";
-        return;
-      }
-    }
     // Check if recent output contains an explicit SSH failure error
     const sshFailed = /ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection timed out/i.test(recent);
 
-    // 1) If user typed `ssh <target>` (stored in pendingSshTarget), process it
-    // even if t.host was set, so a new or corrected ssh command updates t.host.
+    // 1) Explicit pending SSH target typed by user takes priority
     if (t.pendingSshTarget) {
       const target = t.pendingSshTarget;
       t.pendingSshTarget = undefined;
       if (!sshFailed) {
-        t.host = target;
+        if (t.host !== target) {
+          if (t.host) agentChecked.delete(t.host);
+          t.host = target;
+        }
         checkAndHintAgent(id, t.host);
-      } else if (t.host === target) {
-        agentChecked.delete(t.host);
-        t.host = "";
-      }
-      return;
-    }
-
-    // 2) If a host connection failed recently and prompt is back at local shell, clear stale target
-    if (sshFailed && t.host) {
-      const failedTargetMatch = recent.match(/ssh: (?:connect to host|Could not resolve|Name or service not known) ([^\s:]+)/i);
-      const failedHost = failedTargetMatch?.[1];
-      if (!failedHost || t.host.includes(failedHost)) {
-        agentChecked.delete(t.host);
-        t.host = "";
         return;
       }
     }
 
-    // 3) A host is already known (e.g. host menu or active SSH session) and no pending target/failure — probe agent if needed
-    if (t.host) {
-      checkAndHintAgent(id, t.host); // idempotent per host per session
-      return;
+    // 2) Scan scrollback backwards from current prompt line `li` to find the
+    // active SSH session in the nested connection chain.
+    let activeHost: string | null = null;
+    const closedHosts = new Set<string>();
+    let unassignedClosedCount = 0;
+
+    for (let i = li; i >= 0; i--) {
+      const line = lines[i];
+
+      // Track connection closures (e.g. "Connection to 192.168.150.34 closed.")
+      const closedMatch = line.match(/Connection (?:to ([^\s:]+) )?(?:closed|reset)|closed by remote host|Connection reset/i);
+      if (closedMatch) {
+        if (closedMatch[1]) {
+          closedHosts.add(closedMatch[1]);
+        } else {
+          unassignedClosedCount++;
+        }
+        continue;
+      }
+
+      // Check if line contains an ssh target command
+      const target = detectSshFromLine(line);
+      if (target) {
+        const targetHost = target.includes("@") ? target.split("@").pop()?.split(":")[0] ?? target : target.split(":")[0];
+
+        // Skip if this host connection was closed below this line
+        if (closedHosts.has(targetHost) || Array.from(closedHosts).some((ch) => target.includes(ch))) {
+          continue;
+        }
+
+        // Skip if an unassigned disconnection marker was encountered below this line
+        if (unassignedClosedCount > 0) {
+          unassignedClosedCount--;
+          continue;
+        }
+
+        // Skip if this ssh command failed immediately
+        const peekBelow = lines.slice(i, Math.min(lines.length, i + 10)).join("\n");
+        if (/ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection timed out/i.test(peekBelow)) {
+          continue;
+        }
+
+        // We found the active SSH session for the current shell prompt!
+        activeHost = target;
+        break;
+      }
     }
 
-    // 4) No host tracked — scan buffer for recalled `ssh <target>` from scrollback,
-    // stopping if we hit a closed connection message (so past exited sessions aren't re-detected).
-    if (!sshFailed) {
-      for (let i = li; i >= 0; i--) {
-        const line = lines[i];
-        if (/Connection (?:to .+? )?(?:closed|reset)|closed by remote host|Connection reset/i.test(line)) {
-          break;
-        }
-        const target = detectSshFromLine(line);
-        if (target) {
-          if (t.host !== target) t.host = target;
-          checkAndHintAgent(id, t.host); // idempotent per host per session
-          return;
-        }
+    // 3) Fallback prompt verification: if prompt is user@host (and user is not "pp"),
+    // verify/fallback to prompt host if scrollback didn't yield an explicit command.
+    if (!activeHost && promptInfo && promptInfo.user !== "pp") {
+      if (t.host && t.host.includes(promptInfo.host)) {
+        activeHost = t.host;
+      } else {
+        activeHost = promptInfo.full;
       }
+    }
+
+    // 4) Sync host state and trigger agent probe if host changed
+    const newHost = activeHost ?? "";
+    if (t.host !== newHost) {
+      if (t.host) agentChecked.delete(t.host);
+      t.host = newHost;
+      if (t.host) checkAndHintAgent(id, t.host);
+    } else if (t.host) {
+      checkAndHintAgent(id, t.host);
     }
   }
 

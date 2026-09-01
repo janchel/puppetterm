@@ -272,10 +272,6 @@
     if (!showSettings) hasAutoFetchedModels = false;
   });
 
-  $effect(() => {
-    if (showSettings) loadProviders();
-  });
-
   function providersSnapshot() {
     return savedProviders.map((p: any) => ({
       id: p.id,
@@ -294,68 +290,60 @@
   function modelOwnerLabels(m: string): string {
     return (modelOwner[m] || []).map(providerLabelFor).join(", ");
   }
-  function captureSettingsSnapshot() {
-    initialSettingsSnapshot = JSON.stringify({
-      aiBaseUrl,
-      aiModel,
+
+  function getSettingsSnapshotString(): string {
+    return JSON.stringify({
+      aiBaseUrl: (aiBaseUrl || "").trim(),
+      aiModel: (aiModel || "").trim(),
       aiProvider,
       aiAuthMethod,
-      oauthAuthUrl,
-      oauthTokenUrl,
-      oauthClientId,
-      oauthScope,
-      oauthRedirectUri,
+      oauthAuthUrl: (oauthAuthUrl || "").trim(),
+      oauthTokenUrl: (oauthTokenUrl || "").trim(),
+      oauthClientId: (oauthClientId || "").trim(),
+      oauthScope: (oauthScope || "").trim(),
+      oauthRedirectUri: (oauthRedirectUri || "").trim(),
       oauthFlow,
       autonomy,
       themeName,
-      aiKey: aiKey ? "pending" : "",
+      aiKey: (aiKey || "").trim() ? "pending" : "",
       providers: providersSnapshot(),
     });
   }
+
+  function captureSettingsSnapshot() {
+    initialSettingsSnapshot = getSettingsSnapshotString();
+  }
+
   // Baseline the snapshot once the async populate (loadProviders) has finished,
-  // so Save reflects a true diff against loaded provider state rather than a
-  // pre-load empty form. Toggling a provider on/off then changes the snapshot
-  // and correctly enables Save / gives feedback.
+  // so Save reflects a true diff against loaded provider state.
   $effect(() => {
     if (!showSettings) {
       initialSettingsSnapshot = "";
       return;
     }
     let cancelled = false;
+    if (!oauthRedirectUri.trim() && typeof location !== "undefined") {
+      oauthRedirectUri = `${location.origin}/oauth/callback`;
+    }
     (async () => {
       try { await loadProviders(); } catch {}
       if (cancelled) return;
-      initialSettingsSnapshot = "";
       captureSettingsSnapshot();
     })();
     return () => {
       cancelled = true;
     };
   });
+
   let isSettingsDirty = $derived.by(() => {
     if (!showSettings || !initialSettingsSnapshot) return false;
     try {
-      const cur = JSON.stringify({
-        aiBaseUrl,
-        aiModel,
-        aiProvider,
-        aiAuthMethod,
-        oauthAuthUrl,
-        oauthTokenUrl,
-        oauthClientId,
-        oauthScope,
-        oauthRedirectUri,
-        oauthFlow,
-        autonomy,
-        themeName,
-        aiKey: aiKey ? "pending" : "",
-        providers: providersSnapshot(),
-      });
-      return cur !== initialSettingsSnapshot;
+      return getSettingsSnapshotString() !== initialSettingsSnapshot;
     } catch {
       return false;
     }
   });
+
   function tryCloseSettings() {
     if (isSettingsDirty && !confirm("You have unsaved changes — discard them?")) return;
     showSettings = false;
@@ -592,9 +580,6 @@
     } catch (e) {
       console.warn("load providers", e);
     }
-    // Base the dirty snapshot only after the async provider load settles,
-    // so Save reflects a true diff rather than a pre-load empty form.
-    if (showSettings) captureSettingsSnapshot();
   }
   async function addProvider() {
     if (addProviderBusy) return;
@@ -3290,8 +3275,8 @@
         </div>
         <div class="modal-body">
           <nav class="settings-nav">
-            <button class:active={activeSettingsTab === "api"} onclick={() => { activeSettingsTab = "api"; setAiAuthMethod("key"); }}>API Providers</button>
-            <button class:active={activeSettingsTab === "oauth"} onclick={() => { activeSettingsTab = "oauth"; setAiAuthMethod("oauth"); }}>Web Login</button>
+            <button class:active={activeSettingsTab === "api"} onclick={() => (activeSettingsTab = "api")}>API Providers</button>
+            <button class:active={activeSettingsTab === "oauth"} onclick={() => (activeSettingsTab = "oauth")}>Web Login</button>
             <button class:active={activeSettingsTab === "models"} onclick={() => (activeSettingsTab = "models")}>Models</button>
             <button class:active={activeSettingsTab === "general"} onclick={() => (activeSettingsTab = "general")}>General</button>
           </nav>

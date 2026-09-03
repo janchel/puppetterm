@@ -56,6 +56,11 @@ pub async fn require_basic_auth(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
+    // The OAuth callback is hit by the provider's redirect (no auth header),
+    // and only completes a CSRF-protected login — exempt it from basic auth.
+    if req.uri().path() == "/oauth/callback" {
+        return Ok(next.run(req).await);
+    }
     let expected = format!("{}:{}", creds.user, creds.pass);
     let ok = req
         .headers()

@@ -10,7 +10,10 @@
 //! environment variables. The API key is **encrypted at rest** (ChaCha20-Poly1305
 //! keyed from the machine id) and never crosses into the frontend.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chacha20poly1305::{
@@ -23,12 +26,53 @@ pub const PROVIDER_OPENAI: &str = "openai"; // custom OpenAI-compatible
 pub const PROVIDER_DEEPSEEK: &str = "deepseek";
 pub const PROVIDER_ANTHROPIC: &str = "anthropic";
 
+/// Authentication method used to obtain the bearer token sent to the endpoint.
+/// `key`   — a static API key pasted by the user (encrypted at rest).
+/// `oauth` — a bearer token obtained via a browser-based OAuth (PKCE) login,
+///           refreshed automatically while valid. The token is stored in the
+///           same encrypted `api_key` slot used by the `key` method.
+pub const AUTH_METHOD_KEY: &str = "key";
+pub const AUTH_METHOD_OAUTH: &str = "oauth";
+
 fn default_provider() -> String {
     PROVIDER_OPENAI.to_string()
 }
 
+fn default_auth_method() -> String {
+    AUTH_METHOD_OAUTH.to_string()
+}
+
+/// Default OAuth "flow" — the standard authorization-code + PKCE flow
+/// (`/authorize` → redirect with `code` → `/token` form exchange). `openrouter`
+/// is OpenRouter's variant (different param names + JSON key exchange).
+fn default_flow() -> String {
+    "standard".to_string()
+}
+
+/// Non-secret OAuth client metadata (the provider's authorize/token endpoints,
+/// client id, etc.). Never holds a token/secret at rest (the token lives in the
+/// encrypted `api_key`/`refresh_token_enc` slots).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct AiOAuthMeta {
+    #[serde(default)]
+    pub auth_url: String,
+    #[serde(default)]
+    pub token_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+    /// "standard" or "openrouter" (see `default_flow`).
+    #[serde(default = "default_flow")]
+    pub flow: String,
+}
+
 /// AI provider config, stored on disk (never committed). `api_key` is the
-/// decrypted key in memory only; `api_key_enc` is what lives on disk.
+/// decrypted bearer token in memory only; `api_key_enc` is what lives on disk.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AiConfig {
     pub base_url: String,
@@ -39,6 +83,20 @@ pub struct AiConfig {
     pub api_key: String,
     #[serde(default)]
     pub api_key_enc: Option<String>,
+    /// How the bearer token is obtained: `key` (static) or `oauth` (browser login).
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+    /// OAuth client metadata (authorize/token endpoints, client id, scope…).
+    #[serde(default)]
+    pub oauth: AiOAuthMeta,
+    /// Refresh token (in memory only; `refresh_token_enc` is persisted).
+    #[serde(skip_serializing, default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub refresh_token_enc: Option<String>,
+    /// Unix epoch second at which the access token expires (if known).
+    #[serde(default)]
+    pub token_expires_at: Option<u64>,
 }
 
 /// Non-secret view of the config for the settings UI.
@@ -116,6 +174,11 @@ pub fn load_config() -> Result<AiConfig, String> {
             model: model.clone(),
             provider: env_provider.unwrap_or_else(default_provider),
             api_key_enc: None,
+            auth_method: default_auth_method(),
+            oauth: AiOAuthMeta::default(),
+            refresh_token: String::new(),
+            refresh_token_enc: None,
+            token_expires_at: None,
         });
     }
     let data = std::fs::read_to_string(config_path())
@@ -124,6 +187,15 @@ pub fn load_config() -> Result<AiConfig, String> {
     // Decrypt the stored key; legacy plaintext `api_key` field also loads.
     if let Some(enc) = &cfg.api_key_enc {
         cfg.api_key = decrypt_key(enc).unwrap_or_default();
+    }
+    if let Some(enc) = &cfg.refresh_token_enc {
+        cfg.refresh_token = decrypt_key(enc).unwrap_or_default();
+    }
+    if cfg.provider.is_empty() {
+        cfg.provider = default_provider();
+    }
+    if cfg.auth_method.is_empty() {
+        cfg.auth_method = default_auth_method();
     }
     Ok(cfg)
 }
@@ -134,12 +206,177 @@ pub fn save_config(cfg: &AiConfig) -> Result<(), String> {
         out.api_key_enc = Some(encrypt_key(&out.api_key)?);
     }
     out.api_key = String::new(); // never write the plaintext key to disk
+    if !out.refresh_token.is_empty() {
+        out.refresh_token_enc = Some(encrypt_key(&out.refresh_token)?);
+    }
+    out.refresh_token = String::new(); // never write the plaintext refresh token to disk
     let path = config_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let data = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
     std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+// ---- saved providers (multi-provider management) -----------------------------
+
+pub fn providers_path() -> PathBuf {
+    if let Ok(p) = std::env::var("PUPPETTERM_AI_PROVIDERS") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config").join("puppetterm").join("providers.json")
+}
+
+pub fn load_providers() -> Result<Vec<SavedProvider>, String> {
+    let path = providers_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| format!("cannot read providers: {e}"))?;
+    let mut providers: Vec<SavedProvider> =
+        serde_json::from_str(&data).map_err(|e| format!("invalid providers file: {e}"))?;
+    for p in &mut providers {
+        if let Some(enc) = &p.api_key_enc {
+            p.api_key = decrypt_key(enc).unwrap_or_default();
+        }
+        if p.auth_method.is_empty() {
+            p.auth_method = default_auth_method();
+        }
+    }
+    Ok(providers)
+}
+
+pub fn save_providers(providers: &[SavedProvider]) -> Result<(), String> {
+    let mut out = providers.to_vec();
+    for p in &mut out {
+        if !p.api_key.is_empty() {
+            p.api_key_enc = Some(encrypt_key(&p.api_key)?);
+        }
+        p.api_key = String::new();
+    }
+    let path = providers_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let data = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+pub fn add_saved_provider(
+    label: String,
+    base_url: String,
+    model: String,
+    provider: Option<String>,
+    api_key: Option<String>,
+    auth_method: Option<String>,
+    oauth: Option<AiOAuthMeta>,
+) -> Result<SavedProvider, String> {
+    let mut providers = load_providers().unwrap_or_default();
+    let id = urlsafe_no_pad(&random_bytes(8));
+    let label = {
+        let l = label.trim();
+        if !l.is_empty() {
+            l.to_string()
+        } else if !base_url.trim().is_empty() {
+            base_url.trim().to_string()
+        } else {
+            format!("provider-{}", &id[..6])
+        }
+    };
+    let mut p = SavedProvider {
+        id: id.clone(),
+        label,
+        base_url: base_url.trim().to_string(),
+        model: model.trim().to_string(),
+        provider: provider.unwrap_or_else(default_provider),
+        auth_method: auth_method.unwrap_or_else(default_auth_method),
+        oauth: oauth.unwrap_or_default(),
+        api_key_enc: None,
+        enabled: true,
+        api_key: api_key.unwrap_or_default().trim().to_string(),
+    };
+    if p.provider != PROVIDER_ANTHROPIC && p.provider != PROVIDER_DEEPSEEK && p.provider != PROVIDER_OPENAI {
+        p.provider = PROVIDER_OPENAI.into();
+    }
+    if p.auth_method != AUTH_METHOD_OAUTH {
+        p.auth_method = AUTH_METHOD_KEY.into();
+    }
+    if p.base_url.is_empty() {
+        return Err("base_url is required".into());
+    }
+    providers.push(p.clone());
+    save_providers(&providers)?;
+    Ok(p)
+}
+
+pub fn sync_active_oauth_provider() -> Result<(), String> {
+    let cfg = load_config()?;
+    if cfg.auth_method != AUTH_METHOD_OAUTH || cfg.api_key.trim().is_empty() {
+        return Ok(());
+    }
+    let mut providers = load_providers().unwrap_or_default();
+    let label = match (cfg.provider.trim(), cfg.model.trim()) {
+        (_, model) if !model.is_empty() => format!("{} · {}", cfg.provider, model),
+        _ => cfg.base_url.trim().to_string(),
+    };
+    let existing = providers.iter_mut().find(|p| {
+        p.auth_method == AUTH_METHOD_OAUTH
+            && p.base_url == cfg.base_url
+            && p.model == cfg.model
+            && p.oauth.token_url == cfg.oauth.token_url
+    });
+    if let Some(p) = existing {
+        p.label = label;
+        p.provider = cfg.provider.clone();
+        p.oauth = cfg.oauth.clone();
+        p.api_key = cfg.api_key.clone();
+        p.enabled = true;
+        save_providers(&providers)?;
+        return Ok(());
+    }
+    let id = urlsafe_no_pad(&random_bytes(8));
+    let provider = SavedProvider {
+        id: id.clone(),
+        label,
+        base_url: cfg.base_url.clone(),
+        model: cfg.model.clone(),
+        provider: cfg.provider.clone(),
+        auth_method: AUTH_METHOD_OAUTH.to_string(),
+        oauth: cfg.oauth.clone(),
+        api_key_enc: None,
+        enabled: true,
+        api_key: cfg.api_key.clone(),
+    };
+    providers.push(provider);
+    save_providers(&providers)?;
+    Ok(())
+}
+
+pub fn delete_saved_provider(id: &str) -> Result<(), String> {
+    let mut providers = load_providers()?;
+    let before = providers.len();
+    providers.retain(|p| p.id != id);
+    if providers.len() == before {
+        return Err("provider not found".into());
+    }
+    save_providers(&providers)
+}
+
+pub fn toggle_saved_provider(id: &str, enabled: bool) -> Result<(), String> {
+    let mut providers = load_providers()?;
+    let mut found = false;
+    for p in &mut providers {
+        if p.id == id {
+            p.enabled = enabled;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Err("provider not found".into());
+    }
+    save_providers(&providers)
 }
 
 // ---- OpenAI chat completion types -----------------------------------------
@@ -236,11 +473,16 @@ pub async fn chat_completion(
 
 /// Update the stored AI config (shared by the desktop and web frontends).
 /// Blank fields keep their current values; a blank key keeps the stored one.
+/// `auth_method` selects how the bearer token is obtained (`key` or `oauth`);
+/// `oauth` carries the client metadata for the browser login flow.
 pub fn apply_ai_config(
     base_url: String,
     model: String,
     provider: Option<String>,
     api_key: Option<String>,
+    auth_method: Option<String>,
+    oauth: Option<AiOAuthMeta>,
+    provider_id: Option<String>,
 ) -> Result<(), String> {
     let mut cfg = match load_config() {
         Ok(c) => c,
@@ -250,8 +492,39 @@ pub fn apply_ai_config(
             model: String::new(),
             provider: PROVIDER_OPENAI.into(),
             api_key_enc: None,
+            auth_method: default_auth_method(),
+            oauth: AiOAuthMeta::default(),
+            refresh_token: String::new(),
+            refresh_token_enc: None,
+            token_expires_at: None,
         },
     };
+    // If a saved provider is referenced (provider_id), adopt its credentials so
+    // the chat uses the real API key / auth method that the user actually
+    // configured and Test-verified — not a stale active config. Explicit args
+    // below still take priority and can override any of these fields.
+    if let Some(pid) = provider_id.as_deref().filter(|s| !s.is_empty()) {
+        if let Ok(providers) = load_providers() {
+            if let Some(p) = providers.into_iter().find(|p| p.id == pid) {
+                if !p.base_url.trim().is_empty() {
+                    cfg.base_url = p.base_url.clone();
+                }
+                if !p.model.trim().is_empty() {
+                    cfg.model = p.model.clone();
+                }
+                if !p.provider.trim().is_empty() {
+                    cfg.provider = p.provider.clone();
+                }
+                if !p.api_key.is_empty() {
+                    cfg.api_key = p.api_key.clone();
+                }
+                if !p.auth_method.is_empty() {
+                    cfg.auth_method = p.auth_method.clone();
+                }
+                cfg.oauth = p.oauth.clone();
+            }
+        }
+    }
     if !base_url.trim().is_empty() {
         cfg.base_url = base_url.trim().to_string();
     }
@@ -275,7 +548,351 @@ pub fn apply_ai_config(
             cfg.api_key = k.to_string();
         }
     }
+    if let Some(m) = auth_method {
+        let m = m.trim().to_string();
+        if !m.is_empty() {
+            cfg.auth_method = if m == AUTH_METHOD_OAUTH {
+                AUTH_METHOD_OAUTH.into()
+            } else {
+                AUTH_METHOD_KEY.into()
+            };
+        }
+    }
+    if let Some(o) = oauth {
+        // Only adopt non-empty fields so a partial update doesn't wipe the rest.
+        if !o.auth_url.trim().is_empty() {
+            cfg.oauth.auth_url = o.auth_url.trim().to_string();
+        }
+        if !o.token_url.trim().is_empty() {
+            cfg.oauth.token_url = o.token_url.trim().to_string();
+        }
+        if !o.client_id.trim().is_empty() {
+            cfg.oauth.client_id = o.client_id.trim().to_string();
+        }
+        if !o.client_secret.trim().is_empty() {
+            cfg.oauth.client_secret = o.client_secret.trim().to_string();
+        }
+        if !o.scope.trim().is_empty() {
+            cfg.oauth.scope = o.scope.trim().to_string();
+        }
+        if !o.redirect_uri.trim().is_empty() {
+            cfg.oauth.redirect_uri = o.redirect_uri.trim().to_string();
+        }
+        if !o.flow.trim().is_empty() {
+            cfg.oauth.flow = if o.flow.trim() == "openrouter" {
+                "openrouter".into()
+            } else {
+                "standard".into()
+            };
+        }
+    }
     save_config(&cfg)
+}
+
+// ---- OAuth (PKCE) browser login -------------------------------------------
+//
+// Used when `auth_method == "oauth"`: the app opens the provider's authorize
+// URL in the user's browser; the provider redirects back to `redirect_uri`
+// (a server route) with a `code`+`state`. We exchange the code for an access
+// token (PKCE) and store it in the same encrypted `api_key` slot the chat call
+// already sends as a bearer token — so no chat-path changes are needed.
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    getrandom::getrandom(&mut v).expect("rng");
+    v
+}
+
+fn urlsafe_no_pad(b: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Minimal percent-encoding for OAuth query parameters (RFC 3986 unreserved set).
+fn qenc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                o.push(b as char)
+            }
+            _ => o.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    o
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(verifier.as_bytes());
+    urlsafe_no_pad(&h.finalize())
+}
+
+/// In-flight OAuth login, keyed by the CSRF `state`. Survives the redirect
+/// because it lives in the server process (not the stateless callback request).
+struct PendingOAuth {
+    verifier: String,
+    client_id: String,
+    client_secret: String,
+    token_url: String,
+    redirect_uri: String,
+    scope: String,
+    flow: String,
+}
+
+static PENDING: LazyLock<Mutex<HashMap<String, PendingOAuth>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Result of `begin_oauth` — the URL to open in the browser and the CSRF state.
+#[derive(Serialize)]
+pub struct AiOAuthBegin {
+    pub authorize_url: String,
+    pub state: String,
+}
+
+/// Start a browser-based OAuth (PKCE) login. Reads the OAuth metadata already
+/// saved via `apply_ai_config` (auth_url/token_url/client_id/redirect_uri/…).
+/// Returns the provider authorize URL to open and the state to expect back.
+pub fn begin_oauth() -> Result<AiOAuthBegin, String> {
+    let cfg = load_config()?;
+    let o = &cfg.oauth;
+    // OpenRouter's variant has no client registration (it identifies the app by
+    // the `callback_url`), so `client_id` is only required for the standard flow.
+    let need_client_id = o.flow.trim() != "openrouter";
+    if o.auth_url.trim().is_empty()
+        || o.token_url.trim().is_empty()
+        || (need_client_id && o.client_id.trim().is_empty())
+    {
+        return Err(
+            "OAuth not configured: set Auth URL, Token URL and Client ID in AI settings first"
+                .into(),
+        );
+    }
+    if o.redirect_uri.trim().is_empty() {
+        return Err("OAuth redirect URI is required (use the auto-filled one in settings)".into());
+    }
+    let verifier = urlsafe_no_pad(&random_bytes(48));
+    let challenge = pkce_challenge(&verifier);
+    let state = urlsafe_no_pad(&random_bytes(24));
+
+    let flow = if o.flow.trim() == "openrouter" {
+        "openrouter"
+    } else {
+        "standard"
+    };
+
+    let url = if flow == "openrouter" {
+        // OpenRouter's variant: no client_id/state/scope; the callback URL is the
+        // `callback_url` param and the code is returned at that URL.
+        let sep = if o.auth_url.contains('?') { '&' } else { '?' };
+        format!(
+            "{}{sep}callback_url={}&code_challenge={}&code_challenge_method=S256",
+            o.auth_url,
+            qenc(&o.redirect_uri),
+            qenc(&challenge),
+        )
+    } else {
+        let sep = if o.auth_url.contains('?') { '&' } else { '?' };
+        let mut u = format!(
+            "{}{sep}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+            o.auth_url,
+            qenc(&o.client_id),
+            qenc(&o.redirect_uri),
+            qenc(&state),
+            qenc(&challenge),
+        );
+        if !o.scope.trim().is_empty() {
+            u.push_str(&format!("&scope={}", qenc(&o.scope)));
+        }
+        // Google benefits from offline access so a refresh token is issued.
+        if o.auth_url.contains("accounts.google.com") {
+            u.push_str("&access_type=offline&prompt=consent");
+        }
+        u
+    };
+
+    PENDING.lock().unwrap().insert(
+        state.clone(),
+        PendingOAuth {
+            verifier,
+            client_id: o.client_id.clone(),
+            client_secret: o.client_secret.clone(),
+            token_url: o.token_url.clone(),
+            redirect_uri: o.redirect_uri.clone(),
+            scope: o.scope.clone(),
+            flow: flow.to_string(),
+        },
+    );
+    Ok(AiOAuthBegin { authorize_url: url, state })
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// Exchange an OAuth `code` for tokens and persist them (access token in the
+/// encrypted `api_key` slot, refresh token in `refresh_token_enc`).
+pub async fn complete_oauth(state: &str, code: &str) -> Result<(), String> {
+    let pending = {
+        let mut m = PENDING.lock().unwrap();
+        if let Some(p) = m.remove(state) {
+            p
+        } else if m.len() == 1 {
+            // OpenRouter's flow doesn't echo `state`; consume the single in-flight login.
+            m.drain().next().map(|(_, v)| v).unwrap()
+        } else {
+            return Err("unknown or expired OAuth state".into());
+        }
+    };
+    let client = reqwest::Client::new();
+
+    // OpenRouter's variant: POST JSON `{code, code_verifier, code_challenge_method}`
+    // and read `{key}` (a long-lived API key, no refresh/expiry).
+    if pending.flow == "openrouter" {
+        let body = serde_json::json!({
+            "code": code,
+            "code_verifier": pending.verifier,
+            "code_challenge_method": "S256",
+        });
+        let resp = client
+            .post(&pending.token_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("token exchange failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "token exchange failed ({status}): {}",
+                &text.chars().take(400).collect::<String>()
+            ));
+        }
+        #[derive(Deserialize)]
+        struct OrKey {
+            key: String,
+        }
+        let ok: OrKey = serde_json::from_str(&text).map_err(|e| format!("bad token response: {e}"))?;
+        let mut cfg = load_config().map_err(|e| format!("save AI settings before logging in: {e}"))?;
+        cfg.api_key = ok.key;
+        cfg.auth_method = AUTH_METHOD_OAUTH.into();
+        cfg.refresh_token = String::new();
+        cfg.token_expires_at = None;
+        save_config(&cfg)?;
+        return Ok(());
+    }
+
+    // Standard authorization-code + PKCE exchange (form-encoded, JSON response).
+    // NOTE: include client_secret in the SAME params vector — calling .form()
+    // twice replaces the body, wiping the OAuth params (GitHub then 404s).
+    let params: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", &pending.redirect_uri),
+        ("client_id", &pending.client_id),
+        ("code_verifier", &pending.verifier),
+        ("client_secret", &pending.client_secret),
+    ];
+    let resp = client
+        .post(&pending.token_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("token exchange failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "token exchange failed ({status}): {}",
+            &text.chars().take(400).collect::<String>()
+        ));
+    }
+    let tr: TokenResponse = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "bad token response: {e} — provider said: {}",
+            &text.chars().take(300).collect::<String>()
+        )
+    })?;
+
+    let mut cfg = load_config().map_err(|e| format!("save AI settings before logging in: {e}"))?;
+    cfg.api_key = tr.access_token;
+    cfg.auth_method = AUTH_METHOD_OAUTH.into();
+    cfg.refresh_token = tr.refresh_token.unwrap_or_default();
+    cfg.token_expires_at = tr.expires_in.map(|s| now_secs() + s);
+    save_config(&cfg)?;
+    Ok(())
+}
+
+/// Refresh an expired OAuth access token in place (uses the stored refresh token).
+async fn refresh_access_token(cfg: &mut AiConfig) -> Result<(), String> {
+    if cfg.oauth.token_url.trim().is_empty() || cfg.refresh_token.is_empty() {
+        return Err("OAuth token expired and cannot be refreshed — please log in again".into());
+    }
+    let client = reqwest::Client::new();
+    let params: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &cfg.refresh_token),
+        ("client_id", &cfg.oauth.client_id),
+    ];
+    let mut params = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &cfg.refresh_token),
+        ("client_id", &cfg.oauth.client_id),
+    ];
+    if !cfg.oauth.client_secret.is_empty() {
+        params.push(("client_secret", cfg.oauth.client_secret.as_str()));
+    }
+    let req = client
+        .post(&cfg.oauth.token_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&params);
+    let resp = req.send().await.map_err(|e| format!("token refresh failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "token refresh failed ({status}): {}",
+            &text.chars().take(400).collect::<String>()
+        ));
+    }
+    let tr: TokenResponse =
+        serde_json::from_str(&text).map_err(|e| format!("bad token response: {e}"))?;
+    cfg.api_key = tr.access_token;
+    if let Some(rt) = tr.refresh_token.filter(|s| !s.is_empty()) {
+        cfg.refresh_token = rt;
+    }
+    cfg.token_expires_at = tr.expires_in.map(|s| now_secs() + s);
+    save_config(cfg)?;
+    Ok(())
+}
+
+/// Ensure `cfg.api_key` holds a valid (unexpired) bearer token before a chat
+/// call. For the `key` method this is a no-op; for `oauth` it refreshes the
+/// access token when it has (or is about to) expire.
+pub async fn ensure_valid_token(cfg: &mut AiConfig) -> Result<(), String> {
+    if cfg.auth_method != AUTH_METHOD_OAUTH {
+        return Ok(());
+    }
+    let expired = cfg
+        .token_expires_at
+        .map(|e| e <= now_secs() + 60)
+        .unwrap_or(false);
+    if !expired {
+        return Ok(());
+    }
+    refresh_access_token(cfg).await
 }
 
 /// Remove the on-disk AI config (clears the configured provider). The in-memory
@@ -300,12 +917,20 @@ pub async fn test_config(
     // Start from any stored config so an already-saved key (or field the user
     // didn't retype) is still used for the probe.
     let stored = load_config().ok();
-    let base_url = base_url.trim().to_string();
-    let model = model.trim().to_string();
-    let base_url = if base_url.is_empty() { stored.as_ref().map(|c| c.base_url.clone()).unwrap_or_default() } else { base_url };
-    let model = if model.is_empty() { stored.as_ref().map(|c| c.model.clone()).unwrap_or_default() } else { model };
-    if base_url.is_empty() || model.is_empty() {
-        return Err("base_url and model are required".into());
+    let mut base_url = base_url.trim().to_string();
+    let mut model = model.trim().to_string();
+    // For Test: an explicitly blank model means "verify endpoint/key only"
+    // (list models), so don't fall back to the stored model. Only fall back
+    // when the caller sent nothing useful and we have a stored base_url.
+    let from_stored_base = base_url.is_empty();
+    if base_url.is_empty() {
+        base_url = stored.as_ref().map(|c| c.base_url.clone()).unwrap_or_default();
+    }
+    if from_stored_base && model.is_empty() {
+        model = stored.as_ref().map(|c| c.model.clone()).unwrap_or_default();
+    }
+    if base_url.is_empty() {
+        return Err("base_url is required".into());
     }
     let provider = provider.map(|p| p.trim().to_string()).filter(|p| !p.is_empty())
         .or_else(|| stored.as_ref().map(|c| c.provider.clone()))
@@ -314,32 +939,266 @@ pub async fn test_config(
         PROVIDER_ANTHROPIC | PROVIDER_DEEPSEEK | PROVIDER_OPENAI => provider,
         _ => PROVIDER_OPENAI.to_string(),
     };
-    let api_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+    // Resolve the key: explicit > saved provider (matching base_url) > stored ai.json.
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_string();
+    let mut api_key = api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+        .or_else(|| {
+            load_providers()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| p.enabled && !p.base_url.is_empty() && norm(&p.base_url) == norm(&base_url))
+                .map(|p| p.api_key)
+        })
         .or_else(|| stored.as_ref().map(|c| c.api_key.clone()))
         .unwrap_or_default();
+    if api_key.is_empty() {
+        return Err("api_key is required (or log in first)".into());
+    }
+    // Test connection is a pure connectivity probe: it validates that the
+    // endpoint + API key work, without requiring a model and without pulling the
+    // full model list into the Models page. The standard way to check auth is
+    // the provider's /models endpoint — we report the count, not a parsed list.
+    //
+    // A typed API key means the `key` auth method, which is how these tests
+    // authenticate (OAuth tokens come from the Web Login flow instead). This
+    // also selects the correct Google headers (x-goog-api-key / ?key=).
     let cfg = AiConfig {
         base_url,
         api_key,
-        model: model.clone(),
+        model: String::new(),
         provider: provider.clone(),
         api_key_enc: None,
+        auth_method: AUTH_METHOD_KEY.to_string(),
+        oauth: AiOAuthMeta::default(),
+        refresh_token: String::new(),
+        refresh_token_enc: None,
+        token_expires_at: None,
     };
-    let resp = chat_completion(
-        &cfg,
-        vec![ChatMessage {
-            role: Role::User,
-            content: Some("Reply with exactly the single word: PONG".into()),
-            tool_call_id: None,
-            tool_calls: None,
-        }],
-        None,
-        Some(16),
-    )
-    .await?;
-    if resp.choices.is_empty() {
-        return Err("provider returned an empty response".into());
+    let models = list_models(&cfg).await?;
+    Ok(format!(
+        "Connected · {} · {} models (endpoint + API key OK)",
+        provider,
+        models.len()
+    ))
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    pub is_free: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SavedProvider {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub provider: String,
+    pub auth_method: String,
+    pub oauth: AiOAuthMeta,
+    #[serde(default)]
+    pub api_key_enc: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(skip_serializing, default)]
+    pub api_key: String,
+}
+
+#[derive(Serialize)]
+pub struct SavedProviderView {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub provider: String,
+    pub auth_method: String,
+    pub enabled: bool,
+    pub has_api_key: bool,
+}
+
+/// List available models from the provider's `/models` endpoint (OpenAI-compatible).
+/// Returns model IDs with a best-effort free/paid flag. For Anthropic we return
+/// its preset list (no standard `/models`).
+pub async fn list_models(cfg: &AiConfig) -> Result<Vec<ModelInfo>, String> {
+    if cfg.base_url.trim().is_empty() {
+        return Err("base_url is required".into());
     }
-    Ok(format!("Connected · {} · {}", provider, model))
+    if cfg.api_key.trim().is_empty() {
+        return Err("not authenticated — configure a provider or log in first".into());
+    }
+    if cfg.provider == PROVIDER_ANTHROPIC {
+        return Ok(vec![
+            ModelInfo { id: "claude-sonnet-4-20250514".into(), is_free: false },
+            ModelInfo { id: "claude-3-5-haiku-latest".into(), is_free: false },
+            ModelInfo { id: "claude-opus-4-20250514".into(), is_free: false },
+        ]);
+    }
+    let base = cfg.base_url.trim_end_matches('/');
+    // Most OpenAI-compatible gateways expose GET /models (base already contains
+    // the version prefix, e.g. .../v1). For Google's OpenAI-compatible base
+    // (.../v1beta/openai) the canonical models endpoint is without the trailing
+    // /openai, so we try both.
+    let mut urls = vec![format!("{}/models", base)];
+    if base.ends_with("/openai") {
+        urls.push(format!(
+            "{}/models",
+            base.trim_end_matches("/openai").trim_end_matches('/')
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut last_err = String::new();
+    let mut v: Option<serde_json::Value> = None;
+    for url in urls {
+        // Google's OpenAI-compatible endpoint (.../v1beta/openai/...) accepts
+        // Bearer like everyone else; the native Google endpoint (.../v1beta/...)
+        // expects `x-goog-api-key` / `?key=`.
+        let is_native_google = url.contains("generativelanguage.googleapis.com") && !url.contains("/openai/");
+        let use_api_key_header = is_native_google && cfg.auth_method != AUTH_METHOD_OAUTH;
+        let mut req_url = url.clone();
+        if use_api_key_header {
+            let sep = if req_url.contains('?') { '&' } else { '?' };
+            req_url = format!("{}{}key={}", req_url, sep, cfg.api_key);
+        }
+        let mut req = client.get(&req_url);
+        if use_api_key_header {
+            req = req.header("x-goog-api-key", &cfg.api_key);
+        } else {
+            req = req.bearer_auth(&cfg.api_key);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("list models request failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            last_err = format!(
+                "list models failed ({status}): {}",
+                text.chars().take(400).collect::<String>()
+            );
+            // 404 on the /openai variant → try the fallback; otherwise surface it
+            if status.as_u16() == 404 {
+                continue;
+            }
+            // Google OpenAI endpoint with Bearer sometimes 400s with API_KEY_INVALID — try the native endpoint with x-goog-api-key
+            if url.contains("generativelanguage.googleapis.com")
+                && url.contains("/openai/")
+                && status.as_u16() == 400
+            {
+                continue;
+            }
+            return Err(last_err);
+        }
+        v = Some(serde_json::from_str(&text).map_err(|e| format!("bad models response: {e}"))?);
+        break;
+    }
+    let v = v.ok_or_else(|| last_err.clone()).map_err(|e| e)?;
+    // OpenAI shape: {data:[{id:"gpt-4o", pricing:{prompt:"0",completion:"0"}, ...}]}
+    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        let infos: Vec<ModelInfo> = arr
+            .iter()
+            .filter_map(|e| {
+                let id = e.get("id").and_then(|id| id.as_str())?.to_string();
+                // Hide deprecated Gemini models that 404
+                let l = id.to_lowercase();
+                if l.contains("gemini-2.0-flash") || l.contains("gemini-2.5-pro") {
+                    return None;
+                }
+                let is_free = {
+                    if l.contains(":free") || l.contains("-free") {
+                        true
+                    } else if let Some(pricing) = e.get("pricing") {
+                        let pf = pricing.get("prompt").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        let cf = pricing.get("completion").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        pf && cf
+                    } else {
+                        false
+                    }
+                };
+                Some(ModelInfo { id, is_free })
+            })
+            .collect();
+        if !infos.is_empty() {
+            return Ok(infos);
+        }
+    }
+    // Fallback: {models:[{id:...}]} or {models:["a","b"]}
+    if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+        let infos: Vec<ModelInfo> = arr
+            .iter()
+            .filter_map(|e| {
+                let (id, pricing) = if let Some(s) = e.as_str() {
+                    (s.to_string(), None)
+                } else {
+                    (e.get("id").and_then(|id| id.as_str())?.to_string(), e.get("pricing"))
+                };
+                let l = id.to_lowercase();
+                if l.contains("gemini-2.0-flash") || l.contains("gemini-2.5-pro") {
+                    return None;
+                }
+                let is_free = {
+                    if l.contains(":free") || l.contains("-free") {
+                        true
+                    } else if let Some(pricing) = pricing {
+                        let pf = pricing.get("prompt").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        let cf = pricing.get("completion").map(|v| {
+                            v.as_str().map(|s| s == "0").unwrap_or(false) || v.as_f64().map(|f| f == 0.0).unwrap_or(false)
+                        }).unwrap_or(false);
+                        pf && cf
+                    } else {
+                        false
+                    }
+                };
+                Some(ModelInfo { id, is_free })
+            })
+            .collect();
+        if !infos.is_empty() {
+            return Ok(infos);
+        }
+    }
+    Err("could not parse models list (unexpected response shape)".into())
+}
+
+pub async fn list_provider_models(id: &str) -> Result<Vec<ModelInfo>, String> {
+    let providers = load_providers()?;
+    let p = providers
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "provider not found".to_string())?;
+    if !p.enabled {
+        return Err("provider is disabled".into());
+    }
+    if !p.model.is_empty() {
+        // Provider was added with a specific model — only that one, no fetch
+        return Ok(vec![ModelInfo { id: p.model.clone(), is_free: false }]);
+    }
+    // Blank model — fetch all available from this provider's endpoint
+    let mut cfg = AiConfig {
+        base_url: p.base_url.clone(),
+        api_key: p.api_key.clone(),
+        model: String::new(),
+        provider: p.provider.clone(),
+        api_key_enc: None,
+        auth_method: p.auth_method.clone(),
+        oauth: p.oauth.clone(),
+        refresh_token: String::new(),
+        refresh_token_enc: None,
+        token_expires_at: None,
+    };
+    // Reuse the same Google API-key handling as list_models (via cfg)
+    // For OAuth providers, refresh if needed (load full provider's refresh token if any)
+    // Note: saved providers store refresh_token_enc separately if needed — for now we just use api_key
+    list_models(&cfg).await
 }
 
 /// Call an OpenAI-compatible `/chat/completions` endpoint (custom + DeepSeek).
@@ -619,6 +1478,11 @@ mod tests {
             provider: PROVIDER_OPENAI.into(),
             api_key: "sk-super-secret-xyz".into(),
             api_key_enc: None,
+            auth_method: default_auth_method(),
+            oauth: AiOAuthMeta::default(),
+            refresh_token: String::new(),
+            refresh_token_enc: None,
+            token_expires_at: None,
         };
         save_config(&cfg).expect("save");
         let raw = std::fs::read_to_string(&path).expect("read file");

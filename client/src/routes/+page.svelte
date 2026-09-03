@@ -15,6 +15,7 @@
     sessionId: number | null;
     connecting: boolean;
     buf: string; // input buffer used to detect `ssh <target>` commands
+    pendingSshTarget?: string; // ssh target from user input, awaiting prompt verification
   };
 
   // ---- reactive state ----------------------------------------------------
@@ -66,6 +67,38 @@
   let aiKey = $state("");
   let aiHasKey = $state(false);
   let aiReady = $state(false);
+  // How the bearer token is obtained: "key" (static) or "oauth" (browser login).
+  let aiAuthMethod = $state("key");
+  // OAuth client metadata (shown when auth_method === "oauth").
+  let oauthAuthUrl = $state("");
+  let oauthTokenUrl = $state("");
+  let oauthClientId = $state("");
+  let oauthClientSecret = $state("");
+  let oauthScope = $state("");
+  let oauthRedirectUri = $state("");
+  let oauthFlow = $state("standard");
+  let oauthHasSecret = $state(false);
+  let aiOauthBusy = $state(false);
+  let activeSettingsTab = $state<"api" | "oauth" | "models" | "general">("api");
+  let modelsList = $state<string[]>([]);
+  let modelsLoading = $state(false);
+  let modelsError = $state<string | null>(null);
+  let enabledModels = $state<string[]>([]);
+  let modelFreeMap = $state<Record<string, boolean>>({});
+  let modelPaidFilter = $state<"all" | "free" | "paid">("all");
+  // model -> provider ids that expose it (used for the per-provider filter view).
+  let modelOwner = $state<Record<string, string[]>>({});
+  // Models-tab provider filter: "all" or a saved-provider id.
+  let modelProviderFilter = $state("all");
+  let savedProviders = $state<any[]>([]);
+  let newProviderLabel = $state("");
+  let addBaseUrl = $state("");
+  let addModel = $state("");
+  let addApiKey = $state("");
+  let addProviderSel = $state("openai");
+  let addProviderBusy = $state(false);
+  let initialSettingsSnapshot = $state<string>("");
+  // Confirmation summary shown before applying settings (Save opens this first).
   // Result of a "test connection" probe (before saving).
   let aiTest = $state<{ ok: boolean; msg: string } | null>(null);
   let aiTestBusy = $state(false);
@@ -91,7 +124,7 @@
       label: "Custom (OpenAI-compatible)",
       baseUrl: "",
       model: "",
-      models: ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
+      models: [],
     },
     deepseek: {
       label: "DeepSeek",
@@ -105,7 +138,216 @@
       model: "claude-sonnet-4-20250514",
       models: ["claude-sonnet-4-20250514", "claude-3-5-haiku-latest", "claude-opus-4-20250514"],
     },
+    "google-ai-studio": {
+      label: "Google AI Studio",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model: "",
+      models: ["gemini-3.6-flash", "gemini-3.1-pro-preview", "gemini-1.5-pro"],
+    },
+    openrouter_api: {
+      label: "OpenRouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "",
+      models: ["openai/gpt-4o", "openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet", "google/gemini-2.0-flash-001"],
+    },
+    groq: {
+      label: "Groq",
+      baseUrl: "https://api.groq.com/openai/v1",
+      model: "",
+      models: ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"],
+    },
+    nvidia: {
+      label: "NVIDIA",
+      baseUrl: "https://integrate.api.nvidia.com/v1",
+      model: "",
+      models: ["meta/llama-3.1-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct", "meta/llama-3.1-405b-instruct"],
+    },
   };
+
+  // OAuth provider presets — one click fills the endpoint + OAuth metadata so
+  // the user only needs to register an OAuth app (client id/secret) and log in.
+  // `flow` selects the backend exchange variant ("standard" or "openrouter").
+  const AI_OAUTH_PRESETS: Record<
+    string,
+    { label: string; flow: string; baseUrl: string; model: string; authUrl: string; tokenUrl: string; scope: string }
+  > = {
+    "github-models": {
+      label: "GitHub Models (OAuth)",
+      flow: "standard",
+      baseUrl: "https://models.inference.ai.azure.com/openai/v1",
+      model: "gpt-4o",
+      authUrl: "https://github.com/login/oauth/authorize",
+      tokenUrl: "https://github.com/login/oauth/access_token",
+      scope: "read:models",
+    },
+    openrouter: {
+      label: "OpenRouter (OAuth)",
+      flow: "openrouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "",
+      authUrl: "https://openrouter.ai/auth",
+      tokenUrl: "https://openrouter.ai/api/v1/auth/keys",
+      scope: "",
+    },
+    google: {
+      label: "Google (Chrome account)",
+      flow: "standard",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model: "gemini-3.6-flash",
+      authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      scope: "https://www.googleapis.com/auth/generative-language.retriever https://www.googleapis.com/auth/cloud-platform",
+    },
+  };
+
+  function isToolCapable(id: string): boolean {
+    const l = id.toLowerCase();
+    if (l.includes("embedding") || l.includes("vision") || l.includes("audio") || l.includes("imagen") || l.includes("whisper") || l.includes("tts") || l.includes("stt") || l.includes("transcription") || l.includes("dall-e"))
+      return false;
+    if (l.includes("gemini-2.0-flash") || l.includes("gemini-2.5-pro")) return false; // deprecated (404)
+    return true;
+  }
+  let showNonToolModels = $state(false);
+  let toolCapableModels = $derived(modelsList.filter((m) => isToolCapable(m)));
+  let visibleModels = $derived.by(() => {
+    const baseSet = new Set<string>(showNonToolModels ? modelsList : toolCapableModels);
+    for (const p of savedProviders) if (p.enabled && p.model) baseSet.add(p.model);
+    let base = [...baseSet];
+    if (modelProviderFilter && modelProviderFilter !== "all") {
+      base = base.filter((m) => (modelOwner[m] || []).includes(modelProviderFilter));
+    }
+    if (modelPaidFilter === "free") return base.filter((m) => modelFreeMap[m]);
+    if (modelPaidFilter === "paid") return base.filter((m) => modelFreeMap[m] === false);
+    return base;
+  });
+
+  // Models from the active provider's preset + fetched provider list.
+  // Disable-all-by-default: only explicitly enabled models appear in the chat switcher.
+  let allModels = $derived.by(() => {
+    const set = new Set<string>();
+    const preset = AI_PROVIDERS[aiProvider];
+    if (preset) for (const m of preset.models) set.add(m);
+    for (const m of toolCapableModels) set.add(m);
+    for (const p of savedProviders) if (p.enabled && p.model) set.add(p.model);
+    if (aiModel && aiModel.trim()) set.add(aiModel.trim());
+    let arr = [...set];
+    if (modelsList.length > 0) {
+      const enabled = new Set(enabledModels);
+      if (aiModel) enabled.add(aiModel);
+      arr = arr.filter((m) => enabled.has(m));
+      return arr.sort();
+    }
+    if (enabledModels.length > 0) {
+      const enabled = new Set(enabledModels);
+      if (aiModel) enabled.add(aiModel);
+      arr = arr.filter((m) => enabled.has(m));
+    }
+    return arr.sort();
+  });
+
+  // Persist the enabled-models filter
+  try {
+    const raw = localStorage.getItem("pp.ai.enabledModels");
+    if (raw) {
+      const v = JSON.parse(raw);
+      if (Array.isArray(v)) enabledModels = v;
+    }
+  } catch {}
+  $effect(() => {
+    try {
+      // touch enabledModels to make this reactive
+      const _ = enabledModels;
+      localStorage.setItem("pp.ai.enabledModels", JSON.stringify(enabledModels));
+    } catch {}
+  });
+
+  let hasAutoFetchedModels = $state(false);
+  // Auto-fetch models as soon as there are enabled saved providers,
+  // so the chatbox dropdown is populated without needing to open the Models tab.
+  $effect(() => {
+    if (savedProviders.some((p: any) => p.enabled) && !modelsList.length && !modelsLoading && !hasAutoFetchedModels) {
+      hasAutoFetchedModels = true;
+      loadModels();
+    }
+    if (!showSettings) hasAutoFetchedModels = false;
+  });
+
+  function providersSnapshot() {
+    return savedProviders.map((p: any) => ({
+      id: p.id,
+      base_url: p.base_url,
+      model: p.model,
+      label: p.label,
+      provider: p.provider,
+      enabled: !!p.enabled,
+      has_api_key: !!p.has_api_key,
+    }));
+  }
+  function providerLabelFor(id: string): string {
+    const p = savedProviders.find((x: any) => x.id === id);
+    return p ? (p.label || p.base_url) : id;
+  }
+  function modelOwnerLabels(m: string): string {
+    return (modelOwner[m] || []).map(providerLabelFor).join(", ");
+  }
+
+  function getSettingsSnapshotString(): string {
+    return JSON.stringify({
+      aiBaseUrl: (aiBaseUrl || "").trim(),
+      aiModel: (aiModel || "").trim(),
+      aiProvider,
+      aiAuthMethod,
+      oauthAuthUrl: (oauthAuthUrl || "").trim(),
+      oauthTokenUrl: (oauthTokenUrl || "").trim(),
+      oauthClientId: (oauthClientId || "").trim(),
+      oauthScope: (oauthScope || "").trim(),
+      oauthRedirectUri: (oauthRedirectUri || "").trim(),
+      oauthFlow,
+      autonomy,
+      themeName,
+      aiKey: (aiKey || "").trim() ? "pending" : "",
+      providers: providersSnapshot(),
+    });
+  }
+
+  function captureSettingsSnapshot() {
+    initialSettingsSnapshot = getSettingsSnapshotString();
+  }
+
+  // Baseline the snapshot once the async populate (loadProviders) has finished,
+  // so Save reflects a true diff against loaded provider state.
+  $effect(() => {
+    if (!showSettings) {
+      initialSettingsSnapshot = "";
+      return;
+    }
+    let cancelled = false;
+    if (!oauthRedirectUri.trim() && typeof location !== "undefined") {
+      oauthRedirectUri = `${location.origin}/oauth/callback`;
+    }
+    (async () => {
+      try { await loadProviders(); } catch {}
+      if (cancelled) return;
+      captureSettingsSnapshot();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  let isSettingsDirty = $derived.by(() => {
+    if (!showSettings || !initialSettingsSnapshot) return false;
+    try {
+      return getSettingsSnapshotString() !== initialSettingsSnapshot;
+    } catch {
+      return false;
+    }
+  });
+
+  function tryCloseSettings() {
+    if (isSettingsDirty && !confirm("You have unsaved changes — discard them?")) return;
+    showSettings = false;
+  }
 
   function applyAiProvider(p: string) {
     aiProvider = p;
@@ -115,32 +357,436 @@
     if (preset?.model) aiModel = preset.model;
   }
 
-  // Every model across all provider presets, plus whatever is currently saved.
-  let allModels = $derived.by(() => {
-    const set = new Set<string>();
-    for (const p of Object.values(AI_PROVIDERS)) for (const m of p.models) set.add(m);
-    if (aiModel) set.add(aiModel);
-    return [...set];
-  });
+  /** Switch the authentication method. OAuth always targets an
+   *  OpenAI-compatible endpoint, so the provider is forced to "openai" and the
+   *  redirect URI is auto-filled from the current origin. */
+  function setAiAuthMethod(m: string) {
+    aiAuthMethod = m;
+    if (m === "oauth") {
+      if (aiProvider !== "openai") {
+        aiProvider = "openai";
+        aiBaseUrl = customBaseUrl;
+      }
+      if (!oauthRedirectUri.trim()) {
+        try {
+          oauthRedirectUri = `${location.origin}/oauth/callback`;
+        } catch {
+          oauthRedirectUri = "";
+        }
+      }
+    }
+  }
 
-  /** Pick a model in the chat panel. If it belongs to a provider preset,
-   *  switch the provider + endpoint too (the custom/openai preset restores the
-   *  remembered custom endpoint); then persist. */
+  /** Fill the OAuth fields from a provider preset (GitHub Models / OpenRouter). */
+  function applyOauthPreset(key: string) {
+    const p = AI_OAUTH_PRESETS[key];
+    if (!p) return;
+    aiProvider = "openai";
+    aiBaseUrl = p.baseUrl;
+    if (p.model) aiModel = p.model;
+    oauthAuthUrl = p.authUrl;
+    oauthTokenUrl = p.tokenUrl;
+    oauthScope = p.scope;
+    oauthFlow = p.flow;
+    aiAuthMethod = "oauth";
+    oauthClientId = "";
+    oauthClientSecret = "";
+    if (!oauthRedirectUri.trim()) {
+      try {
+        oauthRedirectUri = `${location.origin}/oauth/callback`;
+      } catch {
+        oauthRedirectUri = "";
+      }
+    }
+  }
+
+  /** Begin a browser-based OAuth login: save the metadata, open the provider's
+   *  authorize URL, then poll until the token lands in the saved config. */
+  async function startOauthLogin() {
+    if (aiOauthBusy) return;
+    aiOauthBusy = true;
+    try {
+      if (aiProvider === "openai") customBaseUrl = aiBaseUrl;
+      await call("set_ai_config", {
+        base_url: aiBaseUrl,
+        model: aiModel,
+        provider: aiProvider,
+        api_key: aiKey,
+        auth_method: "oauth",
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
+        },
+      });
+      const r = await call<any>("ai_oauth_begin");
+      window.open(r.authorize_url, "puppetterm-oauth", "width=600,height=720");
+      pushChat("ai", "(opened provider login — complete it in the popup, then return here)");
+      const timer = setInterval(async () => {
+        try {
+          const v = await call<any>("get_ai_config");
+          if (v.auth_method === "oauth" && v.has_api_key) {
+            clearInterval(timer);
+            // Register this provider in the saved list if not already present
+            if (aiBaseUrl.trim() && !savedProviders.some((p: any) => p.base_url.trim() === aiBaseUrl.trim())) {
+              try {
+                await call("add_provider", {
+                  label: AI_PROVIDERS[aiProvider]?.label ?? aiBaseUrl,
+                  base_url: aiBaseUrl,
+                  model: aiModel,
+                  provider: aiProvider,
+                  api_key: aiKey,
+                  auth_method: "oauth",
+                });
+              } catch {}
+              await loadProviders();
+            }
+            aiHasKey = true;
+            aiReady = true;
+            pushChat("ai", "(AI logged in via OAuth — token stored, encrypted)");
+            notify("OAuth login successful");
+            loadModels().catch(() => {});
+          }
+        } catch {
+          /* keep polling */
+        }
+      }, 1500);
+      setTimeout(() => clearInterval(timer), 5 * 60 * 1000);
+    } catch (e) {
+      notify(`OAuth login failed: ${e}`, "err");
+      pushChat("ai", `(OAuth login failed: ${e})`);
+    } finally {
+      aiOauthBusy = false;
+    }
+  }
+
+  async function loadModels() {
+    // Ensure saved providers are loaded before deciding per-provider vs active
+    if (savedProviders.length === 0) {
+      try { await loadProviders(); } catch {}
+    }
+    modelsLoading = true;
+    modelsError = null;
+    try {
+      // Models come only from saved providers. If none are saved, don't fetch
+      // from a possibly-orphaned active config — show the configure hint instead.
+      if (savedProviders.length === 0) {
+        if (aiHasKey || aiReady) {
+          try {
+            const r = await call<any>("list_ai_models");
+            const raw = r.models ?? [];
+            const all = new Set<string>();
+            for (const m of raw) {
+              const id = typeof m === "string" ? m : m.id;
+              if (id) all.add(id);
+            }
+            modelsList = [...all];
+          } catch {
+            modelsList = [];
+          }
+        } else {
+          modelsList = [];
+          modelFreeMap = {};
+          modelsError = null;
+        }
+        return;
+      }
+      const enabled = savedProviders.filter((p: any) => p.enabled);
+      if (enabled.length === 0) {
+        modelsList = [];
+        modelFreeMap = {};
+        modelsError = "No enabled providers — enable one in API Providers.";
+        return;
+      }
+      const all = new Set<string>();
+      const freeMap: Record<string, boolean> = {};
+      const owner: Record<string, string[]> = {};
+      const addOwner = (id: string, pid: string) => {
+        const list = owner[id] || (owner[id] = []);
+        if (!list.includes(pid)) list.push(pid);
+      };
+      for (const p of enabled) {
+        if (p.model && p.model.trim()) {
+          all.add(p.model.trim());
+          addOwner(p.model.trim(), p.id);
+        } else {
+          try {
+            const r = await call<any>("list_ai_models", { provider_id: p.id });
+            const raw = r.models ?? [];
+            for (const m of raw) {
+              const id = typeof m === "string" ? m : m.id;
+              if (id) {
+                all.add(id);
+                addOwner(id, p.id);
+                if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
+              }
+            }
+          } catch (e) {
+            const msg = String(e);
+            console.warn("list models for", p.id, e);
+            if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+              modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
+            } else {
+              modelsError = msg;
+            }
+          }
+        }
+      }
+      modelFreeMap = freeMap;
+      modelOwner = owner;
+      modelsList = [...all];
+      // Keep the provider filter valid — if the selected provider no longer has
+      // models, fall back to showing all.
+      if (modelProviderFilter !== "all") {
+        const stillOwns = Object.values(modelOwner).some((ids) => ids.includes(modelProviderFilter));
+        if (!stillOwns) modelProviderFilter = "all";
+      }
+      if (modelsList.length === 0 && !modelsError) modelsError = "No models returned.";
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+        modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
+      } else {
+        modelsError = msg;
+      }
+      hasAutoFetchedModels = false;
+    } finally {
+      modelsLoading = false;
+    }
+  }
+  function toggleModel(m: string) {
+    const s = new Set(enabledModels);
+    const wasEnabled = s.has(m);
+    if (wasEnabled) s.delete(m);
+    else s.add(m);
+    enabledModels = [...s];
+    // If the current chat model was just disabled, clear it so it disappears from the switcher
+    if (wasEnabled && m === aiModel) {
+      const next = enabledModels.find((x) => x !== m) || "";
+      // Use applyAiModel to keep provider/endpoint in sync, or clear if nothing left
+      if (next) applyAiModel(next);
+      else aiModel = "";
+    }
+  }
+
+  async function loadProviders() {
+    try {
+      const r = await call<any>("list_providers");
+      savedProviders = r.providers ?? [];
+    } catch (e) {
+      console.warn("load providers", e);
+    }
+  }
+  async function addProvider() {
+    if (addProviderBusy) return;
+    addProviderBusy = true;
+    const base = addBaseUrl.trim() || aiBaseUrl.trim();
+    if (!base) {
+      notify("Endpoint is required", "err");
+      addProviderBusy = false;
+      return;
+    }
+    const label = newProviderLabel.trim() || base;
+    // Use exactly what was filled in the Add form. An EMPTY model is meaningful:
+    // it means "parse all models on save" — do NOT fall back to a stale active
+    // model, or the provider would be pinned to the wrong model.
+    const model = addModel.trim();
+    const provider = addProviderSel || aiProvider;
+    const key = addApiKey.trim() || aiKey.trim();
+    try {
+      await call("add_provider", {
+        label,
+        base_url: base,
+        model,
+        provider,
+        api_key: key,
+        auth_method: aiAuthMethod,
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
+        },
+      });
+      // also set as active for chat
+      await call("set_ai_config", {
+        base_url: base,
+        model,
+        provider,
+        api_key: key,
+        auth_method: aiAuthMethod,
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
+        },
+      });
+      notify("Provider added");
+      // auto-enable the specific model so it appears in Models and the chat switcher
+      if (model && !enabledModels.includes(model) && isToolCapable(model)) {
+        const s = new Set(enabledModels);
+        s.add(model);
+        enabledModels = [...s];
+      }
+      // clean the add-form so it's ready for the next provider
+      newProviderLabel = "";
+      addBaseUrl = "";
+      addModel = "";
+      addApiKey = "";
+      addProviderSel = "openai";
+      await loadProviders();
+      // Populate Models: a specific model shows only that one; an empty model
+      // causes all models to be parsed. This keeps the Models page in sync with
+      // how the provider was just added.
+      modelsList = [];
+      await loadModels().catch(() => {});
+      // Sync the main Settings form to the just-added provider so Save is
+      // "ready" (endpoint/model/key reflect what was just added).
+      const v = await call<any>("get_ai_config");
+      aiBaseUrl = v.base_url;
+      aiModel = v.model || aiModel;
+      aiProvider = v.provider ?? "openai";
+      aiHasKey = v.has_api_key;
+      aiReady = true;
+    } catch (e) {
+      notify(`Failed to add provider: ${e}`, "err");
+    } finally {
+      addProviderBusy = false;
+    }
+  }
+  async function deleteProvider(id: string) {
+    if (!confirm("Delete this provider?")) return;
+    const doomed = savedProviders.find((p: any) => p.id === id);
+    try {
+      await call("delete_provider", { id });
+      if (doomed?.model) {
+        const s = new Set(enabledModels);
+        s.delete(doomed.model);
+        enabledModels = [...s];
+      }
+      await loadProviders();
+      // If the deleted provider was active, switch to first enabled or clear
+      if (doomed && aiBaseUrl === doomed.base_url) {
+        const next = savedProviders.find((p: any) => p.enabled);
+        if (next) {
+          aiBaseUrl = next.base_url;
+          aiModel = next.model;
+          aiProvider = next.provider;
+          await call("set_ai_config", { base_url: aiBaseUrl, model: aiModel, provider: aiProvider }).catch(() => {});
+        }
+      }
+      // Rebuild the model list from what's actually still saved+enabled.
+      // Don't re-fetch from a provider that no longer exists.
+      if (savedProviders.length === 0) {
+        modelsList = [];
+        modelFreeMap = {};
+        enabledModels = [];
+        modelsError = null;
+      } else {
+        modelsList = [];
+        await loadModels();
+      }
+      notify("Provider deleted");
+    } catch (e) {
+      notify(`Failed to delete: ${e}`, "err");
+    }
+  }
+  async function toggleProvider(id: string, enabled: boolean) {
+    const target = savedProviders.find((p: any) => p.id === id);
+    try {
+      await call("toggle_provider", { id, enabled });
+      if (target?.model) {
+        const s = new Set(enabledModels);
+        if (!enabled) s.delete(target.model);
+        else if (!s.has(target.model) && isToolCapable(target.model)) s.add(target.model);
+        enabledModels = [...s];
+      }
+      await loadProviders();
+      // If the toggled provider was active and is now disabled, switch active
+      if (target && aiBaseUrl === target.base_url && !enabled) {
+        const next = savedProviders.find((p: any) => p.enabled);
+        if (next) {
+          aiBaseUrl = next.base_url;
+          aiModel = next.model;
+          aiProvider = next.provider;
+          await call("set_ai_config", { base_url: aiBaseUrl, model: aiModel, provider: aiProvider }).catch(() => {});
+        }
+      }
+      // refresh the Models list so disabled providers' fetched models disappear
+      modelsList = [];
+      await loadModels();
+    } catch (e) {
+      notify(`Failed to toggle: ${e}`, "err");
+    }
+  }
+
+  /** Pick a model in the chat panel. If it belongs to a provider preset or a
+   *  saved provider, switch the endpoint/provider too. */
   function applyAiModel(m: string) {
     aiModel = m;
-    for (const [key, p] of Object.entries(AI_PROVIDERS)) {
-      if (p.models.includes(m)) {
-        aiProvider = key;
-        if (p.baseUrl) aiBaseUrl = p.baseUrl;
-        else if (key === "openai") aiBaseUrl = customBaseUrl;
+    // 1) Check saved providers first (covers custom single-model providers).
+    // Track the owning provider id so its real credentials (API key / auth) are
+    // copied into the active config the chat uses.
+    let found = false;
+    let foundId: string | null = null;
+    for (const p of savedProviders) {
+      if (p.enabled && p.model === m) {
+        aiBaseUrl = p.base_url;
+        aiProvider = p.provider;
+        foundId = p.id;
+        found = true;
+        break;
+      }
+      // For blank-model providers, the model came from fetched list — find which provider's fetched list contains it
+      if (p.enabled && !p.model && modelsList.includes(m)) {
+        aiBaseUrl = p.base_url;
+        aiProvider = p.provider;
+        foundId = p.id;
+        found = true;
         break;
       }
     }
+    if (!found && savedProviders.length > 0) {
+      // Prefer the enabled provider that owns this model (per the Models-tab
+      // owner map) even when it's a fetched model, so credentials match.
+      const ownerIds = modelOwner[m] || [];
+      const own = savedProviders.find((p: any) => p.enabled && ownerIds.includes(p.id));
+      if (own) {
+        aiBaseUrl = own.base_url;
+        aiProvider = own.provider;
+        foundId = own.id;
+        found = true;
+      }
+    }
+    if (!found) {
+      for (const [key, p] of Object.entries(AI_PROVIDERS)) {
+        if (p.models.includes(m)) {
+          aiProvider = key;
+          if (p.baseUrl) aiBaseUrl = p.baseUrl;
+          else if (key === "openai") aiBaseUrl = customBaseUrl;
+          found = true;
+          break;
+        }
+      }
+    }
+    // Fallback: if model is from fetched list and no saved provider matched, keep current baseUrl
     aiReady = true;
     call("set_ai_config", {
       base_url: aiBaseUrl,
       model: aiModel,
       provider: aiProvider,
+      provider_id: foundId,
     }).catch((e) => console.error("save model", e));
   }
   let chatBusy = $state(false);
@@ -264,7 +910,7 @@
   // Messages route to the pinned task's host when one is running, else the
   // active host (so streaming during a tab switch lands in the right chat).
   function pushChat(role: string, text: string) {
-    const host = chatTarget?.host ? chatHostOf(chatTarget.host) : (activeHost ?? "__local__");
+    const host = chatTarget != null ? chatHostOf(chatTarget.host) : chatHostOf(activeHost);
     appendChat(host, role, text);
   }
 
@@ -420,7 +1066,11 @@
   function chatConfigFor(host: string | null | undefined, cwd?: string | null) {
     const hasAgent = hostHasAgent(host);
     const tools = hasAgent ? AGENT_TOOLS : TERMINAL_ONLY_TOOLS;
-    const base = hasAgent ? AGENT_SYSTEM_PROMPT : TERMINAL_SYSTEM_PROMPT;
+    const base = !host
+      ? LOCAL_SYSTEM_PROMPT
+      : hasAgent
+        ? AGENT_SYSTEM_PROMPT
+        : TERMINAL_SYSTEM_PROMPT;
     // History is a terminal app's working context, NOT ground truth. Explicitly
     // tell the model to re-query the live server rather than trust stale chat
     // or activity output — keeps it honest about current config and avoids
@@ -428,7 +1078,7 @@
     const historyCaveat =
       "\n\nHISTORY IS EPHEMERAL — the chat and Activity log are working context only, never the source of truth about the server. Do NOT treat prior tool output or chat history as the host's CURRENT state. Whenever you need current config or status, re-query the LIVE server with the tools (run_command / config / snapshot / service, or the terminal tool). This is a terminal app: trust the server's CURRENT state, not stale history.";
     const cwdLine = cwd
-      ? `\n\nYou are currently working in the directory \`${cwd}\` on ${host || "this host"}. Prefer commands relative to that directory (or reference the full path) when the user asks about files/folders there.`
+      ? `\n\nYou are currently working in the directory \`${cwd}\` on ${host || "the local terminal"}. Prefer commands relative to that directory (or reference the full path) when the user asks about files/folders there.`
       : "";
     const prompt = base + historyCaveat + cwdLine;
     return { tools, prompt, hasAgent };
@@ -436,6 +1086,19 @@
 
   // Agent-aware system prompts: the AI is told which mode it's in so it uses
   // the right tools instead of guessing.
+  const LOCAL_SYSTEM_PROMPT =
+    "You are puppetterm, an AI assistant inside a terminal app.\n\n" +
+    "LOCAL CONTAINER ENVIRONMENT: You are attached to the LOCAL container shell session " +
+    "(user `pp` inside the puppetterm container), NOT a remote SSH target server. " +
+    "Do NOT attempt to modify, reconfigure, or perform system administration / management tasks on " +
+    "this local container environment. If the user asks to manage a server or perform system administration, " +
+    "advise them to connect to their remote target host via SSH (e.g. `ssh user@host`).\n\n" +
+    "You can answer general questions, help formulate commands, inspect the local terminal screen using " +
+    "`read_terminal`, or assist the user in connecting to a remote SSH target.\n\n" +
+    "ANSWER QUESTIONS FIRST. When the user asks a question, answer it directly from your own " +
+    "knowledge in text BEFORE calling any tool. Only run a command when genuinely requested. " +
+    "Before running anything, explain in text what you'll run and why. Be concise.";
+
   const TERMINAL_SYSTEM_PROMPT =
     "You are puppetterm, an AI assistant inside a terminal app. You manage the ACTIVE host " +
     "using the provided tools.\n\n" +
@@ -521,7 +1184,7 @@
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
-  const SYSTEM_PROMPT = TERMINAL_SYSTEM_PROMPT; // default until a host is detected
+  const SYSTEM_PROMPT = LOCAL_SYSTEM_PROMPT; // default until a host is detected
 
   const TOOL_TO_ACTION: Record<string, string> = {
     run_command: "run",
@@ -681,7 +1344,7 @@
     }
 
     const id = nextTabId++;
-    tabs = [...tabs, { id, host: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "" }];
+    tabs = [...tabs, { id, host: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "", pendingSshTarget: undefined }];
     activeTabId = id;
     showHostMenu = false;
     await tick();
@@ -729,14 +1392,10 @@
           // Apply backspaces / drop arrow-key sequences BEFORE parsing, so a
           // corrected typo (e.g. `user2<BS>@host`) detects as `user@host`.
           const target = parseSshTarget(cleanTyped(line));
-          if (target && target !== t.host) {
-            // Set the host immediately, but DON'T check for the agent here —
-            // on password-only remotes the check would run before the user has
-            // connected (no ControlMaster yet) and fail. The prompt-gated
-            // buffer scan (maybeDetectSshFromBuffer) does the check once the
-            // connection is actually established.
-            t.host = target;
-          }
+          // Store typed ssh target as pending; it will be confirmed by
+          // maybeDetectSshFromBuffer when the remote prompt appears.
+          if (target) t.pendingSshTarget = target;
+          requestAnimationFrame(() => maybeDetectSshFromBuffer(id));
         } else if (t.buf.length > 4096) {
           t.buf = "";
         }
@@ -1082,11 +1741,38 @@
   async function saveAiConfig() {
     try {
       if (aiProvider === "openai") customBaseUrl = aiBaseUrl; // remember the custom endpoint
+      // Ensure the configured provider is registered in the saved-provider list
+      // (Add Provider = "add to cart"; Save commits it). If the current endpoint
+      // isn't already saved, register it so it shows up in the provider list and
+      // its models load by the empty->all / specific->only rule.
+      if (aiBaseUrl.trim() && !savedProviders.some((p: any) => p.base_url.trim() === aiBaseUrl.trim())) {
+        try {
+          await call("add_provider", {
+            label: AI_PROVIDERS[aiProvider]?.label ?? aiBaseUrl,
+            base_url: aiBaseUrl,
+            model: aiModel,
+            provider: aiProvider,
+            api_key: aiKey,
+            auth_method: aiAuthMethod,
+          });
+        } catch {}
+        await loadProviders();
+      }
       await call("set_ai_config", {
         base_url: aiBaseUrl,
         model: aiModel,
         provider: aiProvider,
         api_key: aiKey,
+        auth_method: aiAuthMethod,
+        oauth: {
+          auth_url: oauthAuthUrl,
+          token_url: oauthTokenUrl,
+          client_id: oauthClientId,
+          client_secret: oauthClientSecret,
+          scope: oauthScope,
+          redirect_uri: oauthRedirectUri,
+          flow: oauthFlow,
+        },
       });
       aiKey = "";
       const v = await call<any>("get_ai_config");
@@ -1094,10 +1780,31 @@
       aiModel = v.model;
       aiProvider = v.provider ?? "openai";
       aiHasKey = v.has_api_key;
-      aiReady = true;
-      if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
+        aiAuthMethod = v.auth_method ?? "key";
+        if (v.oauth) {
+          oauthAuthUrl = v.oauth.auth_url ?? "";
+          oauthTokenUrl = v.oauth.token_url ?? "";
+          oauthClientId = v.oauth.client_id ?? "";
+          oauthScope = v.oauth.scope ?? "";
+          oauthRedirectUri = v.oauth.redirect_uri ?? "";
+          oauthFlow = v.oauth.flow ?? "standard";
+          oauthHasSecret = !!v.oauth.has_client_secret;
+        }
+        aiReady = true;
+        if (aiProvider === "openai") customBaseUrl = v.base_url || customBaseUrl;
       pushChat("ai", "(AI settings saved)");
       notify(`AI settings saved — ${AI_PROVIDERS[aiProvider]?.label ?? "Custom"} · ${aiModel}`);
+      // Auto-discover models for Custom / OAuth so the dropdown isn't stale/empty
+      try {
+        await loadModels();
+        if (!aiModel && modelsList.length) aiModel = modelsList[0];
+      } catch {}
+      // keep the newly discovered model persisted
+      if (aiModel && modelsList.includes(aiModel)) {
+        try {
+          await call("set_ai_config", { base_url: aiBaseUrl, model: aiModel, provider: aiProvider });
+        } catch {}
+      }
     } catch (e) {
       pushChat("ai", `(failed to save AI settings: ${e})`);
       notify(`Failed to save AI settings: ${e}`, "err");
@@ -1133,6 +1840,15 @@
       customBaseUrl = "";
       aiModel = "";
       aiKey = "";
+      aiAuthMethod = "key";
+      oauthAuthUrl = "";
+      oauthTokenUrl = "";
+      oauthClientId = "";
+      oauthClientSecret = "";
+      oauthScope = "";
+      oauthRedirectUri = "";
+      oauthFlow = "standard";
+      oauthHasSecret = false;
       aiHasKey = false;
       aiReady = false;
       aiTest = null;
@@ -1142,10 +1858,32 @@
     }
   }
 
-  /** Save everything from the Settings modal and close it. */
+  // Whether a usable provider endpoint + auth is actually configured. If not,
+  // Save must not persist default/blank selections.
+  function hasUsableProvider(): boolean {
+    if (savedProviders.some((p: any) => p.enabled && p.has_api_key)) return true;
+    if (savedProviders.length === 0 && aiBaseUrl.trim() && aiHasKey) return true;
+    return false;
+  }
+
+  /** Save everything from the Settings modal. Shows a watermark notification
+   *  on success (no blocking confirmation popup) and blocks saving when no
+   *  usable provider is configured. */
   async function saveSettings() {
+    if (!hasUsableProvider()) {
+      notify("Nothing saved — add a provider with an API key first.", "err");
+      return;
+    }
     await saveAiConfig();
-    showSettings = false;
+    // refresh dirty snapshot so Save disables until next edit
+    captureSettingsSnapshot();
+    const enabledP = savedProviders.filter((p: any) => p.enabled);
+    const enabledTxt = enabledP.length > 0
+      ? `${enabledP.length} provider${enabledP.length > 1 ? "s" : ""} enabled`
+      : "no providers enabled";
+    const modelTxt = aiModel ? ` · model ${aiModel}` : "";
+    notify(`Settings saved ✅ ${enabledTxt} · ${aiAuthMethod === "oauth" ? "OAuth" : "API key"}${modelTxt}`);
+    // stay open so the user can switch tabs (Models etc.) — close only via Cancel / × / Esc
   }
 
   async function sendChat() {
@@ -1459,62 +2197,117 @@
     return clean && (clean.startsWith("/") || clean.startsWith("~")) ? clean : null;
   }
 
+  function extractUserHostFromPrompt(line: string): { user: string; host: string; full: string } | null {
+    const m = line.match(/(?:^|[\s\[\(])([A-Za-z0-9_.\-]+)@([A-Za-z0-9_.\-]+)(?:[:\s\]\)]|\s*[$#>])/);
+    if (!m) return null;
+    return { user: m[1], host: m[2], full: `${m[1]}@${m[2]}` };
+  }
+
   /** Detect an ssh target from what's on screen. This catches commands that
    *  never passed through onData — e.g. recalled with the up-arrow — because
    *  the shell echoes them into the pty output. Only scans when the shell is
    *  back at a prompt (i.e. the connection has been established / command done).
-   *  This is ALSO where the agent check/hint happens (once per host per
-   *  session), so on password-only remotes the check runs only after the user's
-   *  interactive ssh has authenticated and created the ControlMaster socket. */
+   *  Supports nested SSH sessions (e.g. hostA -> hostB) and automatically
+   *  restores parent host context when nested sessions exit. */
   function maybeDetectSshFromBuffer(id: number) {
     const t = tabs.find((x) => x.id === id);
     const term = termByTab.get(id)?.term;
     if (!t || !term) return;
-    // Scan a generous window: a recalled `ssh …` can sit many lines up in the
-    // buffer behind a long MOTD/scrollback (especially after history recall,
-    // where the command never passes through onData).
+
     const lines = terminalText(term, 200).split("\n");
-    // The shell prompt is the last non-empty line (a trailing blank line can
-    // follow the prompt, e.g. after a redraw — skip it before gating).
     let li = lines.length - 1;
     while (li >= 0 && lines[li].trim() === "") li--;
     const last = (lines[li] ?? "").trim();
-    if (!/[\$#>] ?$/.test(last)) return; // only when at a shell prompt
-    // Track the working directory so the AI knows WHERE it's working (the
-    // prompt carries it, e.g. `user@host:/opt/docker/mcp-rag$`).
+    if (!/[\$#>] ?$/.test(last)) return; // only evaluate when at a shell prompt
+
     const dir = cwdFromPrompt(last);
     if (dir) t.cwd = dir;
-    // If the remote session has ended (e.g. the user typed `exit`, or ssh
-    // dropped), OpenSSH prints "Connection to <host> closed." — forget the
-    // host so the status dot turns grey and the AI no longer targets it.
-    // (The pty itself stays alive — it's the local shell — so pty-exit never
-    // fires here; this is the reliable signal.)
-    if (t.host) {
-      const recent = lines.slice(Math.max(0, li - 12), li + 1).join("\n");
-      if (/Connection (?:to .+? )?(?:closed|reset)|closed by remote host|Connection reset/i.test(recent)) {
-        agentChecked.delete(t.host);
-        t.host = "";
+    const recent = lines.slice(Math.max(0, li - 15), li + 1).join("\n");
+    const promptInfo = extractUserHostFromPrompt(last);
+
+    // Check if recent output contains an explicit SSH failure error
+    const sshFailed = /ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection timed out/i.test(recent);
+
+    // 1) Explicit pending SSH target typed by user takes priority
+    if (t.pendingSshTarget) {
+      const target = t.pendingSshTarget;
+      t.pendingSshTarget = undefined;
+      if (!sshFailed) {
+        if (t.host !== target) {
+          if (t.host) agentChecked.delete(t.host);
+          t.host = target;
+        }
+        checkAndHintAgent(id, t.host);
         return;
       }
     }
-    // A host may already be known WITHOUT an `ssh` line in the buffer — e.g.
-    // when connected directly via the host menu (`openTab(host)`), which starts
-    // the session over SSH without echoing the command into the pty. In that
-    // case we MUST still probe for the agent, or the app would stay stuck in
-    // terminal mode even though the agent is installed.
-    if (t.host) {
-      checkAndHintAgent(id, t.host); // idempotent per host per session
-      return;
-    }
-    // Otherwise discover an ssh target from the buffer (a command typed or
-    // recalled into the live terminal).
+
+    // 2) Scan scrollback backwards from current prompt line `li` to find the
+    // active SSH session in the nested connection chain.
+    let activeHost: string | null = null;
+    const closedHosts = new Set<string>();
+    let unassignedClosedCount = 0;
+
     for (let i = li; i >= 0; i--) {
-      const target = detectSshFromLine(lines[i]);
-      if (target) {
-        if (t.host !== target) t.host = target;
-        checkAndHintAgent(id, t.host); // idempotent per host per session
-        return;
+      const line = lines[i];
+
+      // Track connection closures (e.g. "Connection to 192.168.150.34 closed.")
+      const closedMatch = line.match(/Connection (?:to ([^\s:]+) )?(?:closed|reset)|closed by remote host|Connection reset/i);
+      if (closedMatch) {
+        if (closedMatch[1]) {
+          closedHosts.add(closedMatch[1]);
+        } else {
+          unassignedClosedCount++;
+        }
+        continue;
       }
+
+      // Check if line contains an ssh target command
+      const target = detectSshFromLine(line);
+      if (target) {
+        const targetHost = target.includes("@") ? target.split("@").pop()?.split(":")[0] ?? target : target.split(":")[0];
+
+        // Skip if this host connection was closed below this line
+        if (closedHosts.has(targetHost) || Array.from(closedHosts).some((ch) => target.includes(ch))) {
+          continue;
+        }
+
+        // Skip if an unassigned disconnection marker was encountered below this line
+        if (unassignedClosedCount > 0) {
+          unassignedClosedCount--;
+          continue;
+        }
+
+        // Skip if this ssh command failed immediately
+        const peekBelow = lines.slice(i, Math.min(lines.length, i + 10)).join("\n");
+        if (/ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection timed out/i.test(peekBelow)) {
+          continue;
+        }
+
+        // We found the active SSH session for the current shell prompt!
+        activeHost = target;
+        break;
+      }
+    }
+
+    // 3) Fallback prompt verification: if prompt is user@host (and user is not "pp"),
+    // verify/fallback to prompt host if scrollback didn't yield an explicit command.
+    if (!activeHost && promptInfo && promptInfo.user !== "pp") {
+      if (t.host && t.host.includes(promptInfo.host)) {
+        activeHost = t.host;
+      } else {
+        activeHost = promptInfo.full;
+      }
+    }
+
+    // 4) Sync host state and trigger agent probe if host changed
+    const newHost = activeHost ?? "";
+    if (t.host !== newHost) {
+      if (t.host) agentChecked.delete(t.host);
+      t.host = newHost;
+      if (t.host) checkAndHintAgent(id, t.host);
+    } else if (t.host) {
+      checkAndHintAgent(id, t.host);
     }
   }
 
@@ -1837,21 +2630,27 @@
     // stable-window approach (fast commands, no giant streams).
     const isRead = isFileReadCommand(cmd);
     const deadline = Date.now() + (isRead ? 60000 : 30000);
-    const stableMs = isRead ? 2500 : 800;
     const lastLine = (s: string) => (s.split("\n").filter(Boolean).pop() ?? "").trimEnd();
     const isPromptLine = (s: string) => /[$#>]\s*$/.test(s);
     let last = terminalText(term, 2000);
     let stableSince = Date.now();
     let markerLine = -1;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 200));
       const nowText = terminalText(term, 2000);
       const line = lastLine(nowText);
-      markerLine = lastLineStartingWith(term, markerPrefix);
-      // Prompt returned after the echo + output → command is done.
-      if (isRead && markerLine >= 0 && isPromptLine(line)) break;
+      const foundMarker = lastLineStartingWith(term, markerPrefix);
+      if (foundMarker >= 0) markerLine = foundMarker;
+
+      // Primary completion: AI marker rendered AND shell prompt returned after command output
+      if (markerLine >= 0 && isPromptLine(line)) {
+        await new Promise((r) => setTimeout(r, 100));
+        break;
+      }
+
+      // Fallback completion: output has stopped changing for 1.5s AFTER marker rendered
       if (nowText === last) {
-        if (Date.now() - stableSince > stableMs) break;
+        if (markerLine >= 0 && Date.now() - stableSince > 1500) break;
       } else {
         last = nowText;
         stableSince = Date.now();
@@ -2118,6 +2917,7 @@
               t.sessionId = null;
               if (t.host) agentChecked.delete(t.host);
               t.host = ""; // the session is gone — drop the host so the dot goes grey
+              t.pendingSshTarget = undefined;
               termByTab
                 .get(t.id)
                 ?.term.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");
@@ -2136,15 +2936,27 @@
       }
       await loadHosts();
       loadActivity();
+      try { await loadProviders(); } catch {}
       try {
         const v = await call<any>("get_ai_config");
         aiBaseUrl = v.base_url;
         aiModel = v.model;
         aiProvider = v.provider ?? "openai";
         aiHasKey = v.has_api_key;
+        aiAuthMethod = v.auth_method ?? "key";
+        if (v.oauth) {
+          oauthAuthUrl = v.oauth.auth_url ?? "";
+          oauthTokenUrl = v.oauth.token_url ?? "";
+          oauthClientId = v.oauth.client_id ?? "";
+          oauthScope = v.oauth.scope ?? "";
+          oauthRedirectUri = v.oauth.redirect_uri ?? "";
+          oauthFlow = v.oauth.flow ?? "standard";
+          oauthHasSecret = !!v.oauth.has_client_secret;
+        }
         aiReady = true;
         if (aiProvider === "openai") customBaseUrl = v.base_url || "";
         setHistory(chatHostOf(activeHost), [{ role: "system", content: SYSTEM_PROMPT }]);
+        loadModels().catch(() => {});
       } catch (e) {
         console.warn("ai config unavailable:", e);
       }
@@ -2313,7 +3125,7 @@
           <div class="approval-cmd">
             {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
             <div class="approval-host">
-              {pendingApproval.danger ? 'on ' : 'on '}{chatTarget?.host ?? activeHost}
+              on {(chatTarget?.host || activeHost) || "local terminal"}
             </div>
           </div>
           <div class="approval-btns">
@@ -2474,104 +3286,303 @@
       role="button"
       tabindex="-1"
       aria-label="Close settings"
-      onclick={() => (showSettings = false)}
+      onclick={() => tryCloseSettings()}
       onkeydown={(e) => {
-        if (e.key === "Escape") showSettings = false;
+        if (e.key === "Escape") tryCloseSettings();
       }}
     >
       <div
-        class="modal"
+        class="modal modal-large"
         role="dialog"
         aria-label="Settings"
         tabindex="-1"
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.stopPropagation()}
       >
-        <div class="modal-title">Settings</div>
-
-        <div class="modal-section">AI model</div>
-        <label class="modal-field">
-          AI provider
-          <select
-            value={aiProvider}
-            onchange={(e) => applyAiProvider((e.currentTarget as HTMLSelectElement).value)}
-          >
-            {#each Object.entries(AI_PROVIDERS) as [key, p] (key)}
-              <option value={key}>{p.label}</option>
-            {/each}
-          </select>
-        </label>
-        <label class="modal-field">
-          Endpoint
-          <input
-            bind:value={aiBaseUrl}
-            placeholder="http://host:port/v1"
-            oninput={() => {
-              if (aiProvider === "openai") customBaseUrl = aiBaseUrl;
-            }}
-          />
-        </label>
-        <label class="modal-field">
-          Model
-          <input bind:value={aiModel} placeholder="model-name" list="ai-model-list" />
-          <datalist id="ai-model-list">
-            {#each AI_PROVIDERS[aiProvider]?.models ?? [] as m (m)}
-              <option value={m}></option>
-            {/each}
-          </datalist>
-        </label>
-        <label class="modal-field">
-          API key
-          <input
-            bind:value={aiKey}
-            type="password"
-            placeholder={aiHasKey ? "••• (set — encrypted) — type to replace" : "sk-…"}
-          />
-        </label>
-        <div class="modal-inline">
-          <button
-            type="button"
-            onclick={testAiConfig}
-            disabled={aiTestBusy || !aiBaseUrl.trim() || !aiModel.trim()}
-          >
-            {aiTestBusy ? "Testing…" : "Test connection"}
-          </button>
-          {#if aiTest}
-            <span class="ai-test {aiTest.ok ? 'ok' : 'err'}">
-              {aiTest.ok ? "✓ " : "✗ "}{aiTest.msg}
-            </span>
-          {/if}
+        <div class="modal-header">
+          <div class="modal-title">Settings</div>
+          <button class="modal-close" onclick={() => tryCloseSettings()} aria-label="Close">×</button>
         </div>
-        <label class="modal-field">
-          Autonomy
-          <select bind:value={autonomy}>
-            <option value="ask-first">Ask first (default)</option>
-            <option value="propose-first">Propose first (approve every command)</option>
-            <option value="read-only-auto">Read-only auto</option>
-          </select>
-        </label>
-
-        <div class="modal-section">Appearance</div>
-        <label class="modal-field">
-          Theme
-          <select bind:value={themeName}>
-            <option value="dark">Dark (default)</option>
-          </select>
-        </label>
+        <div class="modal-body">
+          <nav class="settings-nav">
+            <button class:active={activeSettingsTab === "api"} onclick={() => (activeSettingsTab = "api")}>API Providers</button>
+            <button class:active={activeSettingsTab === "oauth"} onclick={() => (activeSettingsTab = "oauth")}>Web Login</button>
+            <button class:active={activeSettingsTab === "models"} onclick={() => (activeSettingsTab = "models")}>Models</button>
+            <button class:active={activeSettingsTab === "general"} onclick={() => (activeSettingsTab = "general")}>General</button>
+          </nav>
+          <div class="settings-content">
+            {#if activeSettingsTab === "api"}
+              <div class="modal-section">Add new provider — fields stay clean for the next one</div>
+              <div class="provider-grid">
+                {#each Object.entries(AI_PROVIDERS) as [key, p] (key)}
+                  <div class="provider-card" class:active={addProviderSel === key}>
+                    <div class="pc-title">{p.label}</div>
+                    <div class="pc-meta">{p.baseUrl || "custom endpoint"} · {(p.models[0] ?? "custom model")}</div>
+                    <button class:active={addProviderSel === key} onclick={() => { addProviderSel = key; const pr = AI_PROVIDERS[key]; if (pr.baseUrl) addBaseUrl = pr.baseUrl; if (pr.model) addModel = pr.model; }}>{addProviderSel === key ? "Selected" : "Select"}</button>
+                  </div>
+                {/each}
+              </div>
+              <label class="modal-field">
+                Endpoint
+                <input
+                  bind:value={addBaseUrl}
+                  placeholder="http://host:port/v1"
+                />
+              </label>
+              <label class="modal-field">
+                Model
+                <input
+                  bind:value={addModel}
+                  placeholder="model-name (required to test)"
+                  list="ai-model-list"
+                />
+                <datalist id="ai-model-list">
+                  {#each allModels as m (m)}
+                    <option value={m}></option>
+                  {/each}
+                </datalist>
+              </label>
+              <label class="modal-field">
+                API key
+                <input
+                  bind:value={addApiKey}
+                  type="password"
+                  placeholder="sk-…"
+                />
+              </label>
+              <div class="modal-inline">
+                <button
+                  type="button"
+                  onclick={async () => {
+                    const base = addBaseUrl.trim() || aiBaseUrl.trim();
+                    const model = addModel.trim() || aiModel.trim();
+                    const key = addApiKey.trim() || aiKey.trim();
+                    aiTestBusy = true; aiTest = null;
+                    try {
+                      const r = await call<any>("test_ai_config", { base_url: base, model, provider: addProviderSel, api_key: key });
+                      aiTest = r.ok ? { ok: true, msg: r.summary } : { ok: false, msg: r.error ?? "failed" };
+                    } catch (e) { aiTest = { ok: false, msg: String(e) }; } finally { aiTestBusy = false; }
+                  }}
+                  disabled={aiTestBusy || !addBaseUrl.trim() || !addApiKey.trim()}
+                >
+                  {aiTestBusy ? "Testing…" : "Test connection"}
+                </button>
+                {#if aiTest}
+                  <span class="ai-test {aiTest.ok ? 'ok' : 'err'}">
+                    {aiTest.ok ? "✓ " : "✗ "}{aiTest.msg}
+                  </span>
+                {/if}
+              </div>
+              <div class="modal-inline">
+                <label class="modal-field" style="flex:1; margin:0">
+                  Label (optional)
+                  <input bind:value={newProviderLabel} placeholder="e.g. My OpenRouter" />
+                </label>
+                <button type="button" onclick={addProvider} disabled={addProviderBusy || !addBaseUrl.trim() || !addApiKey.trim()}>{addProviderBusy ? "Adding…" : "Add provider"}</button>
+              </div>
+              <p class="modal-hint">Adds to the saved list below — fields stay clean for the next provider. Also sets it as active for chat.</p>
+              <div class="modal-section">Saved providers</div>
+              {#if savedProviders.length === 0}
+                <p class="modal-hint">No saved providers yet.</p>
+              {:else}
+                {#each savedProviders as p (p.id)}
+                  <div class="provider-card" style="flex-direction:row; align-items:center; gap:10px">
+                    <div style="flex:1; min-width:0">
+                      <div class="pc-title">{p.label}</div>
+                      <div class="pc-meta" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis">{p.base_url} · {p.model || "no model"} {p.has_api_key ? "· key" : ""}</div>
+                    </div>
+                    <label class="model-row" style="margin:0; padding:0; background:transparent; border:none">
+                      <input type="checkbox" checked={p.enabled} onchange={() => toggleProvider(p.id, !p.enabled)} />
+                      <span class="modal-hint" style="margin:0">{p.enabled ? "enabled" : "disabled"}</span>
+                    </label>
+                    <button class="danger" onclick={() => deleteProvider(p.id)} style="padding:4px 10px; font-size:12px">Delete</button>
+                  </div>
+                {/each}
+              {/if}
+            {:else if activeSettingsTab === "oauth"}
+              <div class="modal-section">Web Login (OAuth) — per-provider presets</div>
+              <p class="modal-hint">Log in through the provider's browser page — the bearer token is stored encrypted. If you use Chrome, it reuses the Google account already signed in.</p>
+              <div class="provider-grid">
+                {#each Object.entries(AI_OAUTH_PRESETS) as [key, p] (key)}
+                  <div class="provider-card" class:active={oauthFlow === p.flow && oauthAuthUrl === p.authUrl}>
+                    <div class="pc-title">{p.label}</div>
+                    <div class="pc-meta">{p.baseUrl}</div>
+                    <button onclick={() => applyOauthPreset(key)}>Use</button>
+                  </div>
+                {/each}
+                <div class="provider-card">
+                  <div class="pc-title">Custom OAuth</div>
+                  <div class="pc-meta">any OpenAI-compatible provider with standard PKCE</div>
+                  <button onclick={() => { oauthAuthUrl = ""; oauthTokenUrl = ""; oauthClientId = ""; oauthClientSecret = ""; oauthScope = ""; oauthFlow = "standard"; }}>Clear</button>
+                </div>
+              </div>
+              <label class="modal-field">
+                Endpoint
+                <input bind:value={aiBaseUrl} placeholder="http://host:port/v1" />
+              </label>
+              <label class="modal-field">
+                Model
+                <input
+                  bind:value={aiModel}
+                  placeholder={modelsList.length ? "select a model" : "model-name — save to auto-fetch"}
+                  list="ai-model-list-oauth"
+                />
+                <datalist id="ai-model-list-oauth">
+                  {#each allModels as m (m)}
+                    <option value={m}></option>
+                  {/each}
+                </datalist>
+              </label>
+              <label class="modal-field">
+                OAuth authorize URL
+                <input bind:value={oauthAuthUrl} placeholder="https://provider.example/oauth/authorize" />
+              </label>
+              <label class="modal-field">
+                OAuth token URL
+                <input bind:value={oauthTokenUrl} placeholder="https://provider.example/oauth/token" />
+              </label>
+              <label class="modal-field">
+                Client ID
+                <input bind:value={oauthClientId} placeholder="client id from your OAuth app" />
+              </label>
+              <label class="modal-field">
+                Client secret (optional — confidential clients only)
+                <input
+                  bind:value={oauthClientSecret}
+                  type="password"
+                  placeholder={oauthHasSecret ? "••• (set — encrypted)" : "leave blank for PKCE public clients"}
+                />
+              </label>
+              <label class="modal-field">
+                Scope (optional)
+                <input bind:value={oauthScope} placeholder="e.g. openid profile email" />
+              </label>
+              <label class="modal-field">
+                Redirect URI (auto-filled — must match the OAuth app)
+                <input bind:value={oauthRedirectUri} placeholder="http://host:8080/oauth/callback" />
+              </label>
+              <div class="modal-inline">
+                <button
+                  type="button"
+                  onclick={startOauthLogin}
+                  disabled={aiOauthBusy || !oauthAuthUrl.trim() || !oauthTokenUrl.trim() || (!oauthClientId.trim() && oauthFlow !== "openrouter") || !aiBaseUrl.trim() || !aiModel.trim()}
+                >
+                  {aiOauthBusy ? "Opening login…" : aiHasKey && aiAuthMethod === "oauth" ? "Log in again" : "Log in"}
+                </button>
+                {#if aiHasKey && aiAuthMethod === "oauth"}
+                  <span class="ai-test ok">✓ token set (encrypted)</span>
+                {/if}
+              </div>
+              <div class="modal-inline" style="margin-top:4px">
+                <button
+                  type="button"
+                  onclick={testAiConfig}
+                  disabled={aiTestBusy || !aiBaseUrl.trim() || (!aiKey.trim() && !aiHasKey)}
+                >
+                  {aiTestBusy ? "Testing…" : "Test connection"}
+                </button>
+                {#if aiTest}
+                  <span class="ai-test {aiTest.ok ? 'ok' : 'err'}">
+                    {aiTest.ok ? "✓ " : "✗ "}{aiTest.msg}
+                  </span>
+                {/if}
+              </div>
+              <div class="modal-section">Saved providers</div>
+              {#if savedProviders.length === 0}
+                <p class="modal-hint">No saved providers yet.</p>
+              {:else}
+                {#each savedProviders as p (p.id)}
+                  <div class="provider-card" style="flex-direction:row; align-items:center; gap:10px">
+                    <div style="flex:1; min-width:0">
+                      <div class="pc-title">{p.label}</div>
+                      <div class="pc-meta" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis">{p.base_url} · {p.model || "no model"} {p.has_api_key ? "· key" : ""}</div>
+                    </div>
+                    <label class="model-row" style="margin:0; padding:0; background:transparent; border:none">
+                      <input type="checkbox" checked={p.enabled} onchange={() => toggleProvider(p.id, !p.enabled)} />
+                      <span class="modal-hint" style="margin:0">{p.enabled ? "enabled" : "disabled"}</span>
+                    </label>
+                    <button class="danger" onclick={() => deleteProvider(p.id)} style="padding:4px 10px; font-size:12px">Delete</button>
+                  </div>
+                {/each}
+              {/if}
+            {:else if activeSettingsTab === "models"}
+              <div class="modal-section">Models — fetched from enabled providers</div>
+              {#if !savedProviders.some((p: any) => p.enabled)}
+                <p class="modal-hint">No enabled providers yet — add one in API Providers, then its models appear here.</p>
+              {:else}
+                <div class="modal-inline">
+                  <button type="button" onclick={loadModels} disabled={modelsLoading}>{modelsLoading ? "Loading…" : "Refresh from provider"}</button>
+                  {#if modelsError}<span class="ai-test err">{modelsError}</span>{/if}
+                </div>
+                <div class="modal-inline" style="margin-top:6px">
+                  <button type="button" onclick={() => (enabledModels = [...visibleModels])} disabled={!visibleModels.length}>Enable all</button>
+                  <button type="button" onclick={() => (enabledModels = [])} disabled={!enabledModels.length}>Disable all</button>
+                  <label class="modal-field" style="margin:0; min-width:120px">
+                    <select bind:value={modelProviderFilter} style="padding:4px 8px; font-size:12px">
+                      <option value="all">All providers</option>
+                      {#each savedProviders.filter((p: any) => p.enabled) as p (p.id)}
+                        <option value={p.id}>{p.label || p.base_url}</option>
+                      {/each}
+                    </select>
+                  </label>
+                  <label class="modal-field" style="margin:0; min-width:120px">
+                    <select bind:value={modelPaidFilter} style="padding:4px 8px; font-size:12px">
+                      <option value="all">All pricing</option>
+                      <option value="free">Free only</option>
+                      <option value="paid">Paid only</option>
+                    </select>
+                  </label>
+                  <label class="model-row" style="margin-left:8px; padding:0; background:transparent; border:none">
+                    <input type="checkbox" bind:checked={showNonToolModels} />
+                    <span class="modal-hint" style="margin:0">Show non-tool ({modelsList.length - toolCapableModels.length} hidden)</span>
+                  </label>
+                  <span class="modal-hint" style="margin-left:auto">{enabledModels.length}/{visibleModels.length} enabled</span>
+                </div>
+                {#if visibleModels.length}
+                  <div class="model-list">
+                    {#each visibleModels as m (m)}
+                      <label class="model-row">
+                        <input type="checkbox" checked={enabledModels.includes(m)} onchange={() => toggleModel(m)} />
+                        <span>{m}</span>
+                        {#if modelOwner[m]?.length > 0 && modelProviderFilter === "all"}
+                          <span class="modal-hint" style="margin-left:6px; opacity:.8">{modelOwnerLabels(m)}</span>
+                        {/if}
+                        {#if modelFreeMap[m]}<span class="modal-hint" style="margin-left:6px; color:#3fb950">free</span>
+                        {:else if modelFreeMap[m] === false}<span class="modal-hint" style="margin-left:6px">paid</span>{/if}
+                        {#if !isToolCapable(m)}<span class="modal-hint" style="margin-left:auto">non-tool</span>{/if}
+                      </label>
+                    {/each}
+                  </div>
+                {:else if !modelsError}
+                  <p class="modal-hint">No tool-capable models found — tick “Show non-tool” or click Refresh.</p>
+                {/if}
+                <p class="modal-hint" style="margin-top:8px">Disabled models are hidden from the chat model switcher. The current model ({aiModel || "none"}) always stays visible.</p>
+              {/if}
+            {:else}
+              <div class="modal-section">General</div>
+              <label class="modal-field">
+                Autonomy
+                <select bind:value={autonomy}>
+                  <option value="ask-first">Ask first (default)</option>
+                  <option value="propose-first">Propose first (approve every command)</option>
+                  <option value="read-only-auto">Read-only auto</option>
+                </select>
+              </label>
+              <div class="modal-section">Appearance</div>
+              <label class="modal-field">
+                Theme
+                <select bind:value={themeName}>
+                  <option value="dark">Dark (default)</option>
+                </select>
+              </label>
+            {/if}
+          </div>
+        </div>
 
         <div class="modal-btns">
-          <button class="danger" type="button" onclick={deleteAiConfig}>
-            Delete provider
-          </button>
           <div class="spacer"></div>
-          <button onclick={() => (showSettings = false)}>Cancel</button>
-          <button
-            class="primary"
-            onclick={saveSettings}
-            disabled={!aiBaseUrl.trim() || !aiModel.trim()}
-          >
-            Save
-          </button>
+          <button onclick={() => tryCloseSettings()}>Cancel</button>
+          <button class="primary" onclick={saveSettings} disabled={!aiBaseUrl.trim() || !isSettingsDirty}>Save</button>
         </div>
       </div>
     </div>
@@ -2759,19 +3770,20 @@
   }
   .toast {
     position: fixed;
-    bottom: 18px;
+    top: 16px;
     left: 50%;
     transform: translateX(-50%);
-    z-index: 1000;
+    z-index: 3000;
     max-width: 90vw;
     background: #1c2128;
     border: 1px solid #3d444d;
     border-left: 3px solid #2f81f7;
     color: #e6edf3;
     border-radius: 8px;
-    padding: 8px 14px;
+    padding: 10px 16px;
     font-size: 13px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    font-weight: 600;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
     animation: toast-in 0.15s ease-out;
   }
   .toast.err {
@@ -2780,7 +3792,7 @@
   @keyframes toast-in {
     from {
       opacity: 0;
-      transform: translate(-50%, 8px);
+      transform: translate(-50%, -8px);
     }
     to {
       opacity: 1;
@@ -3155,6 +4167,167 @@
     border-radius: 10px;
     padding: 18px 20px;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .modal.modal-large {
+    width: 900px;
+    max-width: 92vw;
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+  }
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px 12px;
+    border-bottom: 1px solid #21262d;
+    flex: none;
+  }
+  .modal-header .modal-title {
+    margin-bottom: 0;
+  }
+  .modal-close {
+    background: transparent;
+    border: 1px solid #30363d;
+    color: #8b949e;
+    border-radius: 6px;
+    width: 28px;
+    height: 28px;
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    display: grid;
+    place-items: center;
+  }
+  .modal-close:hover {
+    background: #21262d;
+    color: #e6edf3;
+  }
+  .modal-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .settings-nav {
+    width: 160px;
+    flex: none;
+    background: #010409;
+    border-right: 1px solid #21262d;
+    display: flex;
+    flex-direction: column;
+    padding: 12px 8px;
+    gap: 6px;
+  }
+  .settings-nav button {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #8b949e;
+    border-radius: 6px;
+    padding: 8px 10px;
+    text-align: left;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .settings-nav button.active {
+    background: #21262d;
+    border-color: #30363d;
+    color: #e6edf3;
+  }
+  .settings-nav button:hover {
+    background: #161b22;
+  }
+  .settings-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+  }
+  .modal-hint {
+    font-size: 12.5px;
+    color: #8b949e;
+    margin: -4px 0 12px;
+    line-height: 1.4;
+  }
+  .provider-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .provider-card {
+    background: #010409;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .provider-card.active {
+    border-color: #1f6feb;
+    background: #0d1a33;
+  }
+  .provider-card .pc-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #e6edf3;
+  }
+  .provider-card .pc-meta {
+    font-size: 11.5px;
+    color: #8b949e;
+    line-height: 1.3;
+    min-height: 28px;
+    word-break: break-word;
+  }
+  .provider-card button {
+    align-self: flex-start;
+    border: 1px solid #30363d;
+    background: #21262d;
+    color: #e6edf3;
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .provider-card button.active {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+  }
+  .settings-content .modal-section:first-child {
+    margin-top: 0;
+    border-top: none;
+    padding-top: 0;
+  }
+  .model-list {
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    padding: 6px;
+    background: #010409;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .model-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #e6edf3;
+    padding: 4px 6px;
+    border-radius: 6px;
+  }
+  .model-row:hover {
+    background: #161b22;
+  }
+  .model-row input {
+    accent-color: #1f6feb;
   }
   .modal-title {
     font-size: 16px;

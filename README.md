@@ -63,8 +63,10 @@ Both modes share the same **approval gate**:
   with an **agent / terminal mode badge**, and an **Activity** log. The AI is
   **agent-aware**: it detects whether `puppetterm-agent` is installed on the host and
   adapts its tools + behavior accordingly (structured agent tools vs live-terminal only).
-- **Multi-provider AI** — your API key is **encrypted at rest** (ChaCha20-Poly1305,
-  machine-bound); plaintext never touches disk and is never committed.
+ - **Multi-provider AI** — your API key is **encrypted at rest** (ChaCha20-Poly1305,
+   machine-bound); plaintext never touches disk and is never committed. You can also
+   authenticate via **Web login (OAuth)** (PKCE) for providers like GitHub Models and
+   OpenRouter — the bearer token is stored in the same encrypted slot, no key to paste.
 - **In-app agent installer** — user-space by default (no sudo); auto-upgrades to root
   when passwordless sudo exists; **idempotent**.
 - **Audit trail** — every action is recorded in a client-side SQLite DB (append-only)
@@ -142,6 +144,8 @@ What compose mounts:
 | `puppetterm-ssh` volume | Writable `~/.ssh` inside the container (`known_hosts`, ControlMaster sockets). |
 | `puppetterm-config` volume | AI config + audit DB + pinned machine-id (the encrypted AI key survives restarts). |
 
+> **Updating SSH keys/hosts:** host `~/.ssh` changes are only synced at container startup (`docker/entrypoint.sh:24-31` copies `/ssh-in` → `~/.ssh`). After adding a key/host or editing `~/.ssh/config`, run `docker compose restart puppetterm` (or `docker compose up -d`) — no rebuild needed.
+
 Useful knobs: `PUPPETTERM_PORT` (host port), `PUPPETTERM_SSH_DIR` (alternate
 SSH dir), `PUID`/`PGID` (container user), `PUPPETTERM_AI_*` (AI provider env
 overrides). The AI provider/model/key can also be set in-app via ⚙ Settings.
@@ -187,17 +191,53 @@ no-pty,…`) — it can only invoke the agent, never open a shell.
 
 ## AI configuration
 
-Open **Settings (⚙)** in the app:
+Open **Settings (⚙)** in the app. The AI talks to any **OpenAI-compatible** chat
+endpoint. There are two ways to authenticate:
+
+### 1. API key (static)
 
 - **Provider** — Custom (OpenAI-compatible), DeepSeek, or Claude (Anthropic).
-- **Endpoint / Model / API key** — presets prefill for DeepSeek/Claude.
-- **Test connection** — validate the endpoint/model/key with a live completion call before saving.
+- **Endpoint / Model / API key** — presets prefill for DeepSeek/Claude; for the
+  Custom provider paste your own base URL (e.g. Google AI Studio, OpenRouter, a
+  self-hosted gateway).
+
+### 2. Web login (OAuth — no key)
+
+Pick **Authentication → Web login (OAuth)** to log in through the provider's
+browser login instead of pasting a key. The app opens the provider's authorize
+page, the provider redirects back to the app, and the returned **bearer token is
+stored encrypted at rest** (same slot as an API key) — the chat path is unchanged.
+
+- **Provider preset** — pick a preset to auto-fill the endpoint and OAuth
+  metadata (no need to copy URLs by hand):
+  - **GitHub Models** — standard OAuth: logs in via `github.com`, then calls
+    `https://models.inference.ai.azure.com/openai/v1` (scope `read:models`).
+  - **OpenRouter** — OpenRouter's PKCE flow: logs in at `https://openrouter.ai/auth`,
+    then exchanges the code for a long-lived API key at `https://openrouter.ai/api/v1/auth/keys`.
+  - **Google (Chrome account)** — standard OAuth via the Google account already
+    signed into Chrome: `accounts.google.com` → `generativelanguage.googleapis.com/v1beta/openai/`
+    (model `gemini-2.0-flash`, scope `generative-language.retriever` + `cloud-platform`).
+    Chrome reuses your existing Google session, so no extra password if you're already logged in.
+- **Manual OAuth** — any OpenAI-compatible provider that exposes a standard
+  authorization-code + PKCE endpoint: fill **Auth URL**, **Token URL**, **Client ID**,
+  **Scope** (optional), and **Redirect URI** yourself.
+- **Log in** — opens the provider login in a popup and polls until the token lands.
+
+> ⚙️ **Redirect URI** — register `<your-server-origin>/oauth/callback` as the OAuth
+> app's redirect/callback URL (OpenRouter identifies the app by the `callback_url`).
+> This callback route is exempt from HTTP basic auth so the provider redirect can reach it.
+
+### Common notes
+
+- **Test connection** — validate the endpoint/model/key (or token) with a live
+  completion call before saving.
 - **Delete provider** — remove a configured provider from the UI.
 - The config is stored at `~/.config/puppetterm/ai.json` (outside the repo, `chmod 600`);
-  the key is encrypted at rest. Env overrides: `PUPPETTERM_AI_BASE_URL`, `PUPPETTERM_AI_MODEL`,
-  `PUPPETTERM_AI_API_KEY`, `PUPPETTERM_AI_PROVIDER`.
+  the key/token is encrypted at rest and never sent to the browser. Env overrides:
+  `PUPPETTERM_AI_BASE_URL`, `PUPPETTERM_AI_MODEL`, `PUPPETTERM_AI_API_KEY`,
+  `PUPPETTERM_AI_PROVIDER`.
 
-> 🔒 **Never commit API keys.** `ai.json` and everything under `~/.config/puppetterm/`
+> 🔒 **Never commit API keys/tokens.** `ai.json` and everything under `~/.config/puppetterm/`
 > are outside the repository.
 
 ## Security notes

@@ -19,3 +19,6 @@ sha2 = "0.10"
 getrandom = "0.2"
 base64 = { workspace = true }
 tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

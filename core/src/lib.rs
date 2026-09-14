@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod ai;
 pub mod audit;
+pub mod chat_history;
 pub mod install;
 pub mod sessions;
 pub mod ssh;

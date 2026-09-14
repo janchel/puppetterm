@@ -421,6 +421,68 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
             }
         }
 
+        // ---- chat history ----------------------------------------------------
+        "chat_list_conversations" => run_blocking(move || {
+            let host = arg_str(&args, "host");
+            puppetterm_core::chat_history::list_conversations(&host)
+                .map(|list| json!({ "conversations": list }))
+        })
+        .await,
+        "chat_new" => run_blocking(move || {
+            let host = arg_str(&args, "host");
+            let title = arg_str(&args, "title");
+            puppetterm_core::chat_history::create_conversation(&host, &title)
+                .map(|id| json!({ "id": id }))
+        })
+        .await,
+        "chat_load" => run_blocking(move || {
+            let id = arg_str(&args, "id");
+            puppetterm_core::chat_history::get_conversation(&id)
+                .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+        })
+        .await,
+        "chat_rename" => run_blocking(move || {
+            let id = arg_str(&args, "id");
+            let title = arg_str(&args, "title");
+            puppetterm_core::chat_history::rename_conversation(&id, &title)?;
+            Ok(json!(null))
+        })
+        .await,
+        "chat_delete" => run_blocking(move || {
+            let id = arg_str(&args, "id");
+            puppetterm_core::chat_history::delete_conversation(&id)?;
+            Ok(json!(null))
+        })
+        .await,
+        "chat_append" => run_blocking(move || {
+            let id = arg_str(&args, "conversation_id");
+            let role = arg_str(&args, "role");
+            let content = args.get("content").and_then(|v| v.as_str());
+            let tool_call_id = args.get("tool_call_id").and_then(|v| v.as_str());
+            let tool_calls = args.get("tool_calls").and_then(|v| v.as_str());
+            puppetterm_core::chat_history::append_message(
+                &id, &role, content, tool_call_id, tool_calls,
+            )?;
+            // Auto-title from first user message
+            let _ = puppetterm_core::chat_history::auto_title_from_first_message(&id);
+            Ok(json!(null))
+        })
+        .await,
+        "chat_replace_all" => run_blocking(move || {
+            let id = arg_str(&args, "conversation_id");
+            let messages: Vec<puppetterm_core::chat_history::ChatMsg> =
+                match args.get("messages") {
+                    Some(m) => match serde_json::from_value(m.clone()) {
+                        Ok(m) => m,
+                        Err(e) => return Err(format!("invalid messages: {e}")),
+                    },
+                    None => return Err("missing messages".into()),
+                };
+            puppetterm_core::chat_history::replace_messages(&id, &messages)?;
+            Ok(json!(null))
+        })
+        .await,
+
         other => err(format!("unknown command: {other}")),
     }
 }

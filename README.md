@@ -59,10 +59,11 @@ Both modes share the same **approval gate**:
 - **Tabbed terminals** (xterm.js) — local-first: launch opens a local shell; type
   `ssh user@host` to connect (the tab follows the host, even from shell history).
 - **Resizable AI chat panel** with a **provider/model switcher** (custom
-  OpenAI-compatible, DeepSeek, or Claude), **new chat**, live "acting on \<host\>" banner
-  with an **agent / terminal mode badge**, and an **Activity** log. The AI is
-  **agent-aware**: it detects whether `puppetterm-agent` is installed on the host and
-  adapts its tools + behavior accordingly (structured agent tools vs live-terminal only).
+  OpenAI-compatible, DeepSeek, or Claude), **new chat** and a **conversation history
+  sidebar** (☰), live "acting on \<host\>" banner with an **agent / terminal mode badge**,
+  and an **Activity** log. The AI is **agent-aware**: it detects whether
+  `puppetterm-agent` is installed on the host and adapts its tools + behavior
+  accordingly (structured agent tools vs live-terminal only).
  - **Multi-provider AI** — your API key is **encrypted at rest** (ChaCha20-Poly1305,
    machine-bound); plaintext never touches disk and is never committed. You can also
    authenticate via **Web login (OAuth)** (PKCE) for providers like GitHub Models and
@@ -77,9 +78,13 @@ Both modes share the same **approval gate**:
   per command (truncated with a "narrow your command" hint), and a paginated `read`
   tool (`offset`/`limit`) pages through large logs without dumping them into context.
   The AI is told to `grep` first, then `read` the exact range.
-- **Local chat history** — the conversation auto-persists in the browser (localStorage)
-  and can be **dumped** to Markdown or JSON; the AI is instructed not to trust stale
-  chat/activity history and to re-query the live server state instead.
+- **Multi-conversation chat history** — every host keeps its own set of named
+  conversations, persisted **server-side in SQLite** (`~/.config/puppetterm/chat.db`)
+  and cached in localStorage for instant load. Use **☰ history** in the AI panel to
+  list per-host conversations, **click to load** a past one, **rename** (✎ edit icon),
+  or **delete** (🗑 with confirmation). Conversations are auto-titled from the
+  first user message and can be **dumped** to Markdown or JSON; the AI is instructed
+  not to trust stale chat/activity history and to re-query the live server state instead.
 - **Audit detail on demand** — the Activity panel is click-to-expand: each row shows the
   command plus the full output (stored in a file, kept out of the SQLite index and out
   of AI context).
@@ -142,7 +147,7 @@ What compose mounts:
 |---|---|
 | `$HOME/.ssh` → `/ssh-in` (**read-only**) | Your existing keys/config, copied by the entrypoint into the container's own writable `~/.ssh`. The host's real files are never modified. |
 | `puppetterm-ssh` volume | Writable `~/.ssh` inside the container (`known_hosts`, ControlMaster sockets). |
-| `puppetterm-config` volume | AI config + audit DB + pinned machine-id (the encrypted AI key survives restarts). |
+| `puppetterm-config` volume | AI config + audit + chat-history SQLite DBs + pinned machine-id (the encrypted AI key survives restarts). |
 
 > **Updating SSH keys/hosts:** host `~/.ssh` changes are only synced at container startup (`docker/entrypoint.sh:24-31` copies `/ssh-in` → `~/.ssh`). After adding a key/host or editing `~/.ssh/config`, run `docker compose restart puppetterm` (or `docker compose up -d`) — no rebuild needed.
 
@@ -256,7 +261,7 @@ stored encrypted at rest** (same slot as an API key) — the chat path is unchan
 | Path | What it is |
 |---|---|
 | `agent/` | Go — stateless remote worker (`puppetterm-agent`), invoked through SSH (NDJSON on stdin/stdout). No listener, no daemon. |
-| `core/` | Rust — shared backend logic (SSH sessions, agent bridge, AI client, audit DB, installer). No UI dependencies. |
+| `core/` | Rust — shared backend logic (SSH sessions, agent bridge, AI client, audit + chat-history SQLite DBs, installer). No UI dependencies. |
 | `client/` | Tauri desktop app (Svelte 5 + xterm.js) — tabbed terminals + AI chat panel. |
 | `server/` | Rust — headless axum server: same commands over HTTP + WebSocket, serves the web UI. |
 | `installer/` | `install.sh` + sudoers/`authorized_keys` templates for hardening. |

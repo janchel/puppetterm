@@ -1,5 +1,6 @@
 <script lang="ts">
   import { call, on, type UnlistenFn } from "$lib/backend";
+  import { ChatStore, type ChatMessage, type ConversationMeta } from "$lib/chat-store.svelte";
   import { Terminal } from "xterm";
   import "xterm/css/xterm.css";
   import { FitAddon } from "@xterm/addon-fit";
@@ -792,60 +793,67 @@
   let chatBusy = $state(false);
   let aiThinking = $state(false);
   let chatText = $state("");
-  // Chat history is persisted locally (see the $effect below) so a page reload
-  // keeps the conversation; we restore it here on first load.
-  // Chat sessions are kept per-host: one conversation per SSH target / tab, so
-  // switching tabs switches the visible history. Each is stored under its own
-  // localStorage key (pp.chat.<host>.session).
-  function chatKey(host: string) {
-    return `pp.chat.${host}.session`;
-  }
+
+  // ---- multi-conversation chat store (server-side SQLite + localStorage cache) ----
+  const chatStore = new ChatStore();
+  let conversationList = $state<ConversationMeta[]>([]);
+  let showConvos = $state(false); // toggle conversation sidebar
+  let renamingId = $state<string | null>(null);
+  let renameText = $state("");
+
+  // Expose store state as reactive bindings for template compatibility.
+  let chatLog = $derived(chatStore.chatLog);
+  let history = $derived(chatStore.history);
+
+  // Route to pinned task's host if a task is running, else active host
   function chatHostOf(h: string | null | undefined) {
     return h && h.length ? h : "__local__";
   }
-  function loadChatFor(host: string): { chatLog: any[]; history: any[] } {
-    if (typeof localStorage === "undefined") return { chatLog: [], history: [] };
-    let raw = localStorage.getItem(chatKey(host));
-    // Back-compat: fall back to the old single global session if it matches this host.
-    if (!raw) {
-      const g = localStorage.getItem("pp.chat.session");
-      if (g) {
-        try {
-          const v = JSON.parse(g);
-          if (v && v.host === host && Array.isArray(v.chatLog)) raw = g;
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-    if (raw) {
-      try {
-        const v = JSON.parse(raw);
-        if (v && Array.isArray(v.chatLog)) {
-          return {
-            chatLog: v.chatLog,
-            history: Array.isArray(v.history) ? v.history : [],
-          };
-        }
-      } catch {
-        /* corrupt — start fresh */
-      }
-    }
-    return { chatLog: [], history: [] };
+
+  function pushChat(role: string, text: string) {
+    chatStore.pushChat(role, text);
   }
 
-  const _initialHost = chatHostOf(activeHost);
-  const _initial = loadChatFor(_initialHost);
-  let chats = $state<Record<string, { chatLog: any[]; history: any[] }>>({});
-  // Seed the active host from storage (per-host) + keep one conversation per
-  // SSH target / tab, so switching tabs switches the visible history.
-  chats[_initialHost] = _initial;
-  // The visible chat is always the active host's entry (derived, so it follows
-  // the tab automatically). Writes go through helpers that route to the right
-  // host — a pinned in-flight task streams into its OWN host's chat, not the
-  // one currently on screen.
-  let chatLog = $derived(chats[chatHostOf(activeHost)]?.chatLog ?? []);
-  let history = $derived(chats[chatHostOf(activeHost)]?.history ?? []);
+  function setHistory(_host: string, next: any[]) {
+    chatStore.setHistory(next);
+  }
+
+  function getHistory(_host: string) {
+    return chatStore.getHistory();
+  }
+
+  // Refresh the conversation list sidebar for the active host.
+  async function refreshConversations() {
+    conversationList = await chatStore.listConversations(activeHost ?? "");
+  }
+
+  // Load a conversation from the server into the active chat.
+  async function loadConversation(id: string) {
+    await chatStore.loadConversation(id);
+    showConvos = false;
+  }
+
+  // Delete a conversation after confirmation.
+  async function deleteConversation(id: string) {
+    await chatStore.deleteConversation(id);
+    await refreshConversations();
+  }
+
+  // Start renaming a conversation.
+  function startRename(c: ConversationMeta) {
+    renamingId = c.id;
+    renameText = c.title;
+  }
+
+  // Commit the rename.
+  async function commitRename() {
+    if (renamingId && renameText.trim()) {
+      await chatStore.renameConversation(renamingId, renameText.trim());
+      await refreshConversations();
+    }
+    renamingId = null;
+    renameText = "";
+  }
   let autonomy = $state(
     typeof localStorage !== "undefined"
       ? (localStorage.getItem("pp.autonomy") ?? "ask-first")
@@ -875,75 +883,21 @@
     localStorage.setItem("pp.autonomy", autonomy);
   });
 
-  function chatEntry(host: string) {
-    if (!chats[host]) {
-      chats[host] = { chatLog: [], history: [{ role: "system", content: SYSTEM_PROMPT }] };
-    }
-    return chats[host];
-  }
-  function saveChat(host: string) {
-    if (typeof localStorage === "undefined") return;
-    const e = chats[host];
-    if (!e) return;
-    try {
-      localStorage.setItem(
-        chatKey(host),
-        JSON.stringify({ chatLog: e.chatLog, history: e.history, host, savedAt: Date.now() }),
-      );
-    } catch {
-      /* ignore quota / serialization errors */
-    }
-  }
-  function appendChat(host: string, role: string, text: string) {
-    const e = chatEntry(host);
-    e.chatLog = [...e.chatLog, { role, text }];
-    saveChat(host);
-  }
-  function setHistory(host: string, next: any[]) {
-    const e = chatEntry(host);
-    e.history = next;
-    saveChat(host);
-  }
-  function getHistory(host: string) {
-    return chats[host]?.history ?? [{ role: "system", content: SYSTEM_PROMPT }];
-  }
-  // Messages route to the pinned task's host when one is running, else the
-  // active host (so streaming during a tab switch lands in the right chat).
-  function pushChat(role: string, text: string) {
-    const host = chatTarget != null ? chatHostOf(chatTarget.host) : chatHostOf(activeHost);
-    appendChat(host, role, text);
-  }
-
-  // Persist the active conversation locally (per host) so a reload restores it.
-  // Deep dependency on `chats` re-runs on every message; wrapped in try/catch
-  // because large tool-output histories can exceed the quota.
-  $effect(() => {
-    if (typeof localStorage === "undefined") return;
-    const host = chatHostOf(activeHost);
-    const e = chats[host];
-    if (!e) return;
-    try {
-      localStorage.setItem(
-        chatKey(host),
-        JSON.stringify({ chatLog: e.chatLog, history: e.history, host, savedAt: Date.now() }),
-      );
-    } catch {
-      /* ignore quota / serialization errors */
-    }
-  });
-
-  // Switching tabs changes the active host; the derived chatLog/history already
-  // follow it. Just flush the PREVIOUS host's chat to storage on the way out
-  // (it's only re-saved by the effect above while it's the active host).
-  // `appliedHost` is a plain (non-reactive) guard so this runs only on a switch.
-  let appliedHost: string | null = null;
+  // Reload the conversation list whenever the active host changes, and load
+  // the most recent conversation (or a cached one) for that host.
+  let appliedConvoHost: string | null = null;
   $effect(() => {
     const host = chatHostOf(activeHost);
-    if (host === appliedHost) return;
-    untrack(() => {
-      if (appliedHost) saveChat(appliedHost);
-    });
-    appliedHost = host;
+    if (host === appliedConvoHost) return;
+    appliedConvoHost = host;
+    refreshConversations();
+    // Restore from localStorage cache for instant display (server will refresh).
+    const hadCache = chatStore.loadFromCache(host);
+    if (!hadCache) {
+      // No cache — seed a default system prompt conversation.
+      chatStore.newChat();
+      chatStore.setHistory([{ role: "system", content: SYSTEM_PROMPT }]);
+    }
   });
 
   // ---- settings modal + theme ----------------------------------------------
@@ -1637,17 +1591,17 @@
   }
 
   /** Start a fresh conversation: reset history to just the system prompt and
-   *  clear the visible chat log. History is in-memory (not persisted) and is
-   *  already bounded by compaction while a task runs. */
-  function newChat() {
+   *  clear the visible chat log. Creates a new server-side conversation. */
+  async function newChat() {
     if (chatBusy) return; // don't clear mid-task
-    const h = chatHostOf(activeHost);
-    setHistory(h, [{ role: "system", content: SYSTEM_PROMPT }]);
-    const e = chatEntry(h);
-    e.chatLog = [];
-    saveChat(h);
+    chatStore.newChat();
     chatText = "";
-    pushChat("ai", "(new chat started — earlier conversation cleared)");
+    pushChat("ai", "(new chat started)");
+    // Create a new conversation on the server
+    try {
+      chatStore.activeConversationId = await chatStore.createConversation(activeHost ?? "");
+      await refreshConversations();
+    } catch { /* server unavailable */ }
     notify("New chat started");
   }
 
@@ -1894,16 +1848,10 @@
       return;
     }
     // Pin the target now: the whole task runs against THIS host and streams
-    // into THIS terminal, even if the user switches tabs mid-task. The host may
-    // be empty (local tab) — read_terminal still works, agent tools will say so.
+    // into THIS terminal, even if the user switches tabs mid-task.
     const target = { host: activeHost ?? "", tabId: activeTabId ?? -1 };
     chatTarget = target;
-    // Keep agent presence fresh so we pick the right mode. The in-memory
-    // agentMap is only set by the in-UI install flow or the terminal-buffer
-    // auto-detect; if the agent was installed out-of-band (e.g. via the API)
-    // that flag stays false and we'd wrongly fall back to terminal mode — the
-    // AI would type into the terminal instead of using the agent tools. Re-check
-    // the host once per chat so agent mode activates automatically.
+    // Keep agent presence fresh so we pick the right mode.
     if (target.host) {
       try {
         const ok = await call<boolean>("check_agent", { host: target.host });
@@ -1913,10 +1861,6 @@
         /* leave the current state as-is */
       }
     }
-    // Agent-aware: choose the tool set + system prompt based on whether the
-    // remote agent is installed, so the AI knows if it's in agentic mode. The
-    // tab's current working directory (parsed from the prompt) is also passed
-    // so the AI knows where it's working.
     const tab = target.tabId >= 0 ? tabs.find((x) => x.id === target.tabId) : null;
     const cfg = chatConfigFor(target.host, tab?.cwd || null);
     chatTools = cfg.tools;
@@ -1929,18 +1873,18 @@
       `(acting on ${target.host || "the local terminal"} — ${cfg.hasAgent ? "agent mode" : "terminal mode"})`,
     );
     // Keep the system prompt in the conversation in sync with the current host
-    // (agent vs terminal mode), so a host switch mid-conversation re-frames it.
-    // All writes route to the target host's chat (see pushChat / setHistory).
-    const th = chatHostOf(target.host);
     const userMsg = { role: "user", content: text };
-    setHistory(th, [
+    setHistory(chatHostOf(target.host), [
       { role: "system", content: cfg.prompt },
-      ...getHistory(th).filter((m) => m.role !== "system"),
+      ...chatStore.getHistory().filter((m) => m.role !== "system"),
       userMsg,
     ]);
     chatBusy = true;
     try {
       await runAiLoop();
+      // Persist after the loop completes
+      await chatStore.persistConversation(target.host);
+      await refreshConversations();
     } finally {
       chatBusy = false;
       aiThinking = false;
@@ -2339,27 +2283,19 @@
   async function runAiLoop() {
     try {
       let guard = 0;
-      // Generous for legitimate multi-step work (reading a large file in
-      // sections, several edits). The guard is only a safety net against
-      // runaway loops — real loops are caught by the repeat check below
-      // instead of just a raw step count, so 25 was cutting off genuine tasks
-      // like "read server.py in sections" mid-way.
       const MAX_STEPS = 60;
       let lastSig: string | null = null;
       let repeatCount = 0;
-      // All history writes/reads in this loop target the pinned task's host, so
-      // a tab switch mid-task streams into the correct host's chat.
-      const th = chatHostOf(chatTarget?.host ?? "");
       while (guard++ < MAX_STEPS) {
         if (abortRequested) {
           pushChat("ai", "(aborted by user)");
           return;
         }
-        setHistory(th, compactHistory(getHistory(th)));
+        chatStore.setHistory(compactHistory(chatStore.getHistory()));
         aiThinking = true;
         let resp: any;
         try {
-          resp = await call<any>("ai_chat", { messages: getHistory(th), tools: chatTools });
+          resp = await call<any>("ai_chat", { messages: chatStore.getHistory(), tools: chatTools });
         } finally {
           aiThinking = false;
         }
@@ -2369,18 +2305,13 @@
           return;
         }
         if (msg.tool_calls && msg.tool_calls.length > 0) {
-          // Show the AI's explanation even when it also calls a tool — otherwise
-          // the user only sees the approval dialog and never the answer/plan.
           const explain = (msg.content ?? "").trim();
           if (explain) pushChat("ai", explain);
-          setHistory(th, [
-            ...getHistory(th),
+          chatStore.setHistory([
+            ...chatStore.getHistory(),
             { role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls },
           ]);
           for (const tc of msg.tool_calls) {
-            // Loop guard: repeating the EXACT same tool call 3 times in a row
-            // means the model is stuck, not making progress — stop early
-            // instead of burning all MAX_STEPS.
             const sig = `${tc.function.name}:${tc.function.arguments}`;
             if (sig === lastSig) {
               repeatCount++;
@@ -2399,13 +2330,13 @@
             const content = ok
               ? JSON.stringify(await executeTool(tc))
               : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
-            setHistory(th, [...getHistory(th), { role: "tool", tool_call_id: tc.id, content }]);
+            chatStore.setHistory([...chatStore.getHistory(), { role: "tool", tool_call_id: tc.id, content }]);
           }
           continue;
         }
         const text = msg.content ?? "(done)";
         pushChat("ai", text);
-        setHistory(th, [...getHistory(th), { role: "assistant", content: text }]);
+        chatStore.setHistory([...chatStore.getHistory(), { role: "assistant", content: text }]);
         return;
       }
       pushChat(
@@ -2955,7 +2886,13 @@
         }
         aiReady = true;
         if (aiProvider === "openai") customBaseUrl = v.base_url || "";
-        setHistory(chatHostOf(activeHost), [{ role: "system", content: SYSTEM_PROMPT }]);
+        // Seed a fresh conversation with the default system prompt only if the
+        // store holds nothing yet (avoids wiping a loaded conversation).
+        if (chatStore.getHistory().length === 0 && chatStore.chatLog.length === 0) {
+          chatStore.setHistory([{ role: "system", content: SYSTEM_PROMPT }]);
+        }
+        // Load the conversation list for the initial host (server-side DB).
+        await refreshConversations();
         loadModels().catch(() => {});
       } catch (e) {
         console.warn("ai config unavailable:", e);
@@ -3086,9 +3023,19 @@
           class="ai-settings-link"
           onclick={newChat}
           disabled={chatBusy}
-          title="Start a new chat (clear this conversation)"
+          title="Start a new chat (creates a new conversation)"
         >
           ＋ new chat
+        </button>
+        <button
+          class="ai-settings-link"
+          onclick={() => {
+            showConvos = !showConvos;
+            if (showConvos) refreshConversations();
+          }}
+          title="Show conversation history"
+        >
+          ☰ history {conversationList.length ? `(${conversationList.length})` : ""}
         </button>
         <button
           class="ai-settings-link"
@@ -3107,6 +3054,62 @@
           ⭳ json
         </button>
       </div>
+
+      {#if showConvos}
+        <div class="convo-panel">
+          <div class="convo-head">
+            <span>Conversations — {activeHost || "local"}</span>
+            <button class="convo-close" onclick={() => (showConvos = false)} title="Close">✕</button>
+          </div>
+          <div class="convo-list">
+            {#if conversationList.length === 0}
+              <p class="muted">No saved conversations yet.</p>
+            {:else}
+              {#each conversationList as c (c.id)}
+                <div
+                  class="convo-item {chatStore.activeConversationId === c.id ? 'active' : ''}"
+                  onclick={() => loadConversation(c.id)}
+                >
+                  <span class="convo-title" title={c.title}>{c.title}</span>
+                  <span class="convo-meta">
+                    {c.message_count} msg{c.message_count === 1 ? "" : "s"} · {new Date(c.updated_at).toLocaleString()}
+                  </span>
+                  {#if renamingId === c.id}
+                    <div class="convo-rename" onclick={(e) => e.stopPropagation()}>
+                      <input
+                        type="text"
+                        bind:value={renameText}
+                        placeholder="Rename"
+                        onkeydown={(e) => {
+                          if (e.key === "Enter") commitRename();
+                          if (e.key === "Escape") renamingId = null;
+                        }}
+                      />
+                      <button onclick={commitRename}>✓</button>
+                      <button onclick={() => (renamingId = null)}>✕</button>
+                    </div>
+                  {:else}
+                    <div class="convo-actions" onclick={(e) => e.stopPropagation()}>
+                      <button
+                        class="convo-act"
+                        title="Rename"
+                        onclick={() => startRename(c)}
+                      >✎</button>
+                      <button
+                        class="convo-act danger"
+                        title="Delete"
+                        onclick={() => {
+                          if (confirm(`Delete conversation "${c.title}"?`)) deleteConversation(c.id);
+                        }}
+                      >🗑</button>
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            {/if}
+          </div>
+        </div>
+      {/if}
 
       {#if !aiReady}
         <div class="ai-unconfigured">
@@ -3931,6 +3934,118 @@
     min-width: 260px;
     border-left: 1px solid #21262d;
     background: #010409;
+  }
+  .convo-panel {
+    display: flex;
+    flex-direction: column;
+    max-height: 240px;
+    border-bottom: 1px solid #21262d;
+    background: #010409;
+    overflow: hidden;
+  }
+  .convo-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8b949e;
+    border-bottom: 1px solid #21262d;
+    background: #0d1117;
+  }
+  .convo-close {
+    background: none;
+    border: none;
+    color: #8b949e;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+  }
+  .convo-close:hover {
+    color: #e6edf3;
+  }
+  .convo-list {
+    overflow-y: auto;
+    flex: 1;
+    padding: 4px 0;
+  }
+  .convo-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 12px;
+    cursor: pointer;
+    border-left: 3px solid transparent;
+  }
+  .convo-item:hover {
+    background: #161b22;
+  }
+  .convo-item.active {
+    background: #1f6feb26;
+    border-left-color: #1f6feb;
+  }
+  .convo-title {
+    font-size: 12px;
+    color: #e6edf3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .convo-meta {
+    font-size: 10px;
+    color: #8b949e;
+  }
+  .convo-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .convo-act {
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #e6edf3;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 6px;
+  }
+  .convo-act:hover {
+    background: #1f6feb;
+    border-color: #1f6feb;
+  }
+  .convo-act.danger:hover {
+    background: #f85149;
+    border-color: #f85149;
+  }
+  .convo-rename {
+    display: flex;
+    gap: 4px;
+    margin-top: 4px;
+  }
+  .convo-rename input {
+    flex: 1;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #e6edf3;
+    font-size: 12px;
+    padding: 2px 6px;
+    outline: none;
+  }
+  .convo-rename input:focus {
+    border-color: #1f6feb;
+  }
+  .convo-rename button {
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #e6edf3;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 6px;
   }
   .pane-title {
     display: flex;

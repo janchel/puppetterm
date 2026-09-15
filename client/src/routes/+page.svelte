@@ -12,6 +12,7 @@
   type Tab = {
     id: number;
     host: string; // remote target ("" = local shell); updated when `ssh <target>` is detected
+    chatHost: string; // last known host the AI chat is bound to — kept even when the live ssh session exits
     cwd: string; // current working directory, parsed from the shell prompt ("" = unknown)
     sessionId: number | null;
     connecting: boolean;
@@ -28,6 +29,16 @@
 
   // The host the AI chat binds to (the active session's host).
   let activeHost = $derived(tabs.find((t) => t.id === activeTabId)?.host ?? null);
+  // The host the AI chat is BOUND TO — decoupled from the live ssh session's
+  // host. When an ssh connection exits we clear `t.host` (label/dot go grey)
+  // but keep `t.chatHost`, so a long conversation never resets to the local
+  // chat just because the terminal disconnected or the user switched tabs.
+  let activeChatHost = $derived(
+    (() => {
+      const t = tabs.find((x) => x.id === activeTabId);
+      return t?.chatHost || t?.host || null;
+    })(),
+  );
   // Current working directory of the active session, parsed from its prompt.
   let activeTabCwd = $derived(tabs.find((t) => t.id === activeTabId)?.cwd ?? "");
 
@@ -810,6 +821,17 @@
     return h && h.length ? h : "__local__";
   }
 
+  // Canonicalize a host so cosmetic reformatting (ssh `host` vs prompt
+  // `user@host`, case, trailing port) can't look like a different server and
+  // reset the chat mid-conversation.
+  function canonicalChatHost(h: string): string {
+    let s = chatHostOf(h).trim().toLowerCase();
+    const at = s.lastIndexOf("@");
+    if (at >= 0) s = s.slice(at + 1);
+    s = s.replace(/:\d+$/, "");
+    return s || "__local__";
+  }
+
   function pushChat(role: string, text: string) {
     chatStore.pushChat(role, text);
   }
@@ -822,13 +844,53 @@
     return chatStore.getHistory();
   }
 
+  // Inject a "connection lost" checkpoint so the model is told the SSH session
+  // terminated, then (via the caller) release the "acting on <host>" binding.
+  // Runs BEFORE unbinding so the host's conversation — and the model's future
+  // context — keeps the checkpoint; the host-switch effect then persists the
+  // conversation and swaps to the local one (both preserved, nothing cleared).
+  async function checkpointConnectionClosed(host: string) {
+    pushChat(
+      "system",
+      `⚠ connection to ${host} closed — the SSH session is terminated. Reconnect (ssh) to re-attach the AI to ${host}.`,
+    );
+    chatStore.setHistory([
+      ...chatStore.getHistory(),
+      {
+        role: "system",
+        content: `[checkpoint] The SSH connection to ${host} was terminated (the terminal returned to the local shell — session ended or dropped). There is no more live terminal output from it. To act on ${host} again, the user must re-establish the SSH session (ssh ${host}); this chat will re-attach automatically once it is detected again.`,
+      },
+    ]);
+    chatStore.persistToCache(host);
+    await chatStore.persistConversation(host);
+    await refreshConversations();
+  }
+
+  // Shared disconnect path: tell the model the bound SSH session ended and
+  // release the "acting on <host>" binding, so the chat stops claiming the
+  // remote. Fired by BOTH the terminal process exiting (pty-exit) AND the
+  // ssh-prompt scan detecting the nested session ended (exit / drop). The pty
+  // never dies for a nested ssh (it's a child of the local shell), so the
+  // prompt scan is the real guard for the common case.
+  async function disconnectBoundHost(t: Tab) {
+    const bound = t.chatHost;
+    if (!bound || t.id !== activeTabId || chatBusy) return;
+    await checkpointConnectionClosed(bound);
+    t.chatHost = "";
+  }
+
   // Refresh the conversation list sidebar for the active host.
   async function refreshConversations() {
-    conversationList = await chatStore.listConversations(activeHost ?? "");
+    conversationList = await chatStore.listConversations(activeChatHost ?? "");
   }
 
   // Load a conversation from the server into the active chat.
   async function loadConversation(id: string) {
+    // Persist the current conversation (if any) before replacing it on screen.
+    if (id !== chatStore.activeConversationId && chatStore.chatLog.length > 0) {
+      await chatStore.persistConversation(activeChatHost ?? "");
+      await refreshConversations();
+    }
     await chatStore.loadConversation(id);
     showConvos = false;
   }
@@ -886,10 +948,21 @@
   // Reload the conversation list whenever the active host changes, and load
   // the most recent conversation (or a cached one) for that host.
   let appliedConvoHost: string | null = null;
+  let appliedConvoCanon: string | null = null;
   $effect(() => {
-    const host = chatHostOf(activeHost);
-    if (host === appliedConvoHost) return;
+    const host = chatHostOf(activeChatHost);
+    const canon = canonicalChatHost(host);
+    // Ignore cosmetic host reformatting for the same server (ssh `host` vs
+    // prompt `user@host`, case, port) — only rebind when it's genuinely a
+    // different server, so a long AI session never "clears for no reason".
+    if (canon === appliedConvoCanon) return;
+    // Persist the outgoing host's conversation before switching hosts.
+    if (appliedConvoHost != null && chatStore.chatLog.length > 0) {
+      chatStore.persistToCache(appliedConvoHost);
+      chatStore.persistConversation(appliedConvoHost);
+    }
     appliedConvoHost = host;
+    appliedConvoCanon = canon;
     refreshConversations();
     // Restore from localStorage cache for instant display (server will refresh).
     const hadCache = chatStore.loadFromCache(host);
@@ -1010,6 +1083,12 @@
   function hostHasAgent(host: string | null | undefined): boolean {
     if (!host) return false;
     return agentMap[host] === true;
+  }
+
+  // Null-safe known-absent check for the mode badge (agentMap[null] isn't valid TS).
+  function hostHasNoAgent(host: string | null | undefined): boolean {
+    if (!host) return false;
+    return agentMap[host] === false;
   }
 
   /** The tools + system prompt to hand the model for a given host, depending
@@ -1298,7 +1377,7 @@
     }
 
     const id = nextTabId++;
-    tabs = [...tabs, { id, host: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "", pendingSshTarget: undefined }];
+    tabs = [...tabs, { id, host: host ?? "", chatHost: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "", pendingSshTarget: undefined }];
     activeTabId = id;
     showHostMenu = false;
     await tick();
@@ -1534,7 +1613,7 @@
    *  `pp.chat.<host>.session` (per host) for reload-restore and JSON export. */
   function dumpChat() {
     if (typeof document === "undefined" || chatLog.length === 0) return;
-    const host = activeHost ?? "local";
+    const host = activeChatHost ?? "local";
     const md: string[] = [
       "# PuppetTerm chat",
       "",
@@ -1563,7 +1642,7 @@
   function dumpChatJson() {
     if (typeof document === "undefined") return;
     const payload = {
-      host: activeHost ?? "local",
+      host: activeChatHost ?? "local",
       dumpedAt: new Date().toISOString(),
       chatLog,
       history,
@@ -1574,7 +1653,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `puppetterm-chat-${activeHost?.replace(/[^a-zA-Z0-9._-]/g, "_") ?? "local"}-${Date.now()}.json`;
+    a.download = `puppetterm-chat-${activeChatHost?.replace(/[^a-zA-Z0-9._-]/g, "_") ?? "local"}-${Date.now()}.json`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1594,12 +1673,18 @@
    *  clear the visible chat log. Creates a new server-side conversation. */
   async function newChat() {
     if (chatBusy) return; // don't clear mid-task
+    // Save the current conversation before starting fresh.
+    const host = activeChatHost ?? "";
+    if (chatStore.chatLog.length > 0) {
+      await chatStore.persistConversation(host);
+      await refreshConversations();
+    }
     chatStore.newChat();
     chatText = "";
     pushChat("ai", "(new chat started)");
     // Create a new conversation on the server
     try {
-      chatStore.activeConversationId = await chatStore.createConversation(activeHost ?? "");
+      chatStore.activeConversationId = await chatStore.createConversation(host);
       await refreshConversations();
     } catch { /* server unavailable */ }
     notify("New chat started");
@@ -1848,8 +1933,9 @@
       return;
     }
     // Pin the target now: the whole task runs against THIS host and streams
-    // into THIS terminal, even if the user switches tabs mid-task.
-    const target = { host: activeHost ?? "", tabId: activeTabId ?? -1 };
+    // into THIS terminal, even if the user switches tabs mid-task (or the
+    // ssh session ends — the agent keeps its own connection in agent mode).
+    const target = { host: activeChatHost ?? "", tabId: activeTabId ?? -1 };
     chatTarget = target;
     // Keep agent presence fresh so we pick the right mode.
     if (target.host) {
@@ -1881,7 +1967,7 @@
     ]);
     chatBusy = true;
     try {
-      await runAiLoop();
+      await runAiLoop(target.host);
       // Persist after the loop completes
       await chatStore.persistConversation(target.host);
       await refreshConversations();
@@ -1905,7 +1991,7 @@
         // actual command on the server stops too (sshd alone won't).
         await call("stop_agent_action", {
           requestId: rid,
-          host: chatTarget?.host ?? activeHost,
+          host: chatTarget?.host ?? activeChatHost ?? "",
         });
       } catch (e) {
         console.error("stop_agent_action", e);
@@ -1926,7 +2012,7 @@
    *  update the live resource readout. Cheap: the agent samples /proc directly
    *  and returns just CPU%/MEM%/load1 (no snapshot payload). */
   async function pollMetrics() {
-    const host = activeHost;
+    const host = activeChatHost;
     if (!host || !hostHasAgent(host)) {
       liveMetrics = null;
       return;
@@ -1953,7 +2039,7 @@
   // Re-runs when the active host or its agent-presence flips; cleans up the
   // timer on change/unmount so we never poll a host without an agent.
   $effect(() => {
-    const host = activeHost;
+    const host = activeChatHost;
     const has = host ? hostHasAgent(host) : false;
     if (!has || !host) {
       liveMetrics = null;
@@ -2028,7 +2114,7 @@
   }
 
   function promptAgentAction(verb: string, mode: "install" | "update") {
-    const host = activeHost;
+    const host = activeChatHost;
     const tabId = activeTabId;
     const term = activeTerm();
     if (!host || !tabId || !term || installBusy) return;
@@ -2051,7 +2137,7 @@
       const res = await call<any>("install_agent_on_host", { host, force });
       term?.write(
         `\r\n\x1b[32m[puppetterm install] ${res?.already && !force ? "already present —" : "done —"} ` +
-          `${res?.mode ?? "user"} agent at ${res?.agent_path ?? "~/.puppetterm/bin/puppetterm-agent"}` +
+          `${res?.mode ?? "user"} agent at ${res?.agent_path ?? "$HOME/.snap/app/puppetterm/bin/puppetterm-agent"}` +
           `\x1b[0m\r\n`,
       );
       // The agent is installed now — clear the "not detected" hint state and
@@ -2181,6 +2267,7 @@
           if (t.host) agentChecked.delete(t.host);
           t.host = target;
         }
+        t.chatHost = target; // keep chat bound to this host even if the session exits later
         checkAndHintAgent(id, t.host);
         return;
       }
@@ -2253,42 +2340,100 @@
     } else if (t.host) {
       checkAndHintAgent(id, t.host);
     }
+    // Track chat binding independently: only advances forward (never clears)
+    // so the conversation stays intact across ssh disconnects.
+    if (newHost) t.chatHost = newHost;
+    // The bound ssh session ended: the scan found no active ssh at this prompt
+    // (nested `exit`, or a dropped connection). The pty does NOT exit for a
+    // nested ssh — it's a child of the local shell — so this is how the chat
+    // learns the remote is gone. Tell the model, then release the binding.
+    if (!newHost && t.chatHost) {
+      disconnectBoundHost(t);
+    }
   }
 
-  // Keep the conversation bounded so long investigations don't blow the
-  // model's context window: drop the middle, keep system + original request +
-  // the most recent turns.
-  const MAX_HISTORY = 40;
-  const MAX_CONTEXT_CHARS = 80000;
+  // Conversation sustainability: keep as much *conversation* context as
+  // possible and only drop bulky tool output when the window really is too big.
+  // The user/assistant exchange (the actual memory) is preserved; tool result
+  // messages (which model re-runs can regenerate) are trimmed first.
+  const MAX_HISTORY = 60;
+  const MAX_CONTEXT_CHARS = 200000;
 
-  function compactHistory(h: any[]): any[] {
-    const chars = h.reduce(
+  function countChars(messages: any[]): number {
+    return messages.reduce(
       (n, m) => n + (typeof m.content === "string" ? m.content.length : 0),
       0,
     );
-    if (h.length <= MAX_HISTORY && chars <= MAX_CONTEXT_CHARS) return h;
-    const head = h.slice(0, 2); // system + original request
-    const tail = h.slice(-24);
-    const dropped = h.length - head.length - tail.length;
-    return [
-      ...head,
-      {
-        role: "system",
-        content: `(Note: ${dropped} earlier messages and ~${Math.max(0, chars - MAX_CONTEXT_CHARS)} chars of tool output were compacted to keep the conversation bounded. Continue based on the latest tool results and terminal state.)`,
-      },
-      ...tail,
-    ];
   }
 
-  async function runAiLoop() {
+  function compactHistory(h: any[]): any[] {
+    const lu = h.map((m, i) => ({ m, i }));
+    const head = h.slice(0, 2); // system + original request
+    if (h.length - 2 <= MAX_HISTORY - 2 && countChars(h) <= MAX_CONTEXT_CHARS) return h;
+    // Split the middle (after head): keep every user/assistant message (that's
+    // the AI's memory), trim oldest tool/tool-result blobs first.
+    const middle = lu
+      .filter(({ i }) => i >= 2)
+      .sort((a, b) => {
+        const keepA = a.m.role === "user" || a.m.role === "assistant" ? 0 : 1;
+        const keepB = b.m.role === "user" || b.m.role === "assistant" ? 0 : 1;
+        return keepA - keepB || a.i - b.i; // tool blobs (oldest-first) droppable
+      });
+    const kept = head.slice();
+    let budget = MAX_CONTEXT_CHARS - countChars(kept);
+    for (const { m } of middle) {
+      const role = m.role;
+      const size =
+        role === "tool"
+          ? Math.min((typeof m.content === "string" ? m.content.length : 0) * 2, budget) // penalize tool payload
+          : typeof m.content === "string" ? m.content.length : 0;
+      if (kept.length < MAX_HISTORY && (size <= budget || role === "user" || role === "assistant")) {
+        kept.push(m);
+        budget -= size;
+      }
+    }
+    // Re-sort into original order.
+    const keptIndexes = new Set(
+      kept.map((m) => h.indexOf(m)), // h is small; fine
+    );
+    const ordered = h.filter((_, i) => keptIndexes.has(i));
+    const dropped = h.length - ordered.length;
+    const note: any = {
+      role: "system",
+      content: `(Note: ${dropped} earlier tool outputs were trimmed to keep this conversation bounded — the conversation text is preserved, but the latest terminal/tool state may have changed. Re-query the live server state if needed.)`,
+    };
+    // Keep the note right before the final tail so it informs the next turn.
+    const final = [...ordered, note];
+    // Safety net: if everything is one giant message, keep the newest tail.
+    if (countChars(final) > MAX_CONTEXT_CHARS * 2) {
+      const sys = ordered[0] ?? { role: "system", content: SYSTEM_PROMPT };
+      return [sys, ...ordered.slice(-40), note];
+    }
+    return final;
+  }
+
+  async function runAiLoop(hostForPersist: string) {
     try {
       let guard = 0;
       const MAX_STEPS = 60;
       let lastSig: string | null = null;
       let repeatCount = 0;
+      // Auto-save after each AI response so a long multi-step task (or an
+      // abort) never loses progress. Throttled: rapid tool steps shouldn't
+      // flood the DB — the final persist after the loop covers the tail.
+      let lastPersist = 0;
+      const persistThrottled = async () => {
+        const now = Date.now();
+        if (now - lastPersist < 2000) return;
+        lastPersist = now;
+        try {
+          await chatStore.persistConversation(hostForPersist);
+        } catch { /* keep going — final persist will retry */ }
+      };
       while (guard++ < MAX_STEPS) {
         if (abortRequested) {
           pushChat("ai", "(aborted by user)");
+          await chatStore.persistConversation(hostForPersist);
           return;
         }
         chatStore.setHistory(compactHistory(chatStore.getHistory()));
@@ -2332,11 +2477,13 @@
               : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
             chatStore.setHistory([...chatStore.getHistory(), { role: "tool", tool_call_id: tc.id, content }]);
           }
+          await persistThrottled();
           continue;
         }
         const text = msg.content ?? "(done)";
         pushChat("ai", text);
         chatStore.setHistory([...chatStore.getHistory(), { role: "assistant", content: text }]);
+        await persistThrottled();
         return;
       }
       pushChat(
@@ -2621,8 +2768,8 @@
     const name = tc.function.name;
     const args = safeParse(tc.function.arguments);
     // Act on the pinned target (set when the chat was sent), falling back to
-    // the current active tab. Never chase a tab switch mid-task.
-    const host = chatTarget?.host ?? activeHost;
+    // the current active tab's chat host. Never chase a tab switch mid-task.
+    const host = chatTarget?.host ?? activeChatHost;
     const term =
       chatTarget?.tabId != null && chatTarget.tabId >= 0
         ? termByTab.get(chatTarget.tabId)?.term ?? null
@@ -2825,6 +2972,14 @@
     });
     if (terminalArea) resizeObserver.observe(terminalArea);
 
+    // Persist the current conversation to localStorage before the page unloads
+    // (server sync happens on next load; the localStorage cache is the safety net).
+    const handleBeforeUnload = () => {
+      const host = activeChatHost ?? "";
+      chatStore.persistToCache(host);
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
     // Async setup (listeners + host discovery) — kicked off, not awaited, so
     // the onMount cleanup can stay synchronous.
     (async () => {
@@ -2852,6 +3007,9 @@
               termByTab
                 .get(t.id)
                 ?.term.write("\r\n\x1b[90m[puppetterm] connection closed\x1b[0m\r\n");
+              // Whole terminal process ended (not nested-ssh exit — that is
+              // caught by the prompt scan above). Same checkpoint + unbind.
+              disconnectBoundHost(t);
             }
           }),
           await on<{ host: string; data: string }>("install-output", (p) => {
@@ -2906,6 +3064,7 @@
     })();
 
     return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
       unlisteners.forEach((u) => u());
       resizeObserver?.disconnect();
       for (const t of tabs) {
@@ -3058,7 +3217,7 @@
       {#if showConvos}
         <div class="convo-panel">
           <div class="convo-head">
-            <span>Conversations — {activeHost || "local"}</span>
+            <span>Conversations — {activeChatHost || "local"}</span>
             <button class="convo-close" onclick={() => (showConvos = false)} title="Close">✕</button>
           </div>
           <div class="convo-list">
@@ -3128,7 +3287,7 @@
           <div class="approval-cmd">
             {pendingApproval.tool} {JSON.stringify(pendingApproval.args)}
             <div class="approval-host">
-              on {(chatTarget?.host || activeHost) || "local terminal"}
+              on {(chatTarget?.host || activeChatHost) || "local terminal"}
             </div>
           </div>
           <div class="approval-btns">
@@ -3140,42 +3299,42 @@
 
       <div class="ai-target">
         <span class="dot {activeHost ? 'up' : 'down'}"></span>
-        {#if activeHost}
-          acting on <b>{activeHost}</b>
-          {#if hostHasAgent(activeHost)}
+        {#if chatTarget?.host || activeChatHost}
+          acting on <b>{chatTarget?.host || activeChatHost}</b>
+          {#if hostHasAgent(chatTarget?.host || activeChatHost)}
             <span class="mode-badge agent">agent</span>
-          {:else if agentMap[activeHost] === false}
+          {:else if hostHasNoAgent(chatTarget?.host || activeChatHost)}
             <span class="mode-badge terminal">terminal</span>
           {/if}
           {#if activeTabCwd}
             <span class="ai-cwd" title="Current working directory on the host">{activeTabCwd}</span>
           {/if}
-          {#if hostHasAgent(activeHost) && liveMetrics}
+          {#if hostHasAgent(activeChatHost) && liveMetrics}
             <span class="ai-metrics" title="Live host resources (via agent)">
               CPU {liveMetrics.cpu.toFixed(0)}% · MEM {liveMetrics.mem.toFixed(0)}%
               {#if liveMetrics.load != null}· load {liveMetrics.load.toFixed(2)}{/if}
             </span>
           {/if}
-          {#if chatBusy && chatTarget && chatTarget.host !== activeHost}
+          {#if chatBusy && chatTarget && chatTarget.host !== activeChatHost}
             <span class="warn">(pinned — you switched tabs)</span>
           {/if}
         {:else}
           local — ssh to a remote first
         {/if}
-        {#if activeHost && !installBusy && !hostHasAgent(activeHost)}
+        {#if (chatTarget?.host || activeChatHost) && !installBusy && !hostHasAgent(chatTarget?.host || activeChatHost)}
           <button
             class="install-agent"
             onclick={promptInstall}
-            title="Install puppetterm-agent on {activeHost} (no sudo, reuses your SSH connection)"
+            title="Install puppetterm-agent on {chatTarget?.host || activeChatHost} (no sudo, reuses your SSH key)"
           >
             Install agent
           </button>
         {/if}
-        {#if activeHost && !installBusy && hostHasAgent(activeHost)}
+        {#if (chatTarget?.host || activeChatHost) && !installBusy && hostHasAgent(chatTarget?.host || activeChatHost)}
           <button
             class="install-agent update"
             onclick={promptUpdateAgent}
-            title="Update puppetterm-agent on {activeHost} (reinstall from the current build)"
+            title="Update puppetterm-agent on {chatTarget?.host || activeChatHost} (reinstall from the current build)"
           >
             ↻ Update agent
           </button>
@@ -3244,8 +3403,8 @@
       <div class="chat-input">
         <textarea
           rows="3"
-          placeholder={activeHost
-            ? `Ask the AI to act on ${activeHost}…`
+          placeholder={activeChatHost
+            ? `Ask the AI to act on ${activeChatHost}…`
             : "Ask the AI to act on a remote — ssh to it first…"}
           bind:value={chatText}
           oninput={(e) => autoGrowInput(e.currentTarget)}
@@ -4693,6 +4852,14 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+  .msg.system {
+    background: #161b22aa;
+    color: #8b949e;
+    align-self: center;
+    font-size: 12px;
+    border: 1px dashed #30363d;
+    max-width: 95%;
   }
   .spinner {
     display: inline-block;

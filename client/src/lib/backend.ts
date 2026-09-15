@@ -195,24 +195,24 @@ function mockCall<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
       const host = String(args.host ?? "");
       const steps = [
         `==> puppetterm-agent install on ${host} (x86_64)`,
-        "==> installing binary (user-space)",
+        "==> installing binary",
         "    authorized_keys updated (command-locked entry)",
         "    agent responded OK",
         `==> done: agent installed on ${host}`,
       ];
       steps.forEach((data, i) => setTimeout(() => emitMock("install-output", { host, data }), 200 * (i + 1)));
       return new Promise((resolve) =>
-        setTimeout(
-          () =>
-            resolve({
-              host,
-              arch: "amd64",
-              agent_path: "~/.puppetterm/bin/puppetterm-agent",
-              mode: "user",
-              sudoers: false,
-            } as T),
-          200 * (steps.length + 1),
-        ),
+setTimeout(
+            () =>
+              resolve({
+                host,
+                arch: "amd64",
+                agent_path: "$HOME/.snap/app/puppetterm/bin/puppetterm-agent",
+                mode: "user",
+                sudoers: false,
+              } as T),
+            200 * (steps.length + 1),
+          ),
       );
     }
     case "audit_recent":

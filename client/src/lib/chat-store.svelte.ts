@@ -57,12 +57,26 @@ function loadFromLocalStorage(host: string): { entry: ChatEntry; id: string | nu
   return null;
 }
 
+// LocalStorage cache is bounded so a long conversation never blows the ~5MB
+// quota (which would silently drop the cache and look like the chat "reset").
+// The server DB is the source of truth; the cache only needs to be enough to
+// restore the visible conversation + recent LLM context on reload.
+const CACHE_MAX_LOG = 300;
+const CACHE_MAX_HISTORY = 120;
+
 function saveToLocalStorage(host: string, entry: ChatEntry, convId: string | null) {
   if (typeof localStorage === "undefined") return;
+  const chatLog = entry.chatLog.slice(-CACHE_MAX_LOG);
+  // Keep the leading system prompt (first message) + recent history so the AI
+  // can restore its task context even on the tail of a very long thread.
+  const history =
+    entry.history.length > CACHE_MAX_HISTORY
+      ? [entry.history[0], ...entry.history.slice(-(CACHE_MAX_HISTORY - 1))]
+      : entry.history;
   try {
     localStorage.setItem(
       localStorageKey(host),
-      JSON.stringify({ chatLog: entry.chatLog, history: entry.history, host, convId, savedAt: Date.now() }),
+      JSON.stringify({ chatLog, history, host, convId, savedAt: Date.now() }),
     );
   } catch { /* quota */ }
 }
@@ -153,28 +167,46 @@ export class ChatStore {
     return this.history;
   }
 
+  /** Save current state to localStorage synchronously (for beforeunload).
+   *  Returns true if there was data to save. */
+  persistToCache(host: string): boolean {
+    if (this.chatLog.length === 0 && this.history.length <= 1) return false;
+    const h = chatHostOf(host);
+    saveToLocalStorage(h, { chatLog: this.chatLog, history: this.history }, this.activeConversationId);
+    return true;
+  }
+
   /** Persist the current conversation to the server (append mode).
    *  Call this after mutations to sync with the backend. */
   async persistConversation(host: string): Promise<void> {
     const h = chatHostOf(host);
+    const entry = { chatLog: this.chatLog, history: this.history };
+    let convId = this.activeConversationId;
     // Also cache in localStorage
-    saveToLocalStorage(h, { chatLog: this.chatLog, history: this.history }, this.activeConversationId);
+    saveToLocalStorage(h, entry, convId);
 
-    if (!this.activeConversationId) {
+    if (!convId) {
       // Create a new conversation on the server
       try {
-        this.activeConversationId = await this.createConversation(h);
+        convId = await this.createConversation(h);
+        // Only claim the new id if nothing changed this conversation meanwhile
+        // (e.g. we switched hosts and loaded another conversation's cache).
+        if (!this.activeConversationId) this.activeConversationId = convId;
       } catch {
         return; // server unavailable, localStorage cache is enough
       }
     }
 
-    // Sync the full history to the server via replace (handles compaction)
+    // Sync the full history to the server via replace (handles compaction).
+    // Use the locally-captured id/history so an overlapping host switch can't
+    // make us write the old conversation into the new one's slot.
     try {
       await call("chat_replace_all", {
-        conversation_id: this.activeConversationId,
-        messages: this.history,
+        conversation_id: convId,
+        messages: entry.history,
       });
+      // Only re-link the id if the active conversation hasn't changed meanwhile.
+      if (!this.activeConversationId) this.activeConversationId = convId;
     } catch { /* server unavailable */ }
   }
 

@@ -35,16 +35,17 @@ pub static ACTIVE_ACTIONS: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Cached resolved agent binary path per host ("" = not yet resolved).
-/// `check_agent` (install.rs) considers the agent present if EITHER the
-/// user-space (`~/.puppetterm/bin`) OR the system-wide (`/usr/local/bin`) copy
-/// exists — so `run_action` must invoke whichever one is actually installed,
-/// not always the root path.
+/// `check_agent` (install.rs) considers the agent present if ANY of the
+/// candidate locations exists — `~/.snap/app/puppetterm/bin` (user-space),
+/// the older `/var/local/puppetterm/bin` home, or the legacy `/usr/local/bin`
+/// copy — so `run_action` must invoke whichever one is actually installed,
+/// not always one hard-coded path.
 static AGENT_BIN_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolve the agent binary path to use on `host`, preferring the configured
-/// env override, then probing the host for a user-space or system-wide agent.
-/// The probe is one quick SSH `test` and is cached per host for the session.
+/// env override, then probing the host for a system-wide agent. The probe is
+/// one quick SSH `test` and is cached per host for the session.
 fn resolve_agent_bin(host: &str) -> Result<String, String> {
     if let Ok(bin) = std::env::var("PUPPETTERM_AGENT_BIN") {
         if !bin.trim().is_empty() {
@@ -61,13 +62,13 @@ fn resolve_agent_bin(host: &str) -> Result<String, String> {
     crate::ssh::ssh_host(&mut cmd, host);
     let probe = cmd
         .arg(
-            "sh -c 'for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1'",
+            "sh -c 'for p in \"$HOME/.snap/app/puppetterm/bin/puppetterm-agent\" /var/local/puppetterm/bin/puppetterm-agent /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1'",
         )
         .output()
         .map_err(|e| format!("resolve agent bin (ssh): {e}"))?;
     if !probe.status.success() {
         return Err(
-            "puppetterm-agent not found on host (checked ~/.puppetterm/bin and /usr/local/bin)"
+            "puppetterm-agent not found on host (checked ~/.snap/app/puppetterm/bin, /var/local/puppetterm/bin and /usr/local/bin)"
                 .to_string(),
         );
     }
@@ -113,10 +114,11 @@ pub fn run_action(
     emit: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<AgentRunResult, String> {
     validate_host(host)?;
-    // Use whichever agent binary actually exists on the host (user-space or
-    // system-wide) — NOT always the root path. check_agent reports "present"
-    // for either, so invoking only /usr/local/bin broke user-space-only hosts
-    // with "bash: /usr/local/bin/puppetterm-agent: No such file or directory".
+    // Use whichever agent binary actually exists on the host (user-space
+    // ~/.snap/app/puppetterm/bin, or a legacy /var/local/puppetterm/bin or
+    // /usr/local/bin copy) — NOT always one hard-coded path. check_agent
+    // reports "present" for any of them, so honoring the probe result here
+    // keeps invocations correct.
     let agent = resolve_agent_bin(host)?;
 
     let mut cmd = Command::new("ssh");

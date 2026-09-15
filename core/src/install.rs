@@ -3,11 +3,18 @@
 //!
 //! Strategy:
 //! 1. Always install a **user-space** agent (binary + command-locked key +
-//!    config under `~/.puppetterm/`). No sudo, works with the existing key.
-//! 2. If passwordless sudo is available on the host (`sudo -n true`), ALSO
-//!    upgrade to a **root** install by running the full `installer/install.sh`
-//!    (systemctl/apt grants + /etc config + /var/log audit), giving the agent
-//!    full state-changing privileges.
+//!    config under `~/.snap/app/puppetterm/`). No sudo, works with the existing
+//!    key. The agent binary is world-executable so the command-locked SSH entry
+//!    can invoke it as the login user.
+//! 2. If the `installer/install.sh` payload is available locally, ALSO upgrade
+//!    to full privileges (scoped sudoers, /etc config, /var/log audit dir),
+//!    giving the agent state-changing capabilities.
+//!
+//! Permissions on the host (user-owned via `~/.snap/app/puppetterm/`):
+//!   - `~/.snap/app/puppetterm/bin`  0755 (traversable + executable by user)
+//!   - `puppetterm-agent` binary     0755 (world-exec — agent runs as the SSH
+//!     user via the command-locked key)
+//!   - `config.json`                 0644 (readable by user)
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,22 +33,21 @@ pub struct InstallResult {
 }
 
 /// True if the agent binary is already reachable on the host (either the
-/// user-space or the system-wide path).
+/// `~/.snap/app/puppetterm/bin` user-space path or a legacy system path).
 ///
 /// Uses the SAME `sh -c` probe as `agent::resolve_agent_bin` so the badge can
-/// never disagree with what `run_action` will actually find. The old raw
-/// `test -x ~/.puppetterm/bin/puppetterm-agent -o -x /usr/local/bin/...` was
-/// run through the user's LOGIN shell, where `~` expansion and the deprecated
-/// `test -o` operator behave differently (fish/zsh) — so the badge could claim
-/// "agent mode" while `resolve_agent_bin` then reported the binary missing and
-/// the AI fell back to typing into the live terminal.
+/// never disagree with what `run_action` will actually find. The probe runs
+/// through the user's LOGIN shell, so it must be POSIX-safe (no `~` expansion
+/// dependence, no deprecated `test -o`) — the badge could otherwise claim
+/// "agent mode" while `resolve_agent_bin` reported the binary missing and the
+/// AI fell back to typing into the live terminal.
 pub fn check_agent(host: &str) -> bool {
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
     crate::ssh::ssh_host(&mut cmd, host);
     let out = cmd
         .arg(
-            "sh -c 'for p in \"$HOME/.puppetterm/bin/puppetterm-agent\" /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && exit 0; done; exit 1'",
+            "sh -c 'for p in \"$HOME/.snap/app/puppetterm/bin/puppetterm-agent\" /var/local/puppetterm/bin/puppetterm-agent /usr/local/bin/puppetterm-agent; do [ -x \"$p\" ] && exit 0; done; exit 1'",
         )
         .output();
     matches!(out, Ok(o) if o.status.success())
@@ -106,11 +112,6 @@ fn ssh_ok(host: &str, remote: &[&str]) -> bool {
     ssh_io(host, remote, None, &|_| {}).is_ok()
 }
 
-fn home_of(host: &str) -> Result<String, String> {
-    let (_, out) = ssh_io(host, &["echo", "$HOME"], None, &|_| {})?;
-    Ok(out.trim().to_string())
-}
-
 /// Best-effort location of `installer/install.sh` for the optional root upgrade.
 fn resolve_installer(agent_dir: &Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("PUPPETTERM_INSTALLER") {
@@ -145,33 +146,56 @@ pub fn install_agent(
     };
     emit(&format!("==> puppetterm-agent install on {host} ({machine})"));
 
-    // 1b) idempotency: if a full (root) agent is already installed, nothing to
-    // do — UNLESS `force` (update/reinstall) is set, in which case we re-run
-    // the whole install so the binary/config/sudoers are refreshed.
-    let root_agent = "/usr/local/bin/puppetterm-agent";
-    if !force && ssh_ok(host, &["test", "-x", root_agent]) {
-        emit(&format!(
-            "==> agent already installed at {root_agent} (root install) — nothing to do"
-        ));
-        return Ok(InstallResult {
-            host: host.to_string(),
-            arch: arch.to_string(),
-            agent_path: root_agent.into(),
-            mode: "root".into(),
-            sudoers: true,
-            already: true,
-        });
+    // 1b) idempotency + home dir. The agent installs into the SSH user's home
+    // under ~/.snap/app/puppetterm/ (no sudo needed). Legacy shared paths are
+    // still recognized so existing installs aren't duplicated.
+    const AGENT_PATH: &str = "$HOME/.snap/app/puppetterm/bin/puppetterm-agent";
+    // Single-quoted as ONE argument so the remote shell re-parses it as a
+    // quoted `echo "$HOME"` (splitting it into vector elements would make the
+    // shell run bare `echo`, losing $HOME and yielding an empty result).
+    let (_, home_out) = ssh_io(host, &["sh", "-c", "'echo \"$HOME\"'"], None, &|_| {})?;
+    let r_home = home_out.trim().to_string();
+    if r_home.is_empty() {
+        return Err("could not determine remote home directory".into());
     }
-    // If only the user-space agent exists, refresh it in place (idempotent).
-    let mut already = false;
-    if ssh_ok(host, &["test", "-x", "~/.puppetterm/bin/puppetterm-agent"]) {
-        already = true;
+    let abs_agent = format!("{r_home}/.snap/app/puppetterm/bin/puppetterm-agent");
+
+    let existing: Option<String> = if ssh_ok(host, &["test", "-x", AGENT_PATH]) {
+        Some(abs_agent.clone())
+    } else if ssh_ok(host, &["test", "-x", "/var/local/puppetterm/bin/puppetterm-agent"]) {
+        Some("/var/local/puppetterm/bin/puppetterm-agent".to_string())
+    } else if ssh_ok(host, &["test", "-x", "/usr/local/bin/puppetterm-agent"]) {
+        Some("/usr/local/bin/puppetterm-agent".to_string())
+    } else {
+        None
+    };
+    if !force {
+        if let Some(p) = existing {
+            emit(&format!(
+                "==> agent already installed at {p} — nothing to do (use --force to refresh)"
+            ));
+            return Ok(InstallResult {
+                host: host.to_string(),
+                arch: arch.to_string(),
+                agent_path: p,
+                mode: "user".into(),
+                sudoers: false,
+                already: true,
+            });
+        }
+    }
+    let already = existing.is_some();
+    if already {
         emit(if force {
-            "==> agent already installed (user-space) — forced update: refreshing binary + config"
+            "==> agent already installed — forced update: refreshing binary + config"
         } else {
-            "==> agent already installed (user-space) — refreshing binary + config (idempotent)"
+            "==> agent already installed — refreshing binary + config (idempotent)"
         });
     }
+
+    // The SSH user (needed only for the optional full-privileges upgrade).
+    let (_, whoami_out) = ssh_io(host, &["whoami"], None, &|_| {})?;
+    let ssh_user = whoami_out.trim().to_string();
 
     // 2) local agent binary
     let home = std::env::var("HOME").unwrap_or_default();
@@ -189,111 +213,124 @@ pub fn install_agent(
         )
     })?;
 
-    // 3) agent pubkey (command-locked authorized_keys entry)
-    let pubkey_file = pubkey_path
+    // 3) agent pubkey (OPTIONAL — command-locked authorized_keys entry).
+    //    Only installed when explicitly provided (--agent-pubkey param or
+    //    PUPPETTERM_AGENT_PUBKEY). The client invokes the agent via the user's
+    //    normal SSH key, so a dedicated pubkey is not required for agent mode.
+    let have_pubkey;
+    let (key_body, pubkey_bytes) = match pubkey_path
         .or_else(|| std::env::var("PUPPETTERM_AGENT_PUBKEY").ok())
-        .unwrap_or_else(|| format!("{home}/.ssh/puppetterm-agent.pub"));
-    let pubkey = std::fs::read_to_string(&pubkey_file)
-        .map_err(|e| format!("agent pubkey not found at {pubkey_file} ({e})"))?;
-    let key_body: Vec<&str> = pubkey.split_whitespace().take(2).collect();
-    if key_body.len() < 2 {
-        return Err("malformed agent pubkey".into());
-    }
-    let key_body = format!("{} {}", key_body[0], key_body[1]);
-    let pubkey_bytes = std::fs::read(&pubkey_file).unwrap_or_default();
+        .filter(|p| !p.is_empty())
+    {
+        Some(pubkey_file) => {
+            let pubkey = std::fs::read_to_string(&pubkey_file)
+                .map_err(|e| format!("agent pubkey not found at {pubkey_file} ({e})"))?;
+            let key_body: Vec<&str> = pubkey.split_whitespace().take(2).collect();
+            if key_body.len() < 2 {
+                return Err(format!("malformed agent pubkey at {pubkey_file}"));
+            }
+            have_pubkey = true;
+            (
+                format!("{} {}", key_body[0], key_body[1]),
+                std::fs::read(&pubkey_file).unwrap_or_default(),
+            )
+        }
+        None => {
+            have_pubkey = false;
+            (String::new(), Vec::new())
+        }
+    };
 
-    let r_home = home_of(host)?;
-    let user_agent = format!("{r_home}/.puppetterm/bin/puppetterm-agent");
+    // 4) create the user-space install dir tree
+    emit("==> creating ~/.snap/app/puppetterm/bin");
+    ssh_io(host, &["mkdir", "-p", "~/.snap/app/puppetterm/bin"], None, emit)?;
+    ssh_io(host, &["chmod", "0755", "~/.snap/app/puppetterm"], None, emit)?;
 
-    // 4) install/refresh binary (user-space)
+    // 5) stage + install the binary. A temp file then rename avoids ETXTBSY
+    // ("Text file busy") when the agent is currently executing — `mv` relinks
+    // the directory entry, so the running process keeps its old inode.
     emit(if already {
         "==> refreshing binary (user-space)"
     } else {
         "==> installing binary (user-space)"
     });
-    ssh_io(host, &["mkdir", "-p", "~/.puppetterm/bin"], None, emit)?;
-    // Write to a temp file then rename over the target. A plain `cat >` overwrite
-    // of the binary fails with "Text file busy" (ETXTBSY) when the agent is
-    // currently executing (e.g. a live metrics poll or in-flight action). `mv`
-    // only relinks the directory entry, so the running process keeps its old
-    // inode and new invocations pick up the new binary.
-    ssh_io(host, &["cat", ">", "~/.puppetterm/bin/puppetterm-agent.tmp"], Some(&bin), &|_| {})?;
-    ssh_io(host, &["chmod", "0755", "~/.puppetterm/bin/puppetterm-agent.tmp"], None, emit)?;
-    ssh_io(host, &["mv", "-f", "~/.puppetterm/bin/puppetterm-agent.tmp", "~/.puppetterm/bin/puppetterm-agent"], None, emit)?;
+    ssh_io(host, &["cat", ">", "~/.snap/app/puppetterm/bin/puppetterm-agent.tmp"], Some(&bin), &|_| {})?;
+    ssh_io(host, &["chmod", "0755", "~/.snap/app/puppetterm/bin/puppetterm-agent.tmp"], None, emit)?;
+    ssh_io(host, &["mv", "-f", "~/.snap/app/puppetterm/bin/puppetterm-agent.tmp", "~/.snap/app/puppetterm/bin/puppetterm-agent"], None, emit)?;
 
-    // 5) command-locked authorized_keys entry (idempotent)
-    emit("==> authorizing agent key");
-    let (_, existing) = ssh_io(host, &["cat", "~/.ssh/authorized_keys"], None, &|_| {})?;
-    if existing.contains("puppetterm-agent") {
-        emit("    agent key already present (skipping)");
+    // 6) command-locked authorized_keys entry (idempotent, optional)
+    if have_pubkey {
+        emit("==> authorizing agent key (command-locked)");
+        let (_, existing_keys) = ssh_io(host, &["cat", "~/.ssh/authorized_keys"], None, &|_| {})?;
+        if existing_keys.contains("puppetterm-agent") {
+            emit("    agent key already present (skipping)");
+        } else {
+            let lock = format!(
+                "\n# puppetterm-agent (command-locked)\nrestrict,command=\"{abs_agent}\",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding {key_body} puppetterm-agent\n"
+            );
+            ssh_io(host, &["mkdir", "-p", "~/.ssh"], None, emit)?;
+            ssh_io(host, &["cat", ">>", "~/.ssh/authorized_keys"], Some(lock.as_bytes()), &|_| {})?;
+            ssh_io(host, &["chmod", "0600", "~/.ssh/authorized_keys"], None, emit)?;
+            emit("    authorized_keys updated (command-locked entry)");
+        }
     } else {
-        let lock = format!(
-            "\n# puppetterm-agent (command-locked)\nrestrict,command=\"{user_agent}\",no-pty,no-agent-forwarding,no-port-forwarding,no-X11-forwarding {key_body} puppetterm-agent\n"
-        );
-        ssh_io(host, &["cat", ">>", "~/.ssh/authorized_keys"], Some(lock.as_bytes()), &|_| {})?;
-        ssh_io(host, &["chmod", "0600", "~/.ssh/authorized_keys"], None, emit)?;
-        emit("    authorized_keys updated (command-locked entry)");
+        emit("==> skipping agent key (no pubkey configured — the client uses your SSH key)");
     }
 
-    // 6) agent config
+    // 7) agent allow-list config (user-owned)
     emit("==> writing agent config");
     let cfg = "{\"log_prefixes\":[\"/var/log/\"],\"config_prefixes\":[]}\n";
-    ssh_io(host, &["cat", ">", "~/.puppetterm/config.json"], Some(cfg.as_bytes()), &|_| {})?;
+    ssh_io(host, &["cat", ">", "~/.snap/app/puppetterm/config.json"], Some(cfg.as_bytes()), &|_| {})?;
+    ssh_io(host, &["chmod", "0644", "~/.snap/app/puppetterm/config.json"], None, emit)?;
 
-    // 7) verify
+    // 8) verify
     emit("==> verifying agent");
     let req = b"{\"action\":\"snapshot\",\"request_id\":\"install-check\"}\n";
-    let (code, out) = ssh_io(host, &["~/.puppetterm/bin/puppetterm-agent"], Some(req), &|_| {})?;
+    let (code, out) = ssh_io(host, &[&abs_agent], Some(req), &|_| {})?;
     if code != 0 || !out.contains("\"exit\":0") {
         return Err(format!("agent verification failed (exit {code}): {}", out.trim()));
     }
     emit("    agent responded OK");
 
-    // 8) optional root upgrade when passwordless sudo is available
+    // 9) optional full-privileges upgrade (scoped sudoers + /etc config) when
+    // the local installer script is available AND passwordless sudo works.
     let mut mode = "user".to_string();
     let mut sudoers = false;
-    if ssh_ok(host, &["sudo", "-n", "true"]) {
-        emit("==> passwordless sudo detected — upgrading to root install");
-        if let Some(installer) = resolve_installer(&dir) {
-            let script = std::fs::read_to_string(&installer)
-                .map_err(|e| format!("cannot read installer {}: {e}", installer.display()))?;
-            ssh_io(host, &["cat", ">", "/tmp/puppetterm-install.sh"], Some(script.as_bytes()), &|_| {})?;
-            ssh_io(host, &["cat", ">", "/tmp/puppetterm-agent"], Some(&bin), &|_| {})?;
+    if let Some(installer) = resolve_installer(&dir) {
+        emit("==> applying full-privileges installer (sudoers + config)");
+        let script = std::fs::read_to_string(&installer)
+            .map_err(|e| format!("cannot read installer {}: {e}", installer.display()))?;
+        ssh_io(host, &["cat", ">", "/tmp/puppetterm-install.sh"], Some(script.as_bytes()), &|_| {})?;
+        ssh_io(host, &["cat", ">", "/tmp/puppetterm-agent"], Some(&bin), &|_| {})?;
+        if have_pubkey {
             ssh_io(host, &["cat", ">", "/tmp/puppetterm-agent.pub"], Some(&pubkey_bytes), &|_| {})?;
-            let user = if host.contains('@') {
-                host.split('@').next().unwrap_or_default().to_string()
-            } else {
-                std::env::var("USER").unwrap_or_default()
-            };
-            ssh_io(
-                host,
-                &[
-                    "sudo", "-n", "bash", "/tmp/puppetterm-install.sh", "--binary",
-                    "/tmp/puppetterm-agent", "--agent-pubkey", "/tmp/puppetterm-agent.pub",
-                    "--ssh-user", &user, "--yes",
-                ],
-                None,
-                emit,
-            )?;
-            mode = "root".into();
-            sudoers = true;
-            emit("==> root install complete (full agentic privileges)");
-        } else {
-            emit("    (installer script not found — skipping root upgrade; user-space agent is active)");
         }
+        if !ssh_user.is_empty() && ssh_ok(host, &["sudo", "-n", "true"]) {
+            let mut args = vec![
+                "sudo", "-n", "bash", "/tmp/puppetterm-install.sh", "--binary",
+                "/tmp/puppetterm-agent", "--ssh-user", &ssh_user, "--yes",
+            ];
+            if have_pubkey {
+                args.splice(7..7, ["--agent-pubkey", "/tmp/puppetterm-agent.pub"]);
+            }
+            ssh_io(host, &args, None, emit)?;
+            sudoers = true;
+            mode = "root".into();
+            emit("==> full install complete (agentic privileges granted)");
+        } else {
+            emit("    (no passwordless sudo — user-space agent only; run installer/install.sh manually for full privileges)");
+        }
+    } else if already && !force {
+        // Already installed and no payload to refresh — nothing more to do.
     } else {
-        emit("    (no passwordless sudo — user-space agent only; run installer/install.sh manually for full privileges)");
+        emit("    (installer script not found — agent is active under ~/.snap/app/puppetterm; run installer/install.sh manually for full privileges)");
     }
 
     emit(&format!("==> done: agent installed on {host}"));
     Ok(InstallResult {
         host: host.to_string(),
         arch: arch.to_string(),
-        agent_path: if mode == "root" {
-            "/usr/local/bin/puppetterm-agent".into()
-        } else {
-            user_agent
-        },
+        agent_path: abs_agent,
         mode,
         sudoers,
         already,
@@ -305,7 +342,8 @@ mod tests {
     use super::*;
 
     // Live test against a real host. Skipped unless PUPPETTERM_TEST_INSTALL=1
-    // (set PUPPETTERM_AGENT_DIR to the dir with the built binaries).
+    // (set PUPPETTERM_AGENT_DIR to the dir with the built binaries). Installs
+    // user-space into ~/.snap/app/puppetterm — no sudo required.
     #[test]
     fn install_agent_user_space_live() {
         if std::env::var("PUPPETTERM_TEST_INSTALL").unwrap_or_default() != "1" {
@@ -318,7 +356,9 @@ mod tests {
         let res = install_agent(&host, None, None, false, &|l| lines.borrow_mut().push(l.to_string()))
             .expect("install_agent");
         assert!(
-            res.agent_path.contains(".puppetterm") || res.agent_path.contains("/usr/local/bin"),
+            res.agent_path.contains(".snap/app/puppetterm")
+                || res.agent_path.contains("/var/local/puppetterm")
+                || res.agent_path.contains("/usr/local/bin"),
             "agent path: {}",
             res.agent_path
         );

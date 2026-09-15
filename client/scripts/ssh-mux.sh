@@ -16,11 +16,12 @@
 #
 # Environment:
 #   PUPPETTERM_MUX_DIR     socket dir   (default: ${XDG_RUNTIME_DIR:-/tmp}/puppetterm-mux)
-#   PUPPETTERM_AGENT_BIN   remote agent (default: /usr/local/bin/puppetterm-agent)
+#   PUPPETTERM_AGENT_BIN   remote agent (default: \$HOME/.snap/app/puppetterm/bin/puppetterm-agent)
 set -euo pipefail
 
 MUX_DIR="${PUPPETTERM_MUX_DIR:-${XDG_RUNTIME_DIR:-/tmp}/puppetterm-mux}"
-AGENT_BIN="${PUPPETTERM_AGENT_BIN:-/usr/local/bin/puppetterm-agent}"
+# Kept literal so the REMOTE shell expands $HOME to the agent host's home.
+AGENT_BIN="${PUPPETTERM_AGENT_BIN:-\$HOME/.snap/app/puppetterm/bin/puppetterm-agent}"
 
 sock_for() { # sanitize a host into a safe filename component
   printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'

@@ -194,8 +194,8 @@ fn agent_bin_dir() -> Option<String> {
     })
 }
 
-/// Install the puppetterm agent on a host over the existing SSH key
-/// (user-space by default; upgraded to root when passwordless sudo exists).
+/// Install the puppetterm agent on a host over the existing SSH key.
+/// Installs user-space into `~/.snap/app/puppetterm/` (no sudo needed).
 /// Streams progress lines as `install-output` events.
 #[tauri::command]
 async fn install_agent_on_host(

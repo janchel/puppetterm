@@ -68,8 +68,8 @@ Both modes share the same **approval gate**:
    machine-bound); plaintext never touches disk and is never committed. You can also
    authenticate via **Web login (OAuth)** (PKCE) for providers like GitHub Models and
    OpenRouter — the bearer token is stored in the same encrypted slot, no key to paste.
-- **In-app agent installer** — user-space by default (no sudo); auto-upgrades to root
-  when passwordless sudo exists; **idempotent**.
+- **In-app agent installer** — installs to `~/.snap/app/puppetterm/` (binary +
+  allow-list config) under the remote user's home directory; **no sudo required**.
 - **Audit trail** — every action is recorded in a client-side SQLite DB (append-only)
   and in the remote agent's log.
 - **Safety** — AI targets are pinned per task (switching tabs mid-task can't redirect
@@ -85,6 +85,15 @@ Both modes share the same **approval gate**:
   or **delete** (🗑 with confirmation). Conversations are auto-titled from the
   first user message and can be **dumped** to Markdown or JSON; the AI is instructed
   not to trust stale chat/activity history and to re-query the live server state instead.
+- **Connection-aware chat** — the chat is bound to the host it's acting on, not to
+  the terminal process, so it never resets when the session ends or you switch tabs,
+  and long conversations stay intact (history compaction + a bounded localStorage
+  cache keep them from ever overflowing). When the SSH session actually terminates —
+  nested `exit`, a dropped connection, or the terminal process closing (all detected
+  via the prompt scan, not just `pty-exit`, since ssh runs as a child of the local
+  shell) — puppetterm injects a **checkpoint** into the conversation so the model
+  knows the connection is gone, persists it, and releases the *acting on \<host\>*
+  indicator until you reconnect. Nothing is cleared.
 - **Audit detail on demand** — the Activity panel is click-to-expand: each row shows the
   command plus the full output (stored in a file, kept out of the SQLite index and out
   of AI context).
@@ -177,22 +186,28 @@ make test && make smoke
 ## Install the agent on a server
 
 **In-app (recommended):** connect to a key-based host with `ssh user@host`, click
-**Install agent** in the AI panel, type `y`. It installs user-space
-(`~/.puppetterm/bin/puppetterm-agent`) with a command-locked key, then upgrades to
-root if passwordless sudo is available. The **↻ Update agent** button (or any re-run)
-reinstalls and refreshes the existing binary, so deploying always updates an installed
-agent.
+**Install agent** in the AI panel. It installs the agent into the remote user's
+home at `~/.snap/app/puppetterm/` (binary + allow-list config), **no sudo
+required**, and talks to it over **your existing SSH key** — no dedicated key is
+needed. If you do want an extra hardened key, set `PUPPETTERM_AGENT_PUBKEY` and
+the app will also add a command-locked `authorized_keys` entry for it. If
+passwordless sudo is available on the host, the optional full-privileges
+installer (`installer/install.sh`) runs automatically to grant scoped sudoers +
+systemctl / apt control. The **↻ Update agent** button (or any re-run)
+reinstalls and refreshes the existing binary, so deploying always updates an
+installed agent.
 
 **Manual:**
 
 ```bash
 installer/install.sh --binary agent/bin/puppetterm-agent-linux-amd64 \
-                     --agent-pubkey ~/.ssh/puppetterm-agent.pub \
                      --ssh-user ubuntu --yes
 ```
 
-The dedicated agent key is **command-locked** (`restrict,command="…puppetterm-agent",
-no-pty,…`) — it can only invoke the agent, never open a shell.
+The agent is invoked through SSH as your user; a dedicated agent key is
+**optional**, and when used it is **command-locked**
+(`restrict,command="…puppetterm-agent",no-pty,…`) — it can only invoke the
+agent, never open a shell.
 
 ## AI configuration
 
@@ -249,8 +264,10 @@ stored encrypted at rest** (same slot as an API key) — the chat path is unchan
 
 - **No persistent agent/listener** on remote hosts — the agent is invoked per-action
   through SSH and exits. Nothing new listens.
-- **Least privilege** — user-space install by default; root upgrade only when the user
-  already has passwordless sudo; scoped sudoers aliases (no blanket root).
+- **Least privilege** — the base agent installs user-space under
+  `~/.snap/app/puppetterm/` (no sudo); the optional full-privileges installer
+  grants scoped sudoers aliases (no blanket root); the agent itself runs as the
+  SSH user via a command-locked key.
 - **No secrets in the repo** — keys, AI config, and DBs are gitignored and/or live
   outside the repo.
 - **Approval-gated** — the AI can't change state without you saying yes; dangerous

@@ -69,15 +69,24 @@ confirm() { # confirm <prompt>  -> 0 yes / 1 no
   case "$ans" in y|Y) return 0 ;; *) return 1 ;; esac
 }
 
-AGENT_PATH="/usr/local/bin/puppetterm-agent"
+# User-space install dir under the SSH user's home (no /var/local needed).
+SSH_HOME="$(getent passwd "$SSH_USER" | cut -d: -f6)"
+[ -n "$SSH_HOME" ] || SSH_HOME="/home/$SSH_USER"
+AGENT_PATH="$SSH_HOME/.snap/app/puppetterm/bin/puppetterm-agent"
 
 echo "==> puppetterm-agent install (user: $SSH_USER)"
+echo "    agent path: $AGENT_PATH"
 
 # --- install the binary -----------------------------------------------------
 # Write to a temp file then atomically rename over the target. Overwriting the
 # binary in place fails with "Text file busy" (ETXTBSY) when the agent is
 # currently executing (e.g. a live metrics poll or in-flight action); rename
 # only relinks the directory entry so the running process keeps its old inode.
+SNAP_DIR="$SSH_HOME/.snap/app/puppetterm"
+mkdir -p "$SNAP_DIR/bin"
+chown -R "$SSH_USER" "$SNAP_DIR"
+chmod 0755 "$SNAP_DIR" "$SNAP_DIR/bin"
+
 if [ -n "$RELEASE_URL" ]; then
   echo "    downloading $RELEASE_URL"
   curl -fsSL -o "${AGENT_PATH}.tmp" "$RELEASE_URL"
@@ -89,6 +98,8 @@ else
   echo "error: provide --binary or --release" >&2
   exit 1
 fi
+chown "$SSH_USER" "${AGENT_PATH}.tmp"
+chmod 0755 "${AGENT_PATH}.tmp"
 mv -f "${AGENT_PATH}.tmp" "$AGENT_PATH"
 echo "    installed: $AGENT_PATH"
 "$AGENT_PATH" </dev/null >/dev/null 2>&1 || true # smoke: should exit 1 with an error, not crash

@@ -70,6 +70,13 @@ Both modes share the same **approval gate**:
    OpenRouter — the bearer token is stored in the same encrypted slot, no key to paste.
 - **In-app agent installer** — installs to `~/.snap/app/puppetterm/` (binary +
   allow-list config) under the remote user's home directory; **no sudo required**.
+- **Hostname-agnostic SSH** — every backend SSH call (install, agent runs, probes)
+  rides the **same OpenSSH ControlMaster** as the live terminal, so an alias or
+  name that only resolves from the session's context (VPN, ProxyJump, LAN DNS)
+  keeps working — install never has to re-resolve `mail` if the session did.
+  For flaky LAN/container DNS, installs transparently retry and fall back to
+  the concrete address from `~/.ssh/config` (`ssh -G` — no DNS) or a cached
+  `getaddrinfo` IP (`HostKeyAlias` keeps known_hosts keyed on the alias).
 - **Audit trail** — every action is recorded in a client-side SQLite DB (append-only)
   and in the remote agent's log.
 - **Safety** — AI targets are pinned per task (switching tabs mid-task can't redirect

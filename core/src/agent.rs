@@ -1,13 +1,12 @@
 //! Agent action runner — invokes `puppetterm-agent` on a remote host over SSH,
 //! streaming NDJSON events back and returning them.
 //!
-//! Each invocation is its own SSH exec, so concurrent calls never interleave.
-//! If a ControlMaster socket exists (see client/scripts/ssh-mux.sh) it is
-//! reused for the connection, otherwise a fresh one is opened.
+//! Each invocation is its own SSH exec (through the host's shared ControlMaster
+//! when the app has one open), so concurrent calls never interleave and the
+//! connection is never re-resolved/re-authenticated.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 
@@ -59,6 +58,7 @@ fn resolve_agent_bin(host: &str) -> Result<String, String> {
     }
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
+    crate::ssh::attach_control(&mut cmd, host);
     crate::ssh::ssh_host(&mut cmd, host);
     let probe = cmd
         .arg(
@@ -123,9 +123,7 @@ pub fn run_action(
 
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-    if let Some(sock) = mux_socket_for(host) {
-        cmd.arg("-S").arg(sock);
-    }
+    crate::ssh::attach_control(&mut cmd, host);
     crate::ssh::ssh_host(&mut cmd, host);
     cmd.arg(agent);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -197,26 +195,6 @@ fn run_action_io(
     }
 
     Ok(AgentRunResult { host: host.to_string(), exit, events })
-}
-
-/// Best-effort lookup of an existing ControlMaster socket for a host
-/// (matches the layout used by client/scripts/ssh-mux.sh).
-fn mux_socket_for(host: &str) -> Option<String> {
-    let dir = if let Ok(d) = std::env::var("PUPPETTERM_MUX_DIR") {
-        PathBuf::from(d)
-    } else if let Ok(x) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(x).join("puppetterm-mux")
-    } else {
-        PathBuf::from("/tmp/puppetterm-mux")
-    };
-    let sock = dir.join(format!("{}.sock", sanitize(host)));
-    sock.exists().then(|| sock.to_string_lossy().into_owned())
-}
-
-fn sanitize(host: &str) -> String {
-    host.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
 }
 
 #[cfg(test)]

@@ -44,6 +44,7 @@ pub struct InstallResult {
 pub fn check_agent(host: &str) -> bool {
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
+    crate::ssh::attach_control(&mut cmd, host);
     crate::ssh::ssh_host(&mut cmd, host);
     let out = cmd
         .arg(
@@ -55,57 +56,134 @@ pub fn check_agent(host: &str) -> bool {
 
 /// Run a remote command over SSH, optionally feeding stdin, streaming stdout
 /// lines through `emit`. Returns (exit_code, stdout_text).
+///
+/// Flaky name resolution is handled transparently: on a transient
+/// resolution/connect failure the command is retried — first against the
+/// concrete `HostName`/`User`/`Port`/`ProxyJump` the alias maps to in
+/// ~/.ssh/config (`ssh -G`, no DNS), then with a short backoff against the
+/// alias itself.
 fn ssh_io(
     host: &str,
     remote: &[&str],
     stdin_data: Option<&[u8]>,
     emit: &dyn Fn(&str),
 ) -> Result<(i32, String), String> {
-    let mut cmd = Command::new("ssh");
-    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-    crate::ssh::ssh_host(&mut cmd, host);
-    cmd.args(remote);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("spawn ssh: {e}"))?;
-    if let Some(mut si) = child.stdin.take() {
-        if let Some(d) = stdin_data {
-            let _ = si.write_all(d);
-        }
-    }
+    // ControlMaster socket stays keyed on the ORIGINAL alias so a live session
+    // over that alias is still reused even when a retry targets a concrete IP.
+    let control_host = host.to_string();
+    // Config-derived concrete target, computed once (when it exists).
+    let resolved: Option<(String, Option<String>)> = crate::ssh::config_resolve(host)
+        .map(|(user, h, port, jump)| {
+            let target = if user.is_empty() {
+                format!("{h}:{port}")
+            } else {
+                format!("{user}@{h}:{port}")
+            };
+            (target, jump)
+        });
 
-    let mut out = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        let mut buf = [0u8; 8192];
-        loop {
-            match so.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
-                    for line in s.lines() {
-                        if !line.trim().is_empty() {
-                            emit(line);
+    let mut target = host.to_string();
+    let mut attachment_args: Vec<String> = Vec::new();
+    // If DNS was already resolved for this host, start straight on the IP —
+    // later install commands stay DNS-free even when resolution is flaky.
+    if let Some(ip) = crate::ssh::dns_cached(host) {
+        target = crate::ssh::ip_target(host, ip);
+        let (full, _) = crate::ssh::split_ssh_host(host);
+        let alias = full.rsplit('@').next().unwrap_or(&full).to_string();
+        attachment_args.push("-o".to_string());
+        attachment_args.push(format!("HostKeyAlias={alias}"));
+    }
+    let mut trying_resolved = false;
+    let mut tried_dns = false;
+    let mut attempt = 0;
+    loop {
+        let mut cmd = Command::new("ssh");
+        cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
+        crate::ssh::attach_control(&mut cmd, &control_host);
+        for a in &attachment_args {
+            cmd.arg(a);
+        }
+        crate::ssh::ssh_host(&mut cmd, &target);
+        cmd.args(remote);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("spawn ssh: {e}"))?;
+        if let Some(mut si) = child.stdin.take() {
+            if let Some(d) = stdin_data {
+                let _ = si.write_all(d);
+            }
+        }
+
+        let mut out = String::new();
+        if let Some(mut so) = child.stdout.take() {
+            let mut buf = [0u8; 8192];
+            loop {
+                match so.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                        for line in s.lines() {
+                            if !line.trim().is_empty() {
+                                emit(line);
+                            }
                         }
+                        out.push_str(&s);
                     }
-                    out.push_str(&s);
                 }
             }
         }
-    }
-    let mut err = String::new();
-    if let Some(mut se) = child.stderr.take() {
-        let _ = se.read_to_string(&mut err);
-    }
-    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
-    let code = status.code().unwrap_or(-1);
-    if code != 0 {
+        let mut err = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut err);
+        }
+        let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+        let code = status.code().unwrap_or(-1);
+        if code == 0 {
+            return Ok((code, out));
+        }
+
         let msg = err.trim();
+        let transient = crate::ssh::is_transient_ssh_error(msg);
+        attempt += 1;
+        // 1st fallback: full config re-resolution (bypasses DNS entirely).
+        if transient && !trying_resolved {
+            if let Some((t, jump)) = &resolved {
+                trying_resolved = true;
+                target = t.clone();
+                if let Some(j) = jump {
+                    attachment_args.push("-J".to_string());
+                    attachment_args.push(j.clone());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                continue;
+            }
+        }
+        // 2nd fallback: resolve the alias once via DNS and connect to the IP
+        // directly (cached process-wide). HostKeyAlias keeps known_hosts keyed
+        // on the alias, matching the entry the interactive session wrote.
+        if transient && !tried_dns {
+            if let Some(ip) = crate::ssh::dns_resolve(host) {
+                tried_dns = true;
+                target = crate::ssh::ip_target(host, ip);
+                let (full, _) = crate::ssh::split_ssh_host(host);
+                let alias = full.rsplit('@').next().unwrap_or(&full).to_string();
+                attachment_args.push("-o".to_string());
+                attachment_args.push(format!("HostKeyAlias={alias}"));
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                continue;
+            }
+        }
+        // 3rd fallback: plain retry for transient DNS/network hiccups.
+        if transient && attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+            continue;
+        }
+
         return Err(if msg.is_empty() {
             format!("remote command failed (exit {code})")
         } else {
-            msg.to_string()
+            crate::ssh::resolution_hint(msg)
         });
     }
-    Ok((code, out))
 }
 
 fn ssh_ok(host: &str, remote: &[&str]) -> bool {

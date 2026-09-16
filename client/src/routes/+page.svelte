@@ -13,6 +13,8 @@
     id: number;
     host: string; // remote target ("" = local shell); updated when `ssh <target>` is detected
     chatHost: string; // last known host the AI chat is bound to — kept even when the live ssh session exits
+    sshTarget?: string; // authoritative target this tab was OPENED with (host picker) — the remote's own
+    // prompt hostname (e.g. a VPS whose PS1 shows `root@mail`) must NOT replace it
     cwd: string; // current working directory, parsed from the shell prompt ("" = unknown)
     sessionId: number | null;
     connecting: boolean;
@@ -1377,7 +1379,7 @@
     }
 
     const id = nextTabId++;
-    tabs = [...tabs, { id, host: host ?? "", chatHost: host ?? "", cwd: "", sessionId: null, connecting: false, buf: "", pendingSshTarget: undefined }];
+    tabs = [...tabs, { id, host: host ?? "", chatHost: host ?? "", sshTarget: host || undefined, cwd: "", sessionId: null, connecting: false, buf: "", pendingSshTarget: undefined }];
     activeTabId = id;
     showHostMenu = false;
     await tick();
@@ -2324,7 +2326,14 @@
     // 3) Fallback prompt verification: if prompt is user@host (and user is not "pp"),
     // verify/fallback to prompt host if scrollback didn't yield an explicit command.
     if (!activeHost && promptInfo && promptInfo.user !== "pp") {
-      if (t.host && t.host.includes(promptInfo.host)) {
+      // A session opened through the app's host picker is authoritative — the
+      // remote's own prompt hostname (e.g. a VPS displaying `root@mail`) is
+      // only the server's cosmetic name, NOT the ssh target (which may be
+      // `my-vps` → some IP). Trusting it here is what made installs try to
+      // `ssh root@mail` and fail DNS. Typed nested ssh still wins via (1)/(2).
+      if (t.sshTarget) {
+        activeHost = t.sshTarget;
+      } else if (t.host && t.host.includes(promptInfo.host)) {
         activeHost = t.host;
       } else {
         activeHost = promptInfo.full;

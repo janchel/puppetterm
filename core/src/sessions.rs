@@ -85,8 +85,22 @@ impl SessionManager {
     }
 
     /// Open an interactive SSH session to `host`.
+    ///
+    /// The session itself becomes an OpenSSH ControlMaster (puppetterm's own
+    /// socket scheme), so installs/probes/agent runs can attach to the same
+    /// already-authenticated connection — they never need to re-resolve the
+    /// hostname or re-auth, even for aliases a fresh ssh can't resolve.
     pub fn spawn_ssh(&self, emit: Emitter, host: &str) -> Result<u32, String> {
-        let mut args: Vec<String> = vec!["-tt".to_string()];
+        crate::ssh::ensure_mux_dir();
+        let mut args = vec![
+            "-tt".to_string(),
+            "-o".to_string(),
+            "ControlMaster=yes".to_string(),
+            "-o".to_string(),
+            format!("ControlPath={}", crate::ssh::ssh_control_path(host).display()),
+            "-o".to_string(),
+            "ControlPersist=600".to_string(),
+        ];
         let (h, port) = crate::ssh::split_ssh_host(host);
         if let Some(p) = port {
             args.push("-p".to_string());

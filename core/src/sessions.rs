@@ -54,6 +54,12 @@ impl SessionManager {
 
         let mut cmd = CommandBuilder::new(cmd_name);
         cmd.args(args);
+        // Sessions render in an xterm.js terminal; without TERM the remote shell
+        // (via ssh -tt) comes up with an empty TERM and `top`/`clear`/vi refuse
+        // to run ("TERM environment variable not set").
+        if std::env::var("TERM").is_err() {
+            cmd.env("TERM", "xterm-256color");
+        }
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
@@ -92,6 +98,21 @@ impl SessionManager {
     /// hostname or re-auth, even for aliases a fresh ssh can't resolve.
     pub fn spawn_ssh(&self, emit: Emitter, host: &str) -> Result<u32, String> {
         crate::ssh::ensure_mux_dir();
+        let sock = crate::ssh::ssh_control_path(host);
+        // A dead mux socket (left behind by ControlPersist after a tab closed)
+        // would make `ControlMaster=yes` refuse to attach; more importantly, an
+        // auto-created pty-less master must never be reused here. Clear any
+        // non-alive socket so every connect opens a FRESH `-tt` pty session
+        // (a stale/pty-less master is exactly how TERM / top / clear break).
+        if sock.exists() && !crate::ssh::master_alive(&sock, host) {
+            let _ = std::process::Command::new("ssh")
+                .args(["-S", sock.to_str().unwrap_or_default(), "-O", "exit", host])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = std::fs::remove_file(&sock);
+        }
         let mut args = vec![
             "-tt".to_string(),
             "-o".to_string(),

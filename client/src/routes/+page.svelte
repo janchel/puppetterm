@@ -1163,6 +1163,9 @@
     "first check its size with `wc -l <file>`, then read ONLY the ranges you need with " +
     "`sed -n 'START,ENDp' <file>` or `grep -n 'pattern' <file>` — don't re-read the whole " +
     "file." +
+    " DO NOT re-run the exact same command you already ran in this conversation when its " +
+    "result is already visible above — plain repeats are treated as a stuck loop and the app " +
+    "will stop you; if you need fresh/live data, run a DIFFERENT, more targeted command. " +
     "\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
@@ -1216,6 +1219,11 @@
     "`run_command` to narrow it. For a large file, first check its size with `wc -l <file>`, " +
     "then read ONLY the ranges you need with `sed -n 'START,ENDp' <file>` or `grep -n " +
     "'pattern' <file>` — don't re-read the whole file.\n\n" +
+    "DO NOT re-run the exact same command you already ran in this conversation when its result " +
+    "is already visible above — a plain repeat is treated as a stuck loop and the app will stop " +
+    "you (identical re-runs that return identical output waste everyone's time). If you need " +
+    "fresh/live data, say so in your text and run a DIFFERENT, more targeted command instead of " +
+    "repeating the previous one.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -2421,12 +2429,49 @@
     return final;
   }
 
+  /** Compact fingerprint + human recap of a tool result (the JSON string the
+   *  frontend stores as the tool message content). Used by the stuck-guard:
+   *  two identical consecutive results = no progress; a changing result =
+   *  the model is legitimately polling. */
+  function resultFingerprint(content: string): { fp: string; empty: boolean; recap: string } {
+    let o: any = null;
+    try {
+      o = JSON.parse(content);
+    } catch {
+      o = null;
+    }
+    const exit = o?.exit ?? null;
+    const out = String(o?.outputs ?? "").trim();
+    const structured = o?.structured ?? null;
+    const fp = `${exit}|${JSON.stringify(structured)}|${out.replace(/\s+/g, " ").trim()}`;
+    const err = String(o?.error ?? "").trim();
+    const lines = out ? out.split("\n").length : 0;
+    let recap: string;
+    if (err) {
+      recap = `error: ${err.slice(0, 140)}`;
+    } else if (out) {
+      const first = out.split("\n")[0];
+      recap =
+        `exit ${exit}, output: "${first.slice(0, 160)}${first.length > 160 ? "…" : ""}"` +
+        (lines > 1 ? ` (${lines} lines, ${utf8Bytes(out)} bytes)` : "");
+    } else {
+      recap = `no output (exit ${exit})`;
+    }
+    return { fp, empty: out === "", recap };
+  }
+
   async function runAiLoop(hostForPersist: string) {
     try {
       let guard = 0;
       const MAX_STEPS = 60;
       let lastSig: string | null = null;
       let repeatCount = 0;
+      // Stuck-guard state: fingerprints of the last two EXECUTED tool results
+      // while the calls were identical, so we only stop on NO-PROGRESS repeats
+      // (same call, same output). An identical call whose output changed is a
+      // poll waiting for progress — that should flow, not trip the guard.
+      let lastExec: { fp: string; empty: boolean; recap: string } | null = null;
+      let prevExec: { fp: string; empty: boolean; recap: string } | null = null;
       // Auto-save after each AI response so a long multi-step task (or an
       // abort) never loses progress. Throttled: rapid tool steps shouldn't
       // flood the DB — the final persist after the loop covers the tail.
@@ -2467,16 +2512,27 @@
           ]);
           for (const tc of msg.tool_calls) {
             const sig = `${tc.function.name}:${tc.function.arguments}`;
-            if (sig === lastSig) {
+            const isRepeat = sig === lastSig;
+            if (isRepeat) {
               repeatCount++;
             } else {
               lastSig = sig;
               repeatCount = 1;
+              lastExec = null;
+              prevExec = null;
             }
-            if (repeatCount >= 3) {
+            // Stuck detection runs BEFORE executing: a 3rd consecutive identical
+            // call is NOT run when the last two results show no progress (same
+            // output, or no output at all) — the AI already has that data.
+            if (
+              repeatCount >= 3 &&
+              lastExec &&
+              prevExec &&
+              (lastExec.empty || lastExec.fp === prevExec.fp)
+            ) {
               pushChat(
                 "ai",
-                "(stopped — the AI repeated the same action 3× in a row and appears stuck. Try rephrasing, or ask it to be more specific.)",
+                `(stopped — the AI repeated the same action 3× in a row and appears stuck. It already had this result: ${(lastExec.recap).slice(0, 200)}. The identical call was NOT run again. Try rephrasing, or ask it to be more specific.)`,
               );
               return;
             }
@@ -2485,6 +2541,31 @@
               ? JSON.stringify(await executeTool(tc))
               : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
             chatStore.setHistory([...chatStore.getHistory(), { role: "tool", tool_call_id: tc.id, content }]);
+            const f = resultFingerprint(content);
+            if (isRepeat) {
+              const prior = lastExec;
+              prevExec = prior;
+              lastExec = f;
+              // Re-running the SAME action produced the IDENTICAL result — no new
+              // information for the model, so halt immediately (don't wait for a
+              // 3rd identical call). It already has this data in context.
+              if (f.fp === prior?.fp) {
+                pushChat(
+                  "ai",
+                  `(stopped — the AI repeated an action whose result was already returned unchanged. Last result: ${(lastExec.recap).slice(0, 200)}. The identical call was NOT run again. Try rephrasing, or ask it to be more specific.)`,
+                );
+                return;
+              }
+              // Output changed vs the prior identical run → the model is polling
+              // for progress, not stuck; keep the repeats flowing until the
+              // output freezes (that is exactly when the check above trips).
+              if (repeatCount >= 3) {
+                repeatCount = 2;
+              }
+            } else {
+              lastExec = f;
+              prevExec = null;
+            }
           }
           await persistThrottled();
           continue;
@@ -2939,7 +3020,8 @@
     // DON'T stream the raw agent stdout into the terminal — that would pollute
     // the terminal buffer, and if the AI later calls `read_terminal`/`terminal`
     // it would pull a big dump back into the context window. A concise status
-    // line keeps the user informed without the token cost.
+    // line (exit + byte/line count + a one-line preview) keeps the user informed
+    // that the result WAS captured without the token cost.
     const resultEvent = [...(res?.events ?? [])].reverse().find((e: any) => e?.type === "result");
     const rawOutputs = (res?.events ?? [])
       .filter((e: any) => e?.type === "output")
@@ -2947,8 +3029,20 @@
       .join("");
     if (term) {
       const exit = resultEvent?.exit ?? res?.exit ?? null;
-      // Silent mode: just confirm it finished — no byte counts, no contents.
-      term.write(`\r\n\x1b[90m[puppetterm] done (exit ${exit ?? "?"})\x1b[0m\r\n`);
+      const bytes = utf8Bytes(rawOutputs);
+      const lines = rawOutputs.split("\n").length;
+      let summary = `done (exit ${exit ?? "?"}) — captured ${bytes} bytes / ${lines} line${lines === 1 ? "" : "s"}`;
+      const trimmed = rawOutputs.trim();
+      if (trimmed) {
+        const first = trimmed.split("\n")[0];
+        const preview = first.length > 100 ? first.slice(0, 100) + "…" : first;
+        summary += ` — ${preview}`;
+      } else if (res?.error) {
+        summary += ` — error: ${String(res.error).slice(0, 100)}`;
+      } else {
+        summary += ` — no output`;
+      }
+      term.write(`\r\n\x1b[90m[puppetterm] ${summary}\x1b[0m\r\n`);
     }
     if (res?.error && term) {
       term.write(`\r\n\x1b[31m[puppetterm] action error: ${res.error}\x1b[0m\r\n`);

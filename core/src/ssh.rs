@@ -194,6 +194,26 @@ fn user_mux_socket(host: &str) -> Option<PathBuf> {
     cands.into_iter().map(|s| dir.join(s)).find(|p| p.exists())
 }
 
+/// Backend-only (install/agent/probe) ControlMaster socket — distinct from the
+/// interactive `.sock` so a pty-less auto-master created by a backend call can
+/// NEVER shadow a later interactive session (which would come up pty-less and
+/// report `TERM environment variable not set` for top/clear/etc.).
+pub fn ssh_ctl_control_path(host: &str) -> PathBuf {
+    ssh_mux_dir().join(format!("{}.ctl", ssh_sanitize(host)))
+}
+
+/// True when a ControlMaster socket is alive (an attached probe returns 0).
+pub fn master_alive(sock: &std::path::Path, host: &str) -> bool {
+    Command::new("ssh")
+        .args(["-S", sock.to_str().unwrap_or_default(), "-O", "check", host])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Point `cmd` at the shared ControlMaster for `host` (creating the master on
 /// the first successful connection via `ControlMaster=auto` + `ControlPersist`).
 ///
@@ -204,8 +224,13 @@ fn user_mux_socket(host: &str) -> Option<PathBuf> {
 /// (DNS, ProxyJump, VPN, …). `auto` also heals a stale socket by re-mastering.
 /// Returns true when a control path was attached (always, unless disabled).
 pub fn attach_control(cmd: &mut Command, host: &str) -> bool {
-    let sock = user_mux_socket(host).unwrap_or_else(|| ssh_control_path(host));
     ensure_mux_dir();
+    // Prefer an interactive session the app already opened for this host (its
+    // master carries a pty — rides the exact connection the user sees). When
+    // none exists, use the backend-specific path so we never touch `.sock`.
+    let interactive = ssh_control_path(host);
+    let sock = user_mux_socket(host)
+        .unwrap_or_else(|| if interactive.exists() { interactive } else { ssh_ctl_control_path(host) });
     cmd.arg("-S").arg(&sock);
     cmd.arg("-o").arg("ControlMaster=auto");
     cmd.arg("-o").arg("ControlPersist=600");

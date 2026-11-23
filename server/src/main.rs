@@ -10,23 +10,47 @@
 //!   PUPPETTERM_WEB_DIST    static frontend dir     (optional — API-only if unset)
 //!   PUPPETTERM_BASIC_AUTH  `user:pass` basic auth  (optional — open if unset)
 
+mod ai_task;
 mod api;
 mod auth;
 mod hub;
 
 use std::sync::Arc;
 
-use axum::http::StatusCode;
-use axum::response::IntoResponse;use axum::routing::{get, post};
+use axum::extract::Request;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::Router;
 use puppetterm_core::sessions::SessionManager;
 
 use hub::EventHub;
 
+/// Static assets are content-hashed by the bundler, so they can be cached
+/// forever. `index.html` (and any HTML) must always be revalidated — otherwise
+/// a browser keeps serving the previous build's asset list after a redeploy and
+/// the UI silently runs old code.
+async fn static_cache_headers(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let is_html = path == "/" || path.ends_with(".html");
+    let mut res = next.run(req).await;
+    let value = if is_html {
+        "no-cache"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    if let Ok(v) = HeaderValue::from_str(value) {
+        res.headers_mut().insert(header::CACHE_CONTROL, v);
+    }
+    res
+}
+
 #[derive(Clone)]
 pub struct App {
     pub sessions: Arc<SessionManager>,
     pub hub: Arc<EventHub>,
+    pub tasks: Arc<ai_task::TaskManager>,
 }
 
 async fn health() -> impl IntoResponse {
@@ -57,7 +81,11 @@ async fn main() {
     // Clean up any leftover ControlMaster sockets from previous runs.
     std::thread::spawn(puppetterm_core::sessions::cleanup_stale_masters);
 
-    let app_state = App { sessions: Arc::new(SessionManager::new()), hub: Arc::new(EventHub::new()) };
+    let app_state = App {
+        sessions: Arc::new(SessionManager::new()),
+        hub: Arc::new(EventHub::new()),
+        tasks: Arc::new(ai_task::TaskManager::new()),
+    };
 
     let mut router = Router::new()
         .route("/api/health", get(health))
@@ -70,8 +98,12 @@ async fn main() {
         match std::fs::metadata(&dist) {
             Ok(m) if m.is_dir() => {
                 let index = std::path::Path::new(&dist).join("index.html");
-                let serve = tower_http::services::ServeDir::new(&dist)
-                    .not_found_service(tower_http::services::ServeFile::new(index));
+                let serve = tower::ServiceBuilder::new()
+                    .layer(middleware::from_fn(static_cache_headers))
+                    .service(
+                        tower_http::services::ServeDir::new(&dist)
+                            .not_found_service(tower_http::services::ServeFile::new(index)),
+                    );
                 router = router.fallback_service(serve);
                 println!("[puppetterm] serving web UI from {dist}");
             }

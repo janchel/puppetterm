@@ -483,6 +483,101 @@ pub async fn command(State(app): State<App>, Path(cmd): Path<String>, body: Byte
         })
         .await,
 
+        // ---- server-side AI task loop ----------------------------------------
+        "ai_task_start" => {
+            let owner = arg_str(&args, "owner");
+            let host = arg_str(&args, "host");
+            let tab_id = args.get("tab_id").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let conversation_id = arg_str(&args, "conversation_id");
+            let autonomy = arg_str(&args, "autonomy");
+            let messages: Vec<puppetterm_core::ai::ChatMessage> =
+                match args.get("messages") {
+                    Some(m) => match serde_json::from_value(m.clone()) {
+                        Ok(m) => m,
+                        Err(e) => return err(format!("invalid messages: {e}")),
+                    },
+                    None => return err("missing messages".into()),
+                };
+            let tools: Vec<puppetterm_core::ai::ToolDef> = match args.get("tools") {
+                Some(t) => match serde_json::from_value(t.clone()) {
+                    Ok(t) => t,
+                    Err(e) => return err(format!("invalid tools: {e}")),
+                },
+                None => Vec::new(),
+            };
+            let tasks = app.tasks.clone();
+            let hub = app.hub.clone();
+            run_blocking(move || {
+                let cid = if conversation_id.is_empty() {
+                    puppetterm_core::chat_history::create_conversation(&host, "")?
+                } else {
+                    conversation_id
+                };
+                puppetterm_core::chat_history::replace_messages(
+                    &cid,
+                    &messages.iter().map(|m| puppetterm_core::chat_history::ChatMsg {
+                        role: match m.role {
+                            puppetterm_core::ai::Role::System => "system",
+                            puppetterm_core::ai::Role::User => "user",
+                            puppetterm_core::ai::Role::Assistant => "assistant",
+                            puppetterm_core::ai::Role::Tool => "tool",
+                        }
+                        .to_string(),
+                        content: m.content.clone(),
+                        tool_call_id: m.tool_call_id.clone(),
+                        tool_calls: m
+                            .tool_calls
+                            .as_ref()
+                            .map(|tcs| serde_json::to_string(tcs).unwrap_or_default()),
+                    })
+                    .collect::<Vec<_>>(),
+                )?;
+                let task_id = tasks.start(owner, host, tab_id, cid.clone(), messages, tools, autonomy, hub)?;
+                Ok(json!({ "task_id": task_id, "conversation_id": cid }))
+            })
+            .await
+        }
+        "ai_task_results" => {
+            let task_id = arg_str(&args, "task_id");
+            let results: Vec<crate::ai_task::ToolResult> = match args.get("results") {
+                Some(r) => match serde_json::from_value(r.clone()) {
+                    Ok(r) => r,
+                    Err(e) => return err(format!("invalid results: {e}")),
+                },
+                None => return err("missing results".into()),
+            };
+            let tasks = app.tasks.clone();
+            run_blocking(move || {
+                tasks.submit_results(&task_id, results)?;
+                Ok(json!(null))
+            })
+            .await
+        }
+        "ai_task_attach" => {
+            let task_id = arg_str(&args, "task_id");
+            let owner = arg_str(&args, "owner");
+            let tasks = app.tasks.clone();
+            run_blocking(move || {
+                tasks.attach(&task_id, owner)?;
+                Ok(json!(null))
+            })
+            .await
+        }
+        "ai_task_abort" => {
+            let task_id = arg_str(&args, "task_id");
+            let tasks = app.tasks.clone();
+            run_blocking(move || {
+                tasks.abort(&task_id)?;
+                Ok(json!(null))
+            })
+            .await
+        }
+        "ai_task_status" => {
+            let task_id = arg_str(&args, "task_id");
+            let tasks = app.tasks.clone();
+            run_blocking(move || tasks.status(&task_id)).await
+        }
+
         other => err(format!("unknown command: {other}")),
     }
 }

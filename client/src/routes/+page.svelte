@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { call, on, type UnlistenFn } from "$lib/backend";
+  import { call, on, isWeb, clientId, type UnlistenFn } from "$lib/backend";
   import { ChatStore, type ChatMessage, type ConversationMeta } from "$lib/chat-store.svelte";
   import { Terminal } from "xterm";
   import "xterm/css/xterm.css";
@@ -18,6 +18,7 @@
     cwd: string; // current working directory, parsed from the shell prompt ("" = unknown)
     sessionId: number | null;
     connecting: boolean;
+    local: boolean; // true while this tab is the local shell (not a verified remote session)
     buf: string; // input buffer used to detect `ssh <target>` commands
     pendingSshTarget?: string; // ssh target from user input, awaiting prompt verification
   };
@@ -43,6 +44,28 @@
   );
   // Current working directory of the active session, parsed from its prompt.
   let activeTabCwd = $derived(tabs.find((t) => t.id === activeTabId)?.cwd ?? "");
+  // Live connection state of the active tab. `activeChatHost` is the
+  // CONVERSATION binding (kept across disconnects on purpose); this is the
+  // VERIFIED live session state, which is what the "acting on" indicator and
+  // the AI's SESSION STATE must reflect.
+  let activeConnState = $derived.by<"connected" | "connecting" | "disconnected" | "none">(() => {
+    const t = tabs.find((x) => x.id === activeTabId);
+    if (!t) return "none";
+    if (t.connecting) return "connecting";
+    if (t.host && t.sessionId != null) return "connected";
+    return "disconnected";
+  });
+  // A typed `ssh <target>` that has not yet been verified by a remote prompt.
+  let activePendingSsh = $derived(
+    tabs.find((t) => t.id === activeTabId)?.pendingSshTarget ?? null,
+  );
+
+  // Interactive-shell depth tracking for the live terminal. Prevents the AI
+  // from sending two `exit` commands in a row: the first leaves an inner
+  // container/nested shell, the second would drop the host SSH session.
+  let lastTerminalCmd = "";
+  let nestedShellArmed = false; // last terminal command entered a nested shell
+  let justExitedNested = false; // last terminal command was an exit from a nested shell
 
   // Pinned at send time: the terminal + host a chat task is acting on. Kept so
   // switching tabs mid-task can never redirect the AI to a different server.
@@ -52,6 +75,9 @@
   // in sendChat (the prompt/tool constants are defined further down).
   let chatTools = $state<any[]>([]);
   let chatPrompt = $state<string>("");
+  // Server-side AI task id (web transport). When set, the server owns the loop
+  // and streams task_* events; this browser executes tool calls + approvals.
+  let activeTaskId = $state<string | null>(null);
 
   // ---- agent install (in-terminal, approval-style: install the agent on the connected host) ---
   let installPrompt = $state<{ tabId: number; host: string; force?: boolean } | null>(null); // awaiting y/n in the terminal
@@ -845,6 +871,12 @@
     return s || "__local__";
   }
 
+  /** Output that means an `ssh` attempt did NOT reach (or lost) the remote
+   *  shell. Used to avoid binding the chat to a host that failed to connect
+   *  or was cancelled with Ctrl+C. */
+  const SSH_FAIL_RE =
+    /ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection (?:timed? ?out|operation timed out)|Operation timed out|closed by remote host|Connection reset|ssh exited|\^[CD]|keyboard interrupt|terminated by signal|killed by signal/i;
+
   function pushChat(role: string, text: string) {
     chatStore.pushChat(role, text);
   }
@@ -907,6 +939,10 @@
     if (!bound || t.id !== activeTabId || chatBusy) return;
     await checkpointConnectionClosed(bound);
     t.chatHost = "";
+    // The session is gone — forget nested-shell tracking for the next connect.
+    lastTerminalCmd = "";
+    nestedShellArmed = false;
+    justExitedNested = false;
   }
 
   // Refresh the conversation list sidebar for the active host.
@@ -1070,15 +1106,16 @@
   // The `terminal` tool types a command into the user's LIVE pty (like a human)
   // and waits for the output — it's the universal fallback that works on ANY
   // host (key or password, no agent). It rides the real session, so in agent
-  // mode it is a LAST RESORT for interactive commands the structured tools
-  // can't cover (htop, vim, password prompts) — NOT for regular inspection,
-  // which belongs to `run_command`/`config`/`log`/`snapshot`/`service`.
+  // mode it is a LAST RESORT for interactive work the structured tools can't
+  // cover (docker exec -it into a container, htop, vim, password prompts) — NOT
+  // for regular inspection, which belongs to `run_command`/`config`/`log`/
+  // `snapshot`/`service`.
   const TERMINAL_TOOL = {
     type: "function",
     function: {
       name: "terminal",
       description:
-        "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Works on ANY host — key or password — and needs no agent. ONLY for interactive commands the structured tools cannot handle (e.g. htop, vim, password prompts). For regular inspection and changes, prefer `run_command` (agent mode) or `read_terminal`/this tool (terminal mode). The user sees the command run live. Returns the terminal output after the command.",
+        "Run a command by typing it into the user's LIVE, already-connected terminal (like a human) and wait for the output to settle. Check the SESSION STATE line first: only use this when the terminal is actually CONNECTED to the target — if it says the session is down or you are not on that host, do not run anything. Works on ANY host — key or password — and needs no agent. In agent mode this is the escape hatch for INTERACTIVE work the structured tools cannot do: entering a container (`docker exec -it <name> bash`), `htop`, editors, password prompts. For routine inspection/changes in agent mode, prefer `run_command`/`config`/`log`/`snapshot`/`service`; in terminal mode this is the primary tool. The user sees the command run live. Large output is returned as a digest; call `read_terminal` to page the screen buffer for the full text.",
       parameters: {
         type: "object",
         properties: { command: { type: "string", description: "the full command line to type and execute" } },
@@ -1088,27 +1125,35 @@
   };
 
   // `read_terminal` reads what is physically on the user's screen (bounded by
-  // xterm scrollback). It is ONLY offered in terminal mode, where there is no
-  // agent to return structured results. In agent mode it would show just status
-  // lines (silent mode) and make real results look truncated — so it is NOT in
-  // AGENT_TOOLS. The agent tools return full output directly in the conversation.
+  // xterm scrollback). In terminal mode it is the primary way to see results;
+  // in agent mode it is a companion to the `terminal` escape hatch (checking an
+  // interactive container shell, what the user is looking at). The agent tools
+  // return full output directly in the conversation for routine work.
   const READ_TERMINAL_TOOL = {
     type: "function",
     function: {
       name: "read_terminal",
       description:
-        "Read what is physically on the user's terminal screen right now (bounded by scrollback). Use this ONLY to see what the user is looking at or an interactive session. This is NOT how you get command output or file contents — use `run_command`/`config`/`log` (agent mode) or the `terminal` tool (terminal mode) instead, which return full results directly.",
-      parameters: { type: "object", properties: {} },
+        "Read the user's terminal screen (bounded by scrollback). Returns the most recent `limit` lines by default; set `offset` to page further back (offset counts lines back from the end, e.g. offset=2000&limit=1000 reads the window 3000-2000 lines ago). Use this to see what the user is looking at, to review output from earlier in the session that may have scrolled off, or to check an interactive session (e.g. after `docker exec -it <name> bash`). This is NOT how you get a file's full contents or a command's full output — use the `terminal` tool or the agent tools (agent mode) for that.",
+      parameters: {
+        type: "object",
+        properties: {
+          offset: { type: "number", description: "lines to skip back from the end of the buffer (default 0)" },
+          limit: { type: "number", description: "max lines to return (default 2000, max 5000)" },
+        },
+      },
     },
   };
 
-  // AGENT MODE: the agent is your eyes and hands on the remote host — every
-  // tool runs ON THE MACHINE over the agent's own SSH connection and returns
-  // full, audited results directly in the conversation. No terminal screen
-  // scraping AND no typing into the live terminal: `run_command` is PRIMARY
-  // (read files, run commands), `snapshot`, `service`, `log`, `config` cover
-  // the rest. If the agent is unavailable, the app says so and guides you to
-  // install it — it never falls back to typing commands into the user's pty.
+  // AGENT MODE: the agent is your eyes and hands on the remote host — the
+  // structured tools run ON THE MACHINE over the agent's own SSH connection and
+  // return full, audited results directly in the conversation. `run_command` is
+  // PRIMARY (read files, run commands), `snapshot`, `service`, `log`, `config`
+  // cover the rest. The `terminal`/`read_terminal` tools are a LAST-RESORT
+  // escape hatch for interactive work the structured tools can't do (entering a
+  // container with `docker exec -it <name> bash`, `htop`, editors, password
+  // prompts) — and only when the user's live terminal is actually connected to
+  // the target host.
   const AGENT_TOOLS = [
     { type: "function", function: { name: "run_command", description: "Run a command on the ACTIVE HOST through the installed puppetterm-agent over its dedicated SSH connection. This is your PRIMARY tool — your eyes and hands on the machine. Use it to inspect (read files with cat/sed/head/tail — full content returned; check state with ps/df/free/uptime/grep) and to change (install, configure, restart). Returns the FULL output and a clean exit code directly to you (audited).", parameters: { type: "object", properties: { cmd: { type: "string" }, dir: { type: "string" } }, required: ["cmd"] } } },
     { type: "function", function: { name: "snapshot", description: "System snapshot of the active host: CPU, memory, disk, uptime (via the installed agent).", parameters: { type: "object", properties: {} } } },
@@ -1116,6 +1161,9 @@
     { type: "function", function: { name: "log", description: "Tail a log file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, lines: { type: "number" }, follow: { type: "boolean" } }, required: ["path"] } } },
     { type: "function", function: { name: "config", description: "Read or write a config file on the active host, allow-listed paths (via the installed agent).", parameters: { type: "object", properties: { path: { type: "string" }, op: { type: "string", enum: ["read", "write"] }, content: { type: "string" } }, required: ["path", "op"] } } },
     { type: "function", function: { name: "read", description: "Read a BOUNDED line-range of ANY file on the active host (via the installed agent) — for paging through large logs/configs WITHOUT dumping the whole file into context. Returns line-numbered output. Use `offset` (1-based starting line) and `limit` to page (e.g. read first 200 lines, then offset 201). Prefer `grep \"pattern\"` via run_command to find the relevant section FIRST, then `read` just that range. Default limit 200, max 5000.", parameters: { type: "object", properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } }, required: ["path"] } } },
+    // Interactive escape hatch (last resort): the live terminal.
+    TERMINAL_TOOL,
+    READ_TERMINAL_TOOL,
   ];
 
   // TERMINAL MODE (agent not installed on the host): only tools that ride the
@@ -1136,12 +1184,56 @@
     return agentMap[host] === false;
   }
 
+  /** Short, model-readable description of the live terminal's connection
+   *  state. Injected into the system prompt and tool results so the AI can
+   *  tell whether the SSH session it is acting on is actually up. Hosts are
+   *  compared canonically (user@host:port → host) so `ssh user@host` vs a
+   *  prompt showing `user@host` can't look like a different server. */
+  function sessionStateText(host: string | null | undefined, tab?: Tab | null): string {
+    if (!host) return "LOCAL SHELL — no remote SSH session is active.";
+    const canon = canonicalChatHost(host);
+    const tabCanon = tab?.host ? canonicalChatHost(tab.host) : "";
+    if (tab && tab.sessionId != null && !tab.connecting && tabCanon === canon) {
+      return `CONNECTED to ${host} over a live SSH session`;
+    }
+    if (tab && tab.connecting) return `CONNECTING to ${host} — the session is not ready yet`;
+    if (tab && tab.host && tabCanon !== canon) {
+      return `NOT on ${host} — the active terminal is currently on ${tab.host}`;
+    }
+    if (tab && tab.sessionId != null && !tab.connecting) {
+      return `NOT CONFIRMED on ${host} — the terminal session is alive but its prompt does not show ${host} (it may be the local shell or the prompt was not parsed)`;
+    }
+    return `NOT CONNECTED to ${host} — the SSH session has ended (the terminal is back at the local shell)`;
+  }
+
+  /** System-prompt line that tells the model what it may act on right now. */
+  function sessionPromptLine(host: string | null | undefined, tab?: Tab | null): string {
+    if (!host) {
+      return "\n\nSESSION STATE: you are attached to the LOCAL container shell — no remote SSH session is active. If the user wants you to act on a remote host, they must connect with `ssh <host>` first; do not pretend to be on a remote server.";
+    }
+    const state = sessionStateText(host, tab);
+    let guidance: string;
+    if (state.startsWith("CONNECTED")) {
+      guidance = `Commands you run with the \`terminal\` tool execute on ${host}.`;
+    } else if (state.startsWith("CONNECTING")) {
+      guidance = "Do NOT run commands yet — wait for the connection to finish or ask the user.";
+    } else if (state.startsWith("NOT on")) {
+      guidance = `The chat is bound to ${host}, but the live terminal is elsewhere — do NOT assume commands run on ${host}. Tell the user and ask how to proceed.`;
+    } else if (state.startsWith("NOT CONFIRMED")) {
+      guidance = `Do NOT assume you are on ${host}. Call \`read_terminal\` to see the current prompt and verify where you are before running anything; if it is the local shell, tell the user.`;
+    } else {
+      guidance = `Do NOT run commands as if you were on ${host}; tell the user the session is down and ask whether to reconnect.`;
+    }
+    return `\n\nSESSION STATE: ${state}. ${guidance}`;
+  }
+
   /** The tools + system prompt to hand the model for a given host, depending
    *  on whether the remote agent is installed: agent mode exposes the
    *  structured tools (agentic), otherwise the AI only gets the terminal tools.
-   *  `cwd` (the session's current directory, if known) is injected so the AI
-   *  knows WHERE it's working — like opencode locking to a folder. */
-  function chatConfigFor(host: string | null | undefined, cwd?: string | null) {
+   *  `cwd` (the session's current directory, if known) and the live connection
+   *  state are injected so the AI knows WHERE it is and whether the SSH session
+   *  is actually up. */
+  function chatConfigFor(host: string | null | undefined, cwd?: string | null, tab?: Tab | null) {
     const hasAgent = hostHasAgent(host);
     const tools = hasAgent ? AGENT_TOOLS : TERMINAL_ONLY_TOOLS;
     const base = !host
@@ -1149,16 +1241,14 @@
       : hasAgent
         ? AGENT_SYSTEM_PROMPT
         : TERMINAL_SYSTEM_PROMPT;
-    // History is a terminal app's working context, NOT ground truth. Explicitly
-    // tell the model to re-query the live server rather than trust stale chat
-    // or activity output — keeps it honest about current config and avoids
-    // wasting tokens re-reading old logs.
+    // History is a terminal app's working context, NOT ground truth. Prior
+    // output is real and worth reviewing, but current state must be re-queried.
     const historyCaveat =
-      "\n\nHISTORY IS EPHEMERAL — the chat and Activity log are working context only, never the source of truth about the server. Do NOT treat prior tool output or chat history as the host's CURRENT state. Whenever you need current config or status, re-query the LIVE server with the tools (run_command / config / snapshot / service, or the terminal tool). This is a terminal app: trust the server's CURRENT state, not stale history.";
+      "\n\nHISTORY IS EPHEMERAL — the chat and Activity log are working context, not the source of truth about the server's CURRENT state. Prior tool/terminal output in this conversation IS real output you already captured: review it before acting, but re-query the LIVE server with the tools (run_command / config / snapshot / service, or the terminal tool) when you need current config or status. Do not assume a previous command's result is still current.";
     const cwdLine = cwd
       ? `\n\nYou are currently working in the directory \`${cwd}\` on ${host || "the local terminal"}. Prefer commands relative to that directory (or reference the full path) when the user asks about files/folders there.`
       : "";
-    const prompt = base + historyCaveat + cwdLine;
+    const prompt = base + historyCaveat + cwdLine + sessionPromptLine(host, tab);
     return { tools, prompt, hasAgent };
   }
 
@@ -1192,6 +1282,14 @@
     "history file. `read_terminal` is a SCREEN SNAPSHOT bounded by scrollback: to get a " +
     "file's FULL contents or a command's full output, run it with the `terminal` tool (e.g. " +
     "`cat /path`) rather than reading the screen.\n\n" +
+    "CONTAINERS: to inspect inside a running container, `docker exec <container> <cmd>` from " +
+    "the host is fine for non-interactive checks; use `docker exec -it <container> bash` if " +
+    "you need an interactive container shell.\n\n" +
+    "NESTED SHELLS: if you enter an interactive shell (`docker exec -it <name> bash`, a nested " +
+    "`ssh`, …), ONE `exit` leaves that inner shell and returns to the parent. Do NOT send a " +
+    "second `exit` unless the user explicitly asks to disconnect the host — a second `exit` " +
+    "drops the SSH session. If the user says 'exit', exit only the inner shell and tell them " +
+    "the host is still connected.\n\n" +
     "Before running anything, explain in text what you'll run and why — the user sees your " +
     "explanation before the approval prompt. Large COMMAND OUTPUT is trimmed to a digest " +
     "(first/last lines + any error/warning lines) to save tokens, but FILE READS (`cat`, `sed`, " +
@@ -1210,6 +1308,11 @@
     "result is already visible above — plain repeats are treated as a stuck loop and the app " +
     "will stop you; if you need fresh/live data, run a DIFFERENT, more targeted command. " +
     "\n\n" +
+    "CONNECTION AWARENESS: the SESSION STATE line above is AUTHORITATIVE — it comes from the app's live session tracking, not from screen content. A container, service, or program stopping on the remote is NOT the SSH session dropping; do not infer a dropped connection from terminal output. BEFORE running any command, call `read_terminal` to review the current " +
+    "screen and any output from earlier in this session; if the output you need scrolled " +
+    "off, page back with `read_terminal` (offset/limit). If SESSION STATE says the session is not connected or not confirmed, or the request depends on output you cannot see or that looks like it belongs to an " +
+    "earlier session, STOP and ask the user a clarifying question in text — do NOT guess, " +
+    "do NOT try to `ssh` again, and do NOT run a command. Never assume a previous session's output is still valid or that a dropped session is still on the remote host.\n\n" +
     "State-changing actions are approved by the user before execution; you will be told if one " +
     "is rejected. Be concise and summarize tool results for the user.";
 
@@ -1223,25 +1326,37 @@
     "asked you to take an action. For general-knowledge questions, just give the answer and DO " +
     "NOT run a command at all.\n\n" +
     "The puppetterm-agent IS installed on this host and reachable over its own SSH connection, " +
-    "so DO ALL YOUR WORK THROUGH THE AGENT TOOLS — never by reading the terminal screen. Your " +
-    "tool results come back to you DIRECTLY in this conversation: `run_command` returns the full " +
-    "output + a clean exit code, `snapshot` returns CPU/memory/disk/uptime, `service` returns " +
-    "systemd state, `log` and `config` return full file contents. In agent mode the terminal " +
-    "only shows one status line per action — it does NOT show command output — so reading the " +
-    "terminal would tell you nothing and make real results look truncated. If you need a " +
-    "command's output or a file's contents, GET IT FROM THE TOOLS, not from the screen.\n\n" +
+    "so DO ALL YOUR ROUTINE WORK THROUGH THE AGENT TOOLS. Your tool results come back to you " +
+    "DIRECTLY in this conversation: `run_command` returns the full output + a clean exit code, " +
+    "`snapshot` returns CPU/memory/disk/uptime, `service` returns systemd state, `log` and " +
+    "`config` return full file contents. In agent mode the terminal only shows one status line " +
+    "per action — it does NOT show command output — so for normal inspection prefer the tools, " +
+    "not the screen. The `terminal`/`read_terminal` tools are an ESCAPE HATCH for interactive " +
+    "work the structured tools cannot do (see INTERACTIVE below).\n\n" +
     "PREFER `run_command` for inspecting and changing the machine (read files with " +
     "`cat`/`sed`/`head`/`tail` — full content returned; check state with `ps`/`df`/`free`/" +
     "`uptime`; grep logs; install and configure). Use `config` (read/write) and `log` (tail) " +
     "for their allow-listed paths, `snapshot` for a system overview, and `service` for systemd " +
     "units.\n\n" +
     "LARGE FILES / LOGS: `run_command` output is capped at ~24k words PER command, so NEVER `cat` a huge log or file (the tail is truncated and you'll miss most of it). Instead: `grep \"pattern\"` via run_command to find the relevant section, then use the `read` tool with `offset`/`limit` to page through that exact range (line-numbered). This keeps the conversation bounded and you only ever see what's relevant.\n\n" +
-    "IMPORTANT — YOU NEVER TYPE INTO THE USER'S TERMINAL in agent mode. All your work goes " +
-    "through the agent tools above; the results appear here in the chat, and the terminal only " +
-    "shows a status line. If a tool returns that the puppetterm-agent is not available on the " +
-    "host, do NOT try to work around it by typing into the terminal (you have no such tool) — " +
-    "tell the user the agent isn't installed and that they can click \"Install agent\" in the AI " +
-    "panel to enable agent mode on this host.\n\n" +
+    "INTERACTIVE / CONTAINERS: for anything that needs a real interactive shell — entering a " +
+    "container (`docker exec -it <name> bash`), `htop`, an editor, a password prompt — use the " +
+    "`terminal` tool to type into the user's LIVE terminal, but ONLY after checking SESSION " +
+    "STATE: the live terminal must actually be CONNECTED to the target host. If it is not, do " +
+    "not use it — tell the user to connect the terminal, or use `run_command` with `docker exec " +
+    "<name> <cmd>` for a non-interactive check. Routine inspection and changes still belong to " +
+    "the agent tools. If a tool returns that the puppetterm-agent is not available on the host, " +
+    "do NOT work around it by typing into the terminal — tell the user the agent isn't installed " +
+    "and that they can click \"Install agent\" in the AI panel to enable agent mode on this host.\n\n" +
+    "CONTAINERS: to inspect inside a running container, prefer `run_command` with `docker exec " +
+    "<container> <cmd>` (non-interactive, full output). If you need an interactive container " +
+    "shell (e.g. to explore), use the `terminal` tool with `docker exec -it <container> bash` — " +
+    "and first confirm the live terminal is connected to the host that runs the container.\n\n" +
+    "NESTED SHELLS: if you enter an interactive shell (`docker exec -it <name> bash`, a nested " +
+    "`ssh`, …), ONE `exit` leaves that inner shell and returns to the parent. Do NOT send a " +
+    "second `exit` unless the user explicitly asks to disconnect the host — a second `exit` " +
+    "drops the SSH session. If the user says 'exit', exit only the inner shell and tell them " +
+    "the host is still connected.\n\n" +
     "NOTE: `run_command` runs in the user's HOME directory on the remote host, NOT your shell's " +
     "current folder — always use ABSOLUTE paths (e.g. `cat /opt/docker/example-app/docker-compose." +
     "yml`) when reading files with it.\n\n" +
@@ -1430,7 +1545,7 @@
     }
 
     const id = nextTabId++;
-    tabs = [...tabs, { id, host: host ?? "", chatHost: host ?? "", sshTarget: host || undefined, cwd: "", sessionId: null, connecting: false, buf: "", pendingSshTarget: undefined }];
+    tabs = [...tabs, { id, host: host ?? "", chatHost: host ?? "", sshTarget: host || undefined, cwd: "", sessionId: null, connecting: false, local: !host, buf: "", pendingSshTarget: undefined }];
     activeTabId = id;
     showHostMenu = false;
     await tick();
@@ -1999,7 +2114,7 @@
       }
     }
     const tab = target.tabId >= 0 ? tabs.find((x) => x.id === target.tabId) : null;
-    const cfg = chatConfigFor(target.host, tab?.cwd || null);
+    const cfg = chatConfigFor(target.host, tab?.cwd || null, tab);
     chatTools = cfg.tools;
     chatPrompt = cfg.prompt;
     abortRequested = false;
@@ -2007,7 +2122,9 @@
     pushChat("user", text);
     pushChat(
       "ai",
-      `(acting on ${target.host || "the local terminal"} — ${cfg.hasAgent ? "agent mode" : "terminal mode"})`,
+      `(acting on ${target.host || "the local terminal"} — ${cfg.hasAgent ? "agent mode" : "terminal mode"}${
+        activeConnState === "connected" ? "" : activeConnState === "connecting" ? " (connecting…)" : target.host ? " (not connected)" : ""
+      })`,
     );
     // Keep the system prompt in the conversation in sync with the current host
     const userMsg = { role: "user", content: text };
@@ -2019,6 +2136,33 @@
       ...dropUnbalancedToolBatches(chatStore.getHistory()).filter((m) => m.role !== "system"),
       userMsg,
     ]);
+    // Web transport: run the loop on the server so the task persists, streams
+    // progress, and survives a tab close. The browser still executes tool
+    // calls and approvals (it owns the live pty + the approval UI). Falls back
+    // to the in-browser loop if the server task API is unavailable.
+    if (isWeb) {
+      try {
+        const resp = await call<any>("ai_task_start", {
+          owner: clientId,
+          host: target.host,
+          tab_id: target.tabId,
+          conversation_id: chatStore.activeConversationId || "",
+          messages: chatStore.getHistory(),
+          tools: chatTools,
+          autonomy,
+        });
+        activeTaskId = resp.task_id;
+        try {
+          localStorage.setItem("pp.activeTaskId", resp.task_id);
+        } catch { /* ignore */ }
+        chatStore.activeConversationId = resp.conversation_id;
+        chatBusy = true;
+        aiThinking = true;
+        return;
+      } catch (e) {
+        console.warn("server AI task unavailable, falling back to client loop", e);
+      }
+    }
     chatBusy = true;
     try {
       await runAiLoop(target.host);
@@ -2037,6 +2181,23 @@
   /** Take back control: stop the AI loop and kill the in-flight remote action. */
   async function abortAi() {
     abortRequested = true;
+    // Release a pending approval prompt so the tool loop doesn't hang.
+    if (pendingApproval) {
+      pendingApproval.resolve(false);
+      pendingApproval = null;
+    }
+    // Server-owned task: ask the server to stop its loop.
+    if (activeTaskId) {
+      const tid = activeTaskId;
+      forgetActiveTask();
+      aiThinking = false;
+      chatBusy = false;
+      try {
+        await call("ai_task_abort", { task_id: tid });
+      } catch (e) {
+        console.warn("ai_task_abort", e);
+      }
+    }
     const rid = currentRequestId;
     currentRequestId = null;
     if (rid) {
@@ -2287,6 +2448,15 @@
     return { user: m[1], host: m[2], full: `${m[1]}@${m[2]}` };
   }
 
+  /** True when the current prompt line's user@host canonically matches the ssh
+   *  target — positive evidence that the connection actually came up. A failed
+   *  `ssh` returns to the LOCAL prompt, which must NOT verify the target. */
+  function promptMatchesTarget(line: string, target: string): boolean {
+    const p = extractUserHostFromPrompt(line);
+    if (!p) return false;
+    return canonicalChatHost(p.full) === canonicalChatHost(target);
+  }
+
   /** Detect an ssh target from what's on screen. This catches commands that
    *  never passed through onData — e.g. recalled with the up-arrow — because
    *  the shell echoes them into the pty output. Only scans when the shell is
@@ -2310,20 +2480,31 @@
     const promptInfo = extractUserHostFromPrompt(last);
 
     // Check if recent output contains an explicit SSH failure error
-    const sshFailed = /ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection timed out/i.test(recent);
+    const sshFailed = SSH_FAIL_RE.test(recent);
 
-    // 1) Explicit pending SSH target typed by user takes priority
+    // 1) Explicit pending SSH target typed by the user. Require POSITIVE
+    //    evidence that the connection came up: the current prompt must be the
+    //    remote prompt for that target. `!sshFailed` alone is not enough — a
+    //    failed `ssh` returns to the LOCAL prompt, and binding then made the AI
+    //    claim it was acting on an unreachable host.
     if (t.pendingSshTarget) {
       const target = t.pendingSshTarget;
       t.pendingSshTarget = undefined;
-      if (!sshFailed) {
+      if (!sshFailed && promptMatchesTarget(last, target)) {
         if (t.host !== target) {
           if (t.host) agentChecked.delete(t.host);
           t.host = target;
         }
         t.chatHost = target; // keep chat bound to this host even if the session exits later
+        t.local = false;
         checkAndHintAgent(id, t.host);
         return;
+      }
+      if (sshFailed && canonicalChatHost(t.host) === canonicalChatHost(target)) {
+        // A reconnect to a host we thought was live failed — drop the stale
+        // live binding so the UI stops claiming a connection that isn't there.
+        t.host = "";
+        agentChecked.delete(target);
       }
     }
 
@@ -2364,29 +2545,56 @@
         }
 
         // Skip if this ssh command failed immediately
-        const peekBelow = lines.slice(i, Math.min(lines.length, i + 10)).join("\n");
-        if (/ssh: (?:connect to host|Could not resolve|Name or service not known)|Permission denied|Host key verification failed|Connection refused|No route to host|Connection timed out/i.test(peekBelow)) {
+        const peekBelow = lines.slice(i, Math.min(lines.length, i + 12)).join("\n");
+        if (SSH_FAIL_RE.test(peekBelow)) {
           continue;
+        }
+
+        // Verify the session actually switched shells: the prompt BEFORE this
+        // ssh command must differ from the current prompt. If it is the same
+        // (e.g. the attempt was cancelled with Ctrl+C and we're back at the
+        // same shell), this ssh did NOT produce a live session.
+        const curPrompt = extractUserHostFromPrompt(last);
+        if (curPrompt) {
+          let parentPrompt: { full: string } | null = null;
+          for (let j = i - 1; j >= 0; j--) {
+            const pj = extractUserHostFromPrompt(lines[j]);
+            if (pj) {
+              parentPrompt = pj;
+              break;
+            }
+          }
+          const sameShell =
+            parentPrompt !== null &&
+            canonicalChatHost(parentPrompt.full) === canonicalChatHost(curPrompt.full);
+          const promptIsTarget =
+            canonicalChatHost(curPrompt.full) === canonicalChatHost(target);
+          if (sameShell && !promptIsTarget) {
+            continue;
+          }
         }
 
         // We found the active SSH session for the current shell prompt!
         activeHost = target;
+        t.local = false;
         break;
       }
     }
 
-    // 3) Fallback prompt verification: if prompt is user@host (and user is not "pp"),
-    // verify/fallback to prompt host if scrollback didn't yield an explicit command.
-    if (!activeHost && promptInfo && promptInfo.user !== "pp") {
-      // A session opened through the app's host picker is authoritative — the
-      // remote's own prompt hostname (e.g. a VPS displaying `root@server`) is
-      // only the server's cosmetic name, NOT the ssh target (which may be
-      // `my-vps` → some IP). Trusting it here is what made installs try to
-      // `ssh root@server` and fail DNS. Typed nested ssh still wins via (1)/(2).
+    // 3) Fallback prompt verification: only when the scrollback scan found no
+    // explicit ssh command. The remote's own prompt hostname (e.g. a VPS
+    // displaying `root@test-host`) is COSMETIC — it is NOT the ssh target and must
+    // never re-key the conversation (that is what split chats when 10.0.0.1
+    // "resolved" to a cosmetic name and the AI lost context). Prefer the authoritative
+    // target, then the already-verified host, then the conversation binding;
+    // only trust the prompt hostname as a last resort.
+    if (!activeHost && promptInfo && promptInfo.user !== "pp" && !t.local) {
       if (t.sshTarget) {
         activeHost = t.sshTarget;
-      } else if (t.host && t.host.includes(promptInfo.host)) {
+      } else if (t.host) {
         activeHost = t.host;
+      } else if (t.chatHost) {
+        activeHost = t.chatHost;
       } else {
         activeHost = promptInfo.full;
       }
@@ -2394,6 +2602,7 @@
 
     // 4) Sync host state and trigger agent probe if host changed
     const newHost = activeHost ?? "";
+    t.local = !newHost;
     if (t.host !== newHost) {
       if (t.host) agentChecked.delete(t.host);
       t.host = newHost;
@@ -2674,6 +2883,21 @@
     const args = safeParse(tc.function.arguments);
     // Reading the terminal screen is invisible and changes nothing — never prompt.
     if (name === "read_terminal") return Promise.resolve(true);
+    // Never prompt for (or run) a second consecutive `exit`: the first already
+    // left the inner container/nested shell, so another would drop the host.
+    if (name === "terminal") {
+      const first = String(args.command ?? "").replace(/^sudo\s+/, "").trim().split(/\s+/)[0] ?? "";
+      if (
+        (first === "exit" || first === "logout" || first === "quit") &&
+        justExitedNested
+      ) {
+        pushChat(
+          "ai",
+          "(blocked: that would be a second `exit` — it drops the host SSH session, not just the container. Ask the user if they want to disconnect.)",
+        );
+        return Promise.resolve(false);
+      }
+    }
     // Propose-first: the AI answers the question in text, then asks before
     // executing ANY command (even read-only ones) — full human-in-the-loop.
     const proposeFirst = autonomy === "propose-first";
@@ -2702,6 +2926,57 @@
   function reject() {
     pendingApproval?.resolve(false);
     pendingApproval = null;
+  }
+
+  /** Server-owned task: the server sent tool calls for this browser to run.
+   *  Reuses the same approval + execution path as the in-browser loop, then
+   *  posts the results back to the server's loop. */
+  async function handleTaskToolCalls(p: any) {
+    if (!p || p.owner !== clientId) return;
+    if (!activeTaskId || p.task_id !== activeTaskId) return;
+    const calls = Array.isArray(p.tool_calls) ? p.tool_calls : [];
+    if (calls.length === 0) return;
+    // Pin the target for this task (also covers a re-attached client).
+    if (typeof p.host === "string" && typeof p.tab_id === "number") {
+      chatTarget = { host: p.host, tabId: p.tab_id };
+    }
+    aiThinking = false;
+    if (p.explain) pushChat("ai", String(p.explain));
+    chatStore.setHistory([
+      ...chatStore.getHistory(),
+      { role: "assistant", content: p.explain ?? null, tool_calls: calls },
+    ]);
+    const results: { tool_call_id: string; content: string }[] = [];
+    for (const tc of calls) {
+      let content: string;
+      try {
+        const ok = await requestApproval(tc, p.explain || undefined);
+        content = ok
+          ? JSON.stringify(await executeTool(tc))
+          : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
+      } catch (e) {
+        content = JSON.stringify({ error: String(e) });
+      }
+      results.push({ tool_call_id: tc.id, content });
+      chatStore.setHistory([
+        ...chatStore.getHistory(),
+        { role: "tool", tool_call_id: tc.id, content },
+      ]);
+    }
+    if (activeTaskId !== p.task_id) return; // aborted or superseded
+    try {
+      await call("ai_task_results", { task_id: activeTaskId, results });
+    } catch (e) {
+      pushChat("ai", `(failed to deliver tool results: ${e})`);
+    }
+  }
+
+  /** Clear the active server task (and its persisted id). */
+  function forgetActiveTask() {
+    activeTaskId = null;
+    try {
+      localStorage.removeItem("pp.activeTaskId");
+    } catch { /* ignore */ }
   }
 
   function terminalText(term: Terminal, maxLines = 200): string {
@@ -2923,8 +3198,9 @@
     );
     return {
       host: host || null,
+      session: sessionStateText(host, t),
       note: truncated
-        ? `typed into the live terminal; output was ${lines} lines and is trimmed to a digest (run grep/tail/head/wc to narrow it)`
+        ? `typed into the live terminal; output was ${lines} lines and is trimmed to a digest — call read_terminal to page the screen buffer for the full text, or run grep/tail/head/wc to narrow it`
         : "typed into the live terminal and waited for the output to settle",
       command: cmd,
       output: text,
@@ -2940,36 +3216,62 @@
     // Act on the pinned target (set when the chat was sent), falling back to
     // the current active tab's chat host. Never chase a tab switch mid-task.
     const host = chatTarget?.host ?? activeChatHost;
+    const chatTabId = chatTarget?.tabId ?? null;
     const term =
-      chatTarget?.tabId != null && chatTarget.tabId >= 0
-        ? termByTab.get(chatTarget.tabId)?.term ?? null
+      chatTabId != null && chatTabId >= 0
+        ? termByTab.get(chatTabId)?.term ?? null
         : activeTerm();
+    const tab =
+      chatTabId != null && chatTabId >= 0
+        ? tabs.find((x) => x.id === chatTabId) ?? null
+        : tabs.find((x) => x.id === activeTabId) ?? null;
+    const sessionState = sessionStateText(host, tab);
 
     // Client-local tools (no SSH round-trip) — work on local OR remote tabs.
     if (name === "read_terminal") {
       if (!term) return { error: "no active terminal" };
-      const raw = terminalText(term, 1000);
+      // Pageable screen read: `offset` skips back from the end, `limit` caps
+      // the window. The default is larger than the old fixed 1000 lines so the
+      // model can review earlier output that is still in scrollback.
+      const buf = term.buffer.active;
+      const total = buf.length;
+      const offset = Math.max(0, Math.min(total, Math.floor(Number(args.offset ?? 0)) || 0));
+      const limit = Math.max(1, Math.min(5000, Math.floor(Number(args.limit ?? 2000)) || 2000));
+      const end = Math.max(0, total - offset);
+      const start = Math.max(0, end - limit);
+      const lines: string[] = [];
+      for (let y = start; y < end; y++) {
+        lines.push(buf.getLine(y)?.translateToString(true) ?? "");
+      }
+      const raw = lines.join("\n");
       // This is a SCREEN SNAPSHOT, not a file: the xterm buffer is bounded by
       // scrollback, so it can NEVER be guaranteed "complete". Label it honestly
       // (NOT as a `[file: … COMPLETE …]` read — that marker would make the AI
       // believe it has the whole file when the screen may have scrolled past
       // it, which is exactly how "the output looks truncated" reports started).
-      // Keep as much as fits so on-screen file views are still usable.
-      const screenCap = 100000;
+      const screenCap = 200000;
       const bytes = utf8Bytes(raw);
       const truncated = bytes > screenCap;
       const body = truncated ? raw.slice(0, screenCap) : raw;
-      const text = truncated
-        ? `[terminal screen: ${bytes} bytes — TRUNCATED at ${screenCap} bytes; the screen is bounded by scrollback, this is NOT a complete file]\n${body}`
-        : `[terminal screen: ${bytes} bytes — what is on the user's screen right now, bounded by scrollback (NOT a file, NOT full command output)]\n${body}`;
+      const hasMore = start > 0;
+      const header = truncated
+        ? `[terminal screen: ${bytes} bytes — TRUNCATED at ${screenCap} bytes; the screen is bounded by scrollback, this is NOT a complete file]`
+        : `[terminal screen: ${bytes} bytes — what is on the user's screen, bounded by scrollback (NOT a file, NOT full command output)]`;
+      const pager =
+        `Showing lines ${start + 1}-${end} of ${total} in the buffer` +
+        (hasMore ? ` — there is MORE above; call read_terminal again with offset=${end} to page further back` : " — this is the oldest line in the buffer");
+      const text = `${header}\n[pager: ${pager}]\n${body}`;
       term.write("\r\n\x1b[36m[puppetterm] AI read the active terminal…\x1b[0m\r\n");
       return {
         host: host || null,
+        session: sessionState,
         note: "live terminal screen (not shell history) — a screen snapshot bounded by scrollback. To get a FILE's full contents or a command's full output, run the command via the `terminal` tool (or the agent tools in agent mode) instead of reading the screen.",
         terminal: text,
         truncated,
         complete: false, // a screen snapshot is NEVER a guaranteed-complete file
-        total_lines: raw.split("\n").length,
+        total_lines: total,
+        returned_lines: lines.length,
+        has_more: hasMore,
       };
     }
 
@@ -2978,7 +3280,38 @@
     if (name === "terminal") {
       const cmd = String(args.command ?? "").trim();
       if (!cmd) return { error: "no command given" };
-      return await runInTerminal(host, term, cmd);
+      const bare = cmd.replace(/^sudo\s+/, "").trim();
+      const firstWord = bare.split(/\s+/)[0] ?? "";
+      const isExit = firstWord === "exit" || firstWord === "logout" || firstWord === "quit";
+      // Guard the nested-shell double-exit: the first `exit` leaves an inner
+      // container/nested shell; a second one would drop the host SSH session.
+      // Block it and make the model ask the user before disconnecting the host.
+      if (isExit && justExitedNested) {
+        return {
+          status: "blocked",
+          reason:
+            "That is a second `exit` in a row. The first already left the inner " +
+            "(container/nested) shell — sending another `exit` would drop the host SSH " +
+            "session. Ask the user whether they also want to disconnect from the host, " +
+            "and only send `exit` again if they explicitly confirm.",
+        };
+      }
+      const entersNested =
+        /^(?:docker|podman|kubectl|nerdctl)\s+exec\s+(?:-[^\s]+\s+)*it\b/.test(bare) ||
+        /^ssh\s+/.test(bare) ||
+        /^(?:sudo\s+)?(?:bash|sh|zsh|fish)\s*$/.test(bare);
+      const res = await runInTerminal(host, term, cmd);
+      lastTerminalCmd = cmd;
+      if (isExit) {
+        // The exit leaves the inner shell we armed (if any); a second exit
+        // would now drop the host session, so arm the block for the next call.
+        justExitedNested = nestedShellArmed;
+        nestedShellArmed = false;
+      } else {
+        justExitedNested = false;
+        if (entersNested) nestedShellArmed = true;
+      }
+      return res;
     }
 
     // Tools that run on the remote host need an ssh target.
@@ -3202,6 +3535,47 @@
                 : activeTerm();
             term?.write(`\r\n\x1b[35m[puppetterm install]\x1b[0m ${p.data}\r\n`);
           }),
+          // ---- server-owned AI task events (web transport) ------------------
+          await on<any>("task_tool_calls", (p) => {
+            void handleTaskToolCalls(p);
+          }),
+          await on<any>("task_text", (p) => {
+            if (!p || p.owner !== clientId) return;
+            if (activeTaskId && p.task_id !== activeTaskId) return;
+            activeTaskId = p.task_id;
+            const text = String(p.text ?? "");
+            pushChat("ai", text);
+            chatStore.setHistory([
+              ...chatStore.getHistory(),
+              { role: "assistant", content: text },
+            ]);
+          }),
+          await on<any>("task_status", (p) => {
+            if (!p || p.owner !== clientId) return;
+            if (activeTaskId && p.task_id !== activeTaskId) return;
+            activeTaskId = p.task_id;
+            const s = String(p.status ?? "");
+            if (s === "waiting_tools") aiThinking = false;
+            else if (s === "running") aiThinking = true;
+          }),
+          await on<any>("task_error", (p) => {
+            if (!p || p.owner !== clientId) return;
+            if (activeTaskId && p.task_id !== activeTaskId) return;
+            pushChat("ai", `(AI error: ${p.error ?? "unknown"})`);
+            aiThinking = false;
+            chatBusy = false;
+            forgetActiveTask();
+          }),
+          await on<any>("task_done", (p) => {
+            if (!p || p.owner !== clientId) return;
+            if (activeTaskId && p.task_id !== activeTaskId) return;
+            aiThinking = false;
+            chatBusy = false;
+            forgetActiveTask();
+            if (p.conversation_id) chatStore.activeConversationId = p.conversation_id;
+            chatStore.persistToCache(chatHostOf(typeof p.host === "string" ? p.host : activeChatHost));
+            void refreshConversations();
+          }),
         ];
       } catch (e) {
         console.warn("event listeners unavailable:", e);
@@ -3237,6 +3611,32 @@
         loadModels().catch(() => {});
       } catch (e) {
         console.warn("ai config unavailable:", e);
+      }
+      // Resume a server-side task that was still running when the tab was
+      // closed: the server parked it waiting for tool results. Restore the
+      // conversation and re-attach so the pending tool calls are re-sent.
+      if (isWeb) {
+        let storedTask: string | null = null;
+        try {
+          storedTask = localStorage.getItem("pp.activeTaskId");
+        } catch { /* ignore */ }
+        if (storedTask) {
+          try {
+            const st = await call<any>("ai_task_status", { task_id: storedTask });
+            const s = String(st?.status ?? "");
+            if (st && (s === "waiting_tools" || s === "running" || s === "starting")) {
+              await chatStore.loadConversation(st.conversation_id);
+              activeTaskId = storedTask;
+              chatBusy = true;
+              aiThinking = s === "running" || s === "starting";
+              await call("ai_task_attach", { task_id: storedTask, owner: clientId });
+            } else {
+              forgetActiveTask();
+            }
+          } catch (e) {
+            console.warn("resume task failed", e);
+          }
+        }
       }
       // Land in a working LOCAL shell on launch (like a normal terminal)
       // instead of the empty "No open sessions" state — the local-terminal-first
@@ -3473,6 +3873,12 @@
               on {(chatTarget?.host || activeChatHost) || "local terminal"}
             </div>
           </div>
+          {#if pendingApproval.tool === "terminal" && /^\s*(?:sudo\s+)?(?:exit|logout|quit)\b/.test(String(pendingApproval.args?.command ?? ""))}
+            <div class="approval-warn">
+              This closes a shell session. Inside a container/nested shell, one exit returns to the
+              parent — a second exit drops the host connection.
+            </div>
+          {/if}
           <div class="approval-btns">
             <button onclick={reject}>Reject</button>
             <button class="primary" onclick={approve}>Approve</button>
@@ -3481,28 +3887,37 @@
       {/if}
 
       <div class="ai-target">
-        <span class="dot {activeHost ? 'up' : 'down'}"></span>
+        <span class="dot {activeConnState === 'connected' ? 'up' : activeConnState === 'connecting' ? 'busy' : 'down'}"></span>
+        {#if activePendingSsh}
+          connecting to <b>{activePendingSsh}</b>… <span class="conn-badge">verifying</span>
+        {:else if activeConnState === 'connected'}
+          acting on <b>{activeHost}</b>
+        {:else if activeConnState === 'connecting'}
+          connecting to <b>{activeChatHost ?? "remote"}</b>…
+        {:else if activeChatHost}
+          acting on <b>{activeChatHost}</b>
+          <span class="conn-badge warn" title="The live terminal is not connected to this host. Reconnect with ssh to act on it.">not connected</span>
+        {:else}
+          local — ssh to a remote first
+        {/if}
         {#if chatTarget?.host || activeChatHost}
-          acting on <b>{chatTarget?.host || activeChatHost}</b>
           {#if hostHasAgent(chatTarget?.host || activeChatHost)}
             <span class="mode-badge agent">agent</span>
           {:else if hostHasNoAgent(chatTarget?.host || activeChatHost)}
             <span class="mode-badge terminal">terminal</span>
           {/if}
-          {#if activeTabCwd}
-            <span class="ai-cwd" title="Current working directory on the host">{activeTabCwd}</span>
-          {/if}
-          {#if hostHasAgent(activeChatHost) && liveMetrics}
-            <span class="ai-metrics" title="Live host resources (via agent)">
-              CPU {liveMetrics.cpu.toFixed(0)}% · MEM {liveMetrics.mem.toFixed(0)}%
-              {#if liveMetrics.load != null}· load {liveMetrics.load.toFixed(2)}{/if}
-            </span>
-          {/if}
-          {#if chatBusy && chatTarget && chatTarget.host !== activeChatHost}
-            <span class="warn">(pinned — you switched tabs)</span>
-          {/if}
-        {:else}
-          local — ssh to a remote first
+        {/if}
+        {#if activeTabCwd}
+          <span class="ai-cwd" title="Current working directory on the host">{activeTabCwd}</span>
+        {/if}
+        {#if hostHasAgent(activeChatHost) && liveMetrics}
+          <span class="ai-metrics" title="Live host resources (via agent)">
+            CPU {liveMetrics.cpu.toFixed(0)}% · MEM {liveMetrics.mem.toFixed(0)}%
+            {#if liveMetrics.load != null}· load {liveMetrics.load.toFixed(2)}{/if}
+          </span>
+        {/if}
+        {#if chatBusy && chatTarget && chatTarget.host !== activeChatHost}
+          <span class="warn">(pinned — you switched tabs)</span>
         {/if}
         {#if (chatTarget?.host || activeChatHost) && !installBusy && !hostHasAgent(chatTarget?.host || activeChatHost)}
           <button
@@ -4458,6 +4873,14 @@
     max-height: 120px; /* long commands scroll internally so the buttons stay visible */
     overflow-y: auto;
   }
+  .approval-warn {
+    font-size: 12px;
+    color: #d29922;
+    background: #1c1504;
+    border: 1px solid #d29922;
+    border-radius: 6px;
+    padding: 6px 8px;
+  }
   .approval-explain {
     font-size: 12px;
     color: #e6edf3;
@@ -4935,6 +5358,23 @@
     color: #8b949e;
     background: #161b22;
     border: 1px solid #30363d;
+  }
+  .conn-badge {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 1px 6px;
+    border-radius: 999px;
+    margin-left: 2px;
+    color: #d29922;
+    background: #1c1504;
+    border: 1px solid #d29922;
+  }
+  .conn-badge.warn {
+    color: #f85149;
+    background: #1c0b0b;
+    border-color: #f85149;
   }
   .ai-cwd {
     font-family: monospace;

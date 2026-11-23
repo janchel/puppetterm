@@ -13,6 +13,28 @@ export type { UnlistenFn };
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const useMock = import.meta.env.VITE_PUPPETTERM_MOCK === "1";
 
+/** True for the browser + puppetterm-server deployment (the web transport). */
+export const isWeb = !isTauri && !useMock;
+
+const CLIENT_ID_KEY = "puppetterm.client_id";
+
+/** Stable per-browser id so server-side tasks can be routed back to this tab. */
+export const clientId: string = (() => {
+  try {
+    let id = localStorage.getItem(CLIENT_ID_KEY);
+    if (!id) {
+      id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem(CLIENT_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    return "anon";
+  }
+})();
+
 type Handler = (p: unknown) => void;
 
 /** Call a backend command (IPC, HTTP or mock depending on the runtime). */

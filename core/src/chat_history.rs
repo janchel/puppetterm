@@ -121,6 +121,11 @@ fn gen_id() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
 }
 
+/// Public id generator for other subsystems (e.g. server-side AI tasks).
+pub fn new_id() -> String {
+    gen_id()
+}
+
 fn rand_byte() -> u8 {
     let mut b = [0u8; 1];
     getrandom::getrandom(&mut b).expect("rng");

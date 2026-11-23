@@ -10,6 +10,7 @@ edition = "2021"
 puppetterm-core = { path = "../core" }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 futures-util = "0.3"
 serde = { workspace = true }

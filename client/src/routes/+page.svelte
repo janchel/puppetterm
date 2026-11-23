@@ -146,6 +146,12 @@
       model: "deepseek-chat",
       models: ["deepseek-chat", "deepseek-reasoner"],
     },
+    longcat: {
+      label: "LongCat",
+      baseUrl: "https://api.longcat.chat/openai/v1",
+      model: "LongCat-2.5",
+      models: ["LongCat-2.5", "LongCat-2.5-Preview", "LongCat-2.0"],
+    },
     anthropic: {
       label: "Claude (Anthropic)",
       baseUrl: "https://api.anthropic.com/v1",
@@ -524,29 +530,34 @@
         if (!list.includes(pid)) list.push(pid);
       };
       for (const p of enabled) {
-        if (p.model && p.model.trim()) {
-          all.add(p.model.trim());
-          addOwner(p.model.trim(), p.id);
-        } else {
-          try {
-            const r = await call<any>("list_ai_models", { provider_id: p.id });
-            const raw = r.models ?? [];
-            for (const m of raw) {
-              const id = typeof m === "string" ? m : m.id;
-              if (id) {
-                all.add(id);
-                addOwner(id, p.id);
-                if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
-              }
+        // Always show the model the provider was added with, then fetch the
+        // endpoint's full catalog and merge it in. Previously a saved model
+        // short-circuited the fetch, so providers added from a preset (which
+        // pre-fills a model) only ever listed that one model.
+        const savedModel = typeof p.model === "string" ? p.model.trim() : "";
+        if (savedModel) {
+          all.add(savedModel);
+          addOwner(savedModel, p.id);
+        }
+        try {
+          const r = await call<any>("list_ai_models", { provider_id: p.id });
+          const raw = r.models ?? [];
+          for (const m of raw) {
+            const id = typeof m === "string" ? m : m.id;
+            if (id) {
+              all.add(id);
+              addOwner(id, p.id);
+              if (typeof m !== "string" && m && m.id) freeMap[m.id] = !!m.is_free;
             }
-          } catch (e) {
-            const msg = String(e);
-            console.warn("list models for", p.id, e);
-            if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
-              modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
-            } else {
-              modelsError = msg;
-            }
+          }
+        } catch (e) {
+          if (savedModel) continue; // the saved model is already listed
+          const msg = String(e);
+          console.warn("list models for", p.id, e);
+          if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid")) {
+            modelsError = "API key not valid for this provider — check the key or add a specific model instead.";
+          } else {
+            modelsError = msg;
           }
         }
       }
@@ -660,9 +671,9 @@
       addApiKey = "";
       addProviderSel = "openai";
       await loadProviders();
-      // Populate Models: a specific model shows only that one; an empty model
-      // causes all models to be parsed. This keeps the Models page in sync with
-      // how the provider was just added.
+      // Populate Models: the endpoint's full catalog is fetched for every
+      // enabled provider (the model it was added with is always kept), so the
+      // Models page stays in sync with what was just added.
       modelsList = [];
       await loadModels().catch(() => {});
       // Sync the main Settings form to the just-added provider so Save is
@@ -852,6 +863,23 @@
   // context — keeps the checkpoint; the host-switch effect then persists the
   // conversation and swaps to the local one (both preserved, nothing cleared).
   async function checkpointConnectionClosed(host: string) {
+    // Both the pty-exit event and the prompt scan can observe the same disconnect
+    // in quick succession. If the last message is already this host's
+    // checkpoint, don't stack a duplicate (they piled up in the DB otherwise).
+    const hist = chatStore.getHistory();
+    const last = hist[hist.length - 1];
+    if (
+      last &&
+      last.role === "system" &&
+      typeof last.content === "string" &&
+      last.content.startsWith("[checkpoint]") &&
+      last.content.includes(`The SSH connection to ${host} was terminated`)
+    ) {
+      chatStore.persistToCache(host);
+      await chatStore.persistConversation(host);
+      await refreshConversations();
+      return;
+    }
     pushChat(
       "system",
       `⚠ connection to ${host} closed — the SSH session is terminated. Reconnect (ssh) to re-attach the AI to ${host}.`,
@@ -888,12 +916,14 @@
 
   // Load a conversation from the server into the active chat.
   async function loadConversation(id: string) {
+    if (chatBusy) return; // never clobber an in-flight turn
     // Persist the current conversation (if any) before replacing it on screen.
     if (id !== chatStore.activeConversationId && chatStore.chatLog.length > 0) {
       await chatStore.persistConversation(activeChatHost ?? "");
       await refreshConversations();
     }
     await chatStore.loadConversation(id);
+    chatStore.stateHost = chatHostOf(activeChatHost);
     showConvos = false;
   }
 
@@ -947,8 +977,9 @@
     localStorage.setItem("pp.autonomy", autonomy);
   });
 
-  // Reload the conversation list whenever the active host changes, and load
-  // the most recent conversation (or a cached one) for that host.
+  // When the active host genuinely changes, persist the outgoing host's
+  // conversation and refresh the sidebar list for the new host. Restoring the
+  // new host's conversation happens in the effect below.
   let appliedConvoHost: string | null = null;
   let appliedConvoCanon: string | null = null;
   $effect(() => {
@@ -958,21 +989,33 @@
     // prompt `user@host`, case, port) — only rebind when it's genuinely a
     // different server, so a long AI session never "clears for no reason".
     if (canon === appliedConvoCanon) return;
-    // Persist the outgoing host's conversation before switching hosts.
-    if (appliedConvoHost != null && chatStore.chatLog.length > 0) {
-      chatStore.persistToCache(appliedConvoHost);
-      chatStore.persistConversation(appliedConvoHost);
-    }
+    const prevHost = appliedConvoHost;
+    // Claim the new binding FIRST (synchronously). A transient ssh reconnect
+    // (chatHost cleared → __local__ → re-detected to the same host) must never
+    // rewind this conversation, and an async persist must not be able to
+    // restore a STALE snapshot over the freshly-loaded one for the same host.
     appliedConvoHost = host;
     appliedConvoCanon = canon;
-    refreshConversations();
-    // Restore from localStorage cache for instant display (server will refresh).
-    const hadCache = chatStore.loadFromCache(host);
-    if (!hadCache) {
-      // No cache — seed a default system prompt conversation.
-      chatStore.newChat();
-      chatStore.setHistory([{ role: "system", content: SYSTEM_PROMPT }]);
+    // Persist the outgoing host's conversation before switching hosts. Async,
+    // fire-and-forget: it only writes to the server/cache backups and can
+    // never clobber conversation state for the newly bound host.
+    if (prevHost != null && chatStore.chatLog.length > 0) {
+      chatStore.persistToCache(prevHost);
+      void chatStore.persistConversation(prevHost);
     }
+    refreshConversations();
+  });
+
+  // Restore the newest server conversation for the active host (or the newer of
+  // cache vs server), so a chat is resumable after a reload or from a fresh
+  // browser — not only when this browser has a localStorage cache. Re-runs when
+  // a turn ends: a restore skipped mid-turn is applied afterwards instead of
+  // leaving the previous host's chat on screen.
+  $effect(() => {
+    if (chatBusy) return;
+    const host = chatHostOf(activeChatHost);
+    if (chatStore.stateHost === host) return;
+    void chatStore.restoreForHost(host, () => chatBusy);
   });
 
   // ---- settings modal + theme ----------------------------------------------
@@ -1679,8 +1722,10 @@
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
   }
 
-  /** Start a fresh conversation: reset history to just the system prompt and
-   *  clear the visible chat log. Creates a new server-side conversation. */
+  /** Start a fresh conversation: clear the visible chat log and history (the
+   *  system prompt is re-added on the next send). The server-side conversation
+   *  is created lazily on the first message, so clicking "new chat" and never
+   *  sending doesn't accumulate empty entries. */
   async function newChat() {
     if (chatBusy) return; // don't clear mid-task
     // Save the current conversation before starting fresh.
@@ -1690,13 +1735,9 @@
       await refreshConversations();
     }
     chatStore.newChat();
+    chatStore.stateHost = chatHostOf(host);
     chatText = "";
     pushChat("ai", "(new chat started)");
-    // Create a new conversation on the server
-    try {
-      chatStore.activeConversationId = await chatStore.createConversation(host);
-      await refreshConversations();
-    } catch { /* server unavailable */ }
     notify("New chat started");
   }
 
@@ -1970,9 +2011,12 @@
     );
     // Keep the system prompt in the conversation in sync with the current host
     const userMsg = { role: "user", content: text };
+    // A prior turn may have ended mid-tool-batch (guard stop / abort), leaving a
+    // dangling assistant tool_calls whose results never came — drop those before
+    // appending this user turn, or the provider ignores the latest message.
     setHistory(chatHostOf(target.host), [
       { role: "system", content: cfg.prompt },
-      ...chatStore.getHistory().filter((m) => m.role !== "system"),
+      ...dropUnbalancedToolBatches(chatStore.getHistory()).filter((m) => m.role !== "system"),
       userMsg,
     ]);
     chatBusy = true;
@@ -2292,7 +2336,7 @@
     for (let i = li; i >= 0; i--) {
       const line = lines[i];
 
-      // Track connection closures (e.g. "Connection to 203.0.113.34 closed.")
+      // Track connection closures (e.g. "Connection to 192.0.2.34 closed.")
       const closedMatch = line.match(/Connection (?:to ([^\s:]+) )?(?:closed|reset)|closed by remote host|Connection reset/i);
       if (closedMatch) {
         if (closedMatch[1]) {
@@ -2383,10 +2427,52 @@
     );
   }
 
+  /** Providers require every assistant `tool_calls` to be followed by the tool
+   *  results for those ids before any other message. An AI turn can end early
+   *  (repeat-guard stop, user abort, MAX_STEPS, compaction dropping a result)
+   *  and leave a dangling tool batch — from then on the model ignores newer
+   *  user messages and repeats the old action. Drop any tool batch (mid-history
+   *  or trailing) whose results are incomplete, together with its results and
+   *  any straggler tool messages, so the context handed to the model is always
+   *  a strictly-sequential, well-formed protocol. */
+  function dropUnbalancedToolBatches(h: any[]): any[] {
+    const out: any[] = [];
+    let pending = new Set<string>();
+    let batchStart = -1;
+    for (const m of h) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        const ids = m.tool_calls.map((tc: any) => tc.id).filter(Boolean);
+        if (ids.length > 0) {
+          pending = new Set(ids);
+          batchStart = out.length;
+          out.push(m);
+          continue;
+        }
+      }
+      if (m.role === "tool") {
+        if (pending.size > 0 && m.tool_call_id) {
+          pending.delete(m.tool_call_id);
+          out.push(m);
+          continue;
+        }
+        continue; // orphaned tool result (its batch is gone) → drop
+      }
+      if (pending.size > 0) {
+        // a non-tool message interrupts an unclosed batch → remove the batch
+        if (batchStart >= 0) out.length = batchStart;
+        pending = new Set();
+        batchStart = -1;
+      }
+      out.push(m);
+    }
+    return out;
+  }
+
   function compactHistory(h: any[]): any[] {
     const lu = h.map((m, i) => ({ m, i }));
     const head = h.slice(0, 2); // system + original request
-    if (h.length - 2 <= MAX_HISTORY - 2 && countChars(h) <= MAX_CONTEXT_CHARS) return h;
+    if (h.length - 2 <= MAX_HISTORY - 2 && countChars(h) <= MAX_CONTEXT_CHARS)
+      return dropUnbalancedToolBatches(h);
     // Split the middle (after head): keep every user/assistant message (that's
     // the AI's memory), trim oldest tool/tool-result blobs first.
     const middle = lu
@@ -2420,11 +2506,11 @@
       content: `(Note: ${dropped} earlier tool outputs were trimmed to keep this conversation bounded — the conversation text is preserved, but the latest terminal/tool state may have changed. Re-query the live server state if needed.)`,
     };
     // Keep the note right before the final tail so it informs the next turn.
-    const final = [...ordered, note];
+    const final = [...dropUnbalancedToolBatches(ordered), note];
     // Safety net: if everything is one giant message, keep the newest tail.
     if (countChars(final) > MAX_CONTEXT_CHARS * 2) {
       const sys = ordered[0] ?? { role: "system", content: SYSTEM_PROMPT };
-      return [sys, ...ordered.slice(-40), note];
+      return dropUnbalancedToolBatches([sys, ...ordered.slice(-40), note]);
     }
     return final;
   }
@@ -2463,15 +2549,16 @@
   async function runAiLoop(hostForPersist: string) {
     try {
       let guard = 0;
-      const MAX_STEPS = 60;
+      const MAX_STEPS = 120;
       let lastSig: string | null = null;
       let repeatCount = 0;
-      // Stuck-guard state: fingerprints of the last two EXECUTED tool results
-      // while the calls were identical, so we only stop on NO-PROGRESS repeats
-      // (same call, same output). An identical call whose output changed is a
-      // poll waiting for progress — that should flow, not trip the guard.
-      let lastExec: { fp: string; empty: boolean; recap: string } | null = null;
-      let prevExec: { fp: string; empty: boolean; recap: string } | null = null;
+      // Same-turn result cache keyed by the exact tool signature (name + args).
+      // A command that was already APPROVED + EXECUTED once this turn is answered
+      // from its stored result on an identical re-request: no new approval prompt,
+      // no re-execution (re-running an identical command seconds later returns the
+      // same output anyway). Ends the "AI repeats the same command and I keep
+      // approving" loop. If the SAME call is requested a 3rd time the loop stops.
+      const runCache = new Map<string, string>();
       // Auto-save after each AI response so a long multi-step task (or an
       // abort) never loses progress. Throttled: rapid tool steps shouldn't
       // flood the DB — the final persist after the loop covers the tail.
@@ -2505,6 +2592,11 @@
         }
         if (msg.tool_calls && msg.tool_calls.length > 0) {
           const explain = (msg.content ?? "").trim();
+          // Pin to the tab the task was started on (never chase a tab switch).
+          const tm =
+            chatTarget?.tabId != null && chatTarget.tabId >= 0
+              ? termByTab.get(chatTarget.tabId)?.term ?? null
+              : activeTerm();
           if (explain) pushChat("ai", explain);
           chatStore.setHistory([
             ...chatStore.getHistory(),
@@ -2512,60 +2604,39 @@
           ]);
           for (const tc of msg.tool_calls) {
             const sig = `${tc.function.name}:${tc.function.arguments}`;
-            const isRepeat = sig === lastSig;
-            if (isRepeat) {
+            if (sig === lastSig) {
               repeatCount++;
             } else {
               lastSig = sig;
               repeatCount = 1;
-              lastExec = null;
-              prevExec = null;
             }
-            // Stuck detection runs BEFORE executing: a 3rd consecutive identical
-            // call is NOT run when the last two results show no progress (same
-            // output, or no output at all) — the AI already has that data.
-            if (
-              repeatCount >= 3 &&
-              lastExec &&
-              prevExec &&
-              (lastExec.empty || lastExec.fp === prevExec.fp)
-            ) {
-              pushChat(
-                "ai",
-                `(stopped — the AI repeated the same action 3× in a row and appears stuck. It already had this result: ${(lastExec.recap).slice(0, 200)}. The identical call was NOT run again. Try rephrasing, or ask it to be more specific.)`,
+            // Identical call already approved + executed once this turn → answer
+            // from the stored result. No new approval prompt, no re-execution.
+            const cached = runCache.get(sig);
+            if (cached) {
+              // 3 requests for the same already-answered command = the AI is
+              // re-reading the same result without progress → stop the loop.
+              if (repeatCount >= 3) {
+                pushChat(
+                  "ai",
+                  `(stopped — the AI repeated the same action 3× in a row and appears stuck. It already had this result: ${(resultFingerprint(cached).recap).slice(0, 200)}. The identical call was NOT run again (it was answered from the earlier result). Try rephrasing, or ask it to be more specific.)`,
+                );
+                return;
+              }
+              tm?.write(
+                "\r\n\x1b[90m[puppetterm] same command as before — reusing earlier result (not re-run)\x1b[0m\r\n",
               );
-              return;
+              chatStore.setHistory([...chatStore.getHistory(), { role: "tool", tool_call_id: tc.id, content: cached }]);
+              continue;
             }
             const ok = await requestApproval(tc, explain || undefined);
             const content = ok
               ? JSON.stringify(await executeTool(tc))
               : JSON.stringify({ status: "rejected", reason: "user rejected the action" });
+            // Remember approved executions so an identical retry is answered from
+            // cache; a REJECTED call still prompts again if re-issued.
+            if (ok) runCache.set(sig, content);
             chatStore.setHistory([...chatStore.getHistory(), { role: "tool", tool_call_id: tc.id, content }]);
-            const f = resultFingerprint(content);
-            if (isRepeat) {
-              const prior = lastExec;
-              prevExec = prior;
-              lastExec = f;
-              // Re-running the SAME action produced the IDENTICAL result — no new
-              // information for the model, so halt immediately (don't wait for a
-              // 3rd identical call). It already has this data in context.
-              if (f.fp === prior?.fp) {
-                pushChat(
-                  "ai",
-                  `(stopped — the AI repeated an action whose result was already returned unchanged. Last result: ${(lastExec.recap).slice(0, 200)}. The identical call was NOT run again. Try rephrasing, or ask it to be more specific.)`,
-                );
-                return;
-              }
-              // Output changed vs the prior identical run → the model is polling
-              // for progress, not stuck; keep the repeats flowing until the
-              // output freezes (that is exactly when the check above trips).
-              if (repeatCount >= 3) {
-                repeatCount = 2;
-              }
-            } else {
-              lastExec = f;
-              prevExec = null;
-            }
           }
           await persistThrottled();
           continue;
@@ -2576,10 +2647,19 @@
         await persistThrottled();
         return;
       }
-      pushChat(
-        "ai",
-        "(stopped after too many tool steps — the task may be too large for one go; try breaking it into smaller steps)",
-      );
+      // MAX_STEPS reached while the AI still wanted to issue tool calls: it
+      // kept working (diagnosing away, e.g.) without reaching a final answer.
+      // Say what actually happened on BOTH surfaces so the terminal and the
+      // chatbox tell the same story, and make clear the task can continue.
+      const tm =
+        chatTarget?.tabId != null && chatTarget.tabId >= 0
+          ? termByTab.get(chatTarget.tabId)?.term ?? null
+          : activeTerm();
+      const stopMsg =
+        `(stopped after ${MAX_STEPS} tool steps in a single run — the AI was still issuing tool calls without reaching a final answer. ` +
+        `Nothing crashed; it just needs more room. Send a follow-up message to CONTINUE from here (tip: say "now apply the fix"), or break the task into smaller steps.)`;
+      pushChat("ai", stopMsg);
+      tm?.write(`\r\n\x1b[90m[puppetterm] ${stopMsg}\x1b[0m\r\n`);
     } catch (e) {
       pushChat("ai", `(AI error: ${e})`);
       console.error("ai_chat", e);
@@ -3435,11 +3515,11 @@
         {/if}
         {#if (chatTarget?.host || activeChatHost) && !installBusy && hostHasAgent(chatTarget?.host || activeChatHost)}
           <button
-            class="install-agent update"
+            class="install-agent installed"
             onclick={promptUpdateAgent}
-            title="Update puppetterm-agent on {chatTarget?.host || activeChatHost} (reinstall from the current build)"
+            title="puppetterm-agent is installed on {chatTarget?.host || activeChatHost} — click to reinstall/refresh it"
           >
-            ↻ Update agent
+            ✓ Agent installed
           </button>
         {/if}
       </div>
@@ -4894,13 +4974,13 @@
     background: #238636;
     color: #fff;
   }
-  .install-agent.update {
-    border-color: #d29922;
-    color: #d29922;
+  .install-agent.installed {
+    border-color: #238636;
+    color: #3fb950;
   }
-  .install-agent.update:hover {
-    background: #d29922;
-    color: #000;
+  .install-agent.installed:hover {
+    background: #238636;
+    color: #fff;
   }
   .approval-btns {
     display: flex;

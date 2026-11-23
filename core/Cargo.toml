@@ -12,7 +12,7 @@ serde_json = { workspace = true }
 portable-pty = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 libc = "0.2"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"

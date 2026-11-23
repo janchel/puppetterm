@@ -200,7 +200,7 @@ needed. If you do want an extra hardened key, set `PUPPETTERM_AGENT_PUBKEY` and
 the app will also add a command-locked `authorized_keys` entry for it. If
 passwordless sudo is available on the host, the optional full-privileges
 installer (`installer/install.sh`) runs automatically to grant scoped sudoers +
-systemctl / apt control. The **↻ Update agent** button (or any re-run)
+systemctl / apt control. The **✓ Agent installed** button (or any re-run)
 reinstalls and refreshes the existing binary, so deploying always updates an
 installed agent.
 

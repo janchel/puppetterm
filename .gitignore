@@ -25,6 +25,8 @@ client/src-tauri/gen/apple/
 *.log
 *.tmp
 *.pid
+__pycache__/
+*.pyc
 .DS_Store
 Thumbs.db
 
@@ -49,6 +51,7 @@ id_ed25519
 # up in the tree, ignore it.
 ai.json
 puppetterm-ai.json
+providers.json
 
 # --- Local databases (audit log, etc.) ---
 *.db

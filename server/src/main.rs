@@ -46,6 +46,14 @@ async fn main() {
         .unwrap_or(8080);
     let dist = std::env::var("PUPPETTERM_WEB_DIST").ok().filter(|d| !d.is_empty());
 
+    // One-time: give pre-existing conversations real titles derived from their
+    // first user message (older builds left them all as "New chat").
+    match puppetterm_core::chat_history::backfill_titles() {
+        Ok(n) if n > 0 => println!("[puppetterm] derived titles for {n} existing conversations"),
+        Ok(_) => {}
+        Err(e) => eprintln!("[puppetterm] title backfill failed: {e}"),
+    }
+
     // Clean up any leftover ControlMaster sockets from previous runs.
     std::thread::spawn(puppetterm_core::sessions::cleanup_stale_masters);
 

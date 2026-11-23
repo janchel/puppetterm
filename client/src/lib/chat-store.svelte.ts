@@ -38,7 +38,7 @@ function localStorageKey(host: string): string {
   return `pp.chat.${host}.session`;
 }
 
-function loadFromLocalStorage(host: string): { entry: ChatEntry; id: string | null } | null {
+function loadFromLocalStorage(host: string): { entry: ChatEntry; id: string | null; savedAt: number } | null {
   if (typeof localStorage === "undefined") return null;
   const raw = localStorage.getItem(localStorageKey(host));
   if (!raw) return null;
@@ -51,6 +51,7 @@ function loadFromLocalStorage(host: string): { entry: ChatEntry; id: string | nu
           history: Array.isArray(v.history) ? v.history : [],
         },
         id: typeof v.convId === "string" ? v.convId : null,
+        savedAt: typeof v.savedAt === "number" ? v.savedAt : 0,
       };
     }
   } catch { /* corrupt */ }
@@ -96,8 +97,14 @@ export class ChatStore {
   /** Currently loaded visible chat log. */
   chatLog: { role: string; text: string }[] = $state([]);
 
-  /** Currently loaded LLM history (system + user + assistant + tool messages). */
+  /** The currently loaded LLM history (system + user + assistant + tool messages). */
   history: ChatMessage[] = $state([]);
+
+  /** Guards against an older host's async restore landing after a newer one. */
+  private restoreSeq = 0;
+
+  /** The host the currently displayed conversation belongs to (null = none). */
+  stateHost: string | null = $state(null);
 
   // ---- conversation list ---------------------------------------------------
 
@@ -133,6 +140,55 @@ export class ChatStore {
         role: m.role === "assistant" ? "ai" : m.role,
         text: m.content ?? "",
       }));
+  }
+
+  /** Restore the conversation to show for a host.
+   *
+   *  The server DB is the source of truth, but a long conversation must also be
+   *  resumable from a fresh browser/device where the localStorage cache is
+   *  empty. Prefer the newest server conversation unless the local cache is
+   *  strictly newer (e.g. the last server write failed) — otherwise a stale
+   *  cache would overwrite newer server history on the next save. */
+  async restoreForHost(host: string, isBusy?: () => boolean): Promise<void> {
+    const seq = ++this.restoreSeq;
+    const h = chatHostOf(host);
+    const cached = loadFromLocalStorage(h);
+    let newest: ConversationMeta | null = null;
+    try {
+      newest = (await this.listConversations(h))[0] ?? null;
+    } catch {
+      newest = null; // server unreachable — fall back to the cache
+    }
+    if (seq !== this.restoreSeq || isBusy?.()) return; // superseded or a turn started
+    const serverTs = newest ? Date.parse(newest.updated_at) : NaN;
+    const cacheTs = cached?.savedAt ?? 0;
+    const serverIsFresh =
+      newest != null && (cached == null || Number.isNaN(cacheTs) || serverTs >= cacheTs);
+    if (newest && serverIsFresh) {
+      await this.loadConversation(newest.id);
+      if (seq !== this.restoreSeq || isBusy?.()) return;
+      this.stateHost = h;
+      saveToLocalStorage(
+        h,
+        { chatLog: this.chatLog, history: this.history },
+        this.activeConversationId,
+      );
+      return;
+    }
+    if (cached) {
+      if (isBusy?.()) return;
+      this.chatLog = cached.entry.chatLog;
+      this.history = cached.entry.history;
+      this.activeConversationId = cached.id;
+      this.stateHost = h;
+      // Cache is newer than the server copy (or the server had none): push it up
+      // so the conversation is not stranded in this browser.
+      void this.persistConversation(h);
+      return;
+    }
+    if (isBusy?.()) return;
+    this.newChat();
+    this.stateHost = h;
   }
 
   /** Delete a conversation from the server. */
@@ -176,7 +232,7 @@ export class ChatStore {
     return true;
   }
 
-  /** Persist the current conversation to the server (append mode).
+  /** Persist the current conversation to the server (replace mode).
    *  Call this after mutations to sync with the backend. */
   async persistConversation(host: string): Promise<void> {
     const h = chatHostOf(host);
@@ -184,6 +240,13 @@ export class ChatStore {
     let convId = this.activeConversationId;
     // Also cache in localStorage
     saveToLocalStorage(h, entry, convId);
+    // A conversation with no user/assistant content is just the seeded system
+    // prompt. Don't create server rows for it: switching hosts (or clicking
+    // "new chat" and never sending) would otherwise accumulate empty
+    // "New chat" entries. The localStorage cache above still preserves it.
+    if (!entry.history.some((m) => m.role === "user" || m.role === "assistant")) {
+      return;
+    }
 
     if (!convId) {
       // Create a new conversation on the server

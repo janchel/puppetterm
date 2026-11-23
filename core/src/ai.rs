@@ -10,7 +10,7 @@
 //! environment variables. The API key is **encrypted at rest** (ChaCha20-Poly1305
 //! keyed from the machine id) and never crosses into the frontend.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 pub const PROVIDER_OPENAI: &str = "openai"; // custom OpenAI-compatible
 pub const PROVIDER_DEEPSEEK: &str = "deepseek";
 pub const PROVIDER_ANTHROPIC: &str = "anthropic";
+pub const PROVIDER_LONGCAT: &str = "longcat";
 
 /// Authentication method used to obtain the bearer token sent to the endpoint.
 /// `key`   — a static API key pasted by the user (encrypted at rest).
@@ -296,7 +297,11 @@ pub fn add_saved_provider(
         enabled: true,
         api_key: api_key.unwrap_or_default().trim().to_string(),
     };
-    if p.provider != PROVIDER_ANTHROPIC && p.provider != PROVIDER_DEEPSEEK && p.provider != PROVIDER_OPENAI {
+    if p.provider != PROVIDER_ANTHROPIC
+        && p.provider != PROVIDER_DEEPSEEK
+        && p.provider != PROVIDER_OPENAI
+        && p.provider != PROVIDER_LONGCAT
+    {
         p.provider = PROVIDER_OPENAI.into();
     }
     if p.auth_method != AUTH_METHOD_OAUTH {
@@ -456,6 +461,57 @@ struct ChatRequest {
     max_tokens: Option<u32>,
 }
 
+/// Providers require a strictly-sequential protocol: every assistant `tool_calls`
+/// must be immediately followed by a `tool` result for EACH call id before any
+/// other message. An interrupted turn (client abort, guard stop, compaction, a
+/// reloaded session) can leave a dangling batch, which makes providers silently
+/// ignore newer messages and the model repeat an old action. Drop any incomplete
+/// tool batch (mid-history or trailing) together with its results and any
+/// orphaned tool messages.
+fn drop_unbalanced_tool_batches(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut pending: HashSet<String> = HashSet::new();
+    let mut batch_start: Option<usize> = None;
+    for m in messages {
+        let has_calls = matches!(m.role, Role::Assistant)
+            && m.tool_calls.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+        if has_calls {
+            let ids: HashSet<String> = m
+                .tool_calls
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter_map(|tc| if tc.id.is_empty() { None } else { Some(tc.id.clone()) })
+                .collect();
+            if !ids.is_empty() {
+                pending = ids;
+                batch_start = Some(out.len());
+                out.push(m);
+                continue;
+            }
+        }
+        if matches!(m.role, Role::Tool) {
+            if !pending.is_empty() {
+                if let Some(id) = &m.tool_call_id {
+                    pending.remove(id);
+                }
+                out.push(m);
+            }
+            continue; // orphaned tool result — drop
+        }
+        if !pending.is_empty() {
+            // non-tool message interrupts an unclosed batch → remove the batch
+            if let Some(pos) = batch_start {
+                out.truncate(pos);
+            }
+            pending.clear();
+            batch_start = None;
+        }
+        out.push(m);
+    }
+    out
+}
+
 /// Call the configured provider's chat completions endpoint (OpenAI-compatible
 /// for openai/deepseek, Anthropic Messages for anthropic/claude).
 pub async fn chat_completion(
@@ -464,6 +520,7 @@ pub async fn chat_completion(
     tools: Option<Vec<ToolDef>>,
     max_tokens: Option<u32>,
 ) -> Result<ChatResponse, String> {
+    let messages = drop_unbalanced_tool_batches(messages);
     if cfg.provider == PROVIDER_ANTHROPIC {
         anthropic_completion(cfg, messages, tools, max_tokens).await
     } else {
@@ -534,7 +591,10 @@ pub fn apply_ai_config(
     if let Some(p) = provider {
         let p = p.trim().to_string();
         if !p.is_empty() {
-            cfg.provider = if p == PROVIDER_ANTHROPIC || p == PROVIDER_DEEPSEEK || p == PROVIDER_OPENAI
+            cfg.provider = if p == PROVIDER_ANTHROPIC
+                || p == PROVIDER_DEEPSEEK
+                || p == PROVIDER_OPENAI
+                || p == PROVIDER_LONGCAT
             {
                 p
             } else {
@@ -841,12 +901,7 @@ async fn refresh_access_token(cfg: &mut AiConfig) -> Result<(), String> {
         return Err("OAuth token expired and cannot be refreshed — please log in again".into());
     }
     let client = reqwest::Client::new();
-    let params: Vec<(&str, &str)> = vec![
-        ("grant_type", "refresh_token"),
-        ("refresh_token", &cfg.refresh_token),
-        ("client_id", &cfg.oauth.client_id),
-    ];
-    let mut params = vec![
+    let mut params: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", &cfg.refresh_token),
         ("client_id", &cfg.oauth.client_id),
@@ -936,7 +991,7 @@ pub async fn test_config(
         .or_else(|| stored.as_ref().map(|c| c.provider.clone()))
         .unwrap_or_else(default_provider);
     let provider = match provider.as_str() {
-        PROVIDER_ANTHROPIC | PROVIDER_DEEPSEEK | PROVIDER_OPENAI => provider,
+        PROVIDER_ANTHROPIC | PROVIDER_DEEPSEEK | PROVIDER_OPENAI | PROVIDER_LONGCAT => provider,
         _ => PROVIDER_OPENAI.to_string(),
     };
     // Resolve the key: explicit > saved provider (matching base_url) > stored ai.json.
@@ -1178,12 +1233,17 @@ pub async fn list_provider_models(id: &str) -> Result<Vec<ModelInfo>, String> {
     if !p.enabled {
         return Err("provider is disabled".into());
     }
-    if !p.model.is_empty() {
-        // Provider was added with a specific model — only that one, no fetch
-        return Ok(vec![ModelInfo { id: p.model.clone(), is_free: false }]);
+    let saved = p.model.trim().to_string();
+    // No credential stored on the provider (e.g. an OAuth login whose token lives
+    // in the active config) — the endpoint can't be queried, so expose the model
+    // it was added with, if any.
+    if p.api_key.trim().is_empty() {
+        if saved.is_empty() {
+            return Err("not authenticated — add an API key to this provider".into());
+        }
+        return Ok(vec![ModelInfo { id: saved, is_free: false }]);
     }
-    // Blank model — fetch all available from this provider's endpoint
-    let mut cfg = AiConfig {
+    let cfg = AiConfig {
         base_url: p.base_url.clone(),
         api_key: p.api_key.clone(),
         model: String::new(),
@@ -1195,10 +1255,25 @@ pub async fn list_provider_models(id: &str) -> Result<Vec<ModelInfo>, String> {
         refresh_token_enc: None,
         token_expires_at: None,
     };
-    // Reuse the same Google API-key handling as list_models (via cfg)
-    // For OAuth providers, refresh if needed (load full provider's refresh token if any)
-    // Note: saved providers store refresh_token_enc separately if needed — for now we just use api_key
-    list_models(&cfg).await
+    match list_models(&cfg).await {
+        Ok(mut models) => {
+            // Keep the model it was added with visible even when the endpoint
+            // doesn't list it.
+            if !saved.is_empty() && !models.iter().any(|m| m.id == saved) {
+                models.push(ModelInfo { id: saved, is_free: false });
+            }
+            Ok(models)
+        }
+        Err(e) => {
+            // The endpoint is unreachable/invalid — fall back to the saved model
+            // so the provider still has at least one usable entry.
+            if !saved.is_empty() {
+                Ok(vec![ModelInfo { id: saved, is_free: false }])
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Call an OpenAI-compatible `/chat/completions` endpoint (custom + DeepSeek).
@@ -1555,5 +1630,84 @@ mod tests {
         );
         let tc = &msg.tool_calls.as_ref().unwrap()[0];
         assert_eq!(tc.function.name, "get_weather");
+    }
+
+    fn msg(role: Role, content: Option<&str>, tool_call_id: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.map(|s| s.to_string()),
+            tool_call_id: tool_call_id.map(|s| s.to_string()),
+            tool_calls: None,
+        }
+    }
+
+    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: Some("using tools".into()),
+            tool_call_id: None,
+            tool_calls: Some(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: id.to_string(),
+                        kind: "function".into(),
+                        function: ToolCallFunction {
+                            name: "run_command".into(),
+                            arguments: "{}".into(),
+                        },
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn drops_unbalanced_tool_batches() {
+        // Trailing dangling batch (post-guard-stop / abort), with a following
+        // user message that must survive examination → batch dropped, user kept.
+        let trailing = vec![
+            msg(Role::User, Some("check disk"), None),
+            assistant_with_calls(&["a", "b"]),
+            msg(Role::Tool, Some("res-a"), Some("a")),
+            msg(Role::User, Some("install dig"), None),
+        ];
+        let out = drop_unbalanced_tool_batches(trailing);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[1].role, Role::User));
+        assert_eq!(out[1].content.as_deref(), Some("install dig"));
+
+        // Balanced batch + user → untouched.
+        let balanced = vec![
+            assistant_with_calls(&["a"]),
+            msg(Role::Tool, Some("res-a"), Some("a")),
+            msg(Role::User, Some("next"), None),
+        ];
+        assert_eq!(drop_unbalanced_tool_batches(balanced).len(), 3);
+
+        // Mid-history dangling batch dropped, later content preserved.
+        let mid = vec![
+            assistant_with_calls(&["x", "y"]),
+            msg(Role::Tool, Some("res-x"), Some("x")),
+            msg(Role::User, Some("keep me"), None),
+            assistant_with_calls(&["z"]),
+            msg(Role::Tool, Some("res-z"), Some("z")),
+            msg(Role::User, Some("and me"), None),
+        ];
+        let out = drop_unbalanced_tool_batches(mid);
+        let texts: Vec<_> = out
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(texts, vec!["keep me".to_string(), "and me".to_string()]);
+
+        // Orphaned tool result (no batch before it) → dropped.
+        let orphan = vec![
+            msg(Role::Tool, Some("stray"), Some("zz")),
+            msg(Role::User, Some("hi"), None),
+        ];
+        let out = drop_unbalanced_tool_batches(orphan);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content.as_deref(), Some("hi"));
     }
 }

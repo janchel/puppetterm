@@ -73,11 +73,11 @@ RUN chmod +x /app/entrypoint.sh /app/puppetterm-server \
 
 ENV HOME=/home/pp \
     PUPPETTERM_BIND=0.0.0.0 \
-    PUPPETTERM_PORT=8080 \
+    PUPPETTERM_PORT=7070 \
     PUPPETTERM_WEB_DIST=/app/web \
     PUPPETTERM_AGENT_DIR=/app/agent/bin
 
-EXPOSE 8080
+EXPOSE 7070
 WORKDIR /home/pp
 USER root
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -1,6 +1,6 @@
 # puppetterm — self-hosted web deployment.
 #
-#   docker compose up -d --build          → serve on http://localhost:8080
+#   docker compose up -d --build          → serve on http://localhost:7070
 #   PUPPETTERM_BASIC_AUTH=me:secret docker compose up -d   → with basic auth
 #
 # Your SSH setup is mounted READ-ONLY at /ssh-in and copied by the entrypoint
@@ -14,12 +14,12 @@ services:
     container_name: puppetterm
     restart: unless-stopped
     ports:
-      - "${PUPPETTERM_PORT:-8080}:8080"
+      - "${PUPPETTERM_PORT:-7070}:7070"
     environment:
       # user:pass — REQUIRED in anything but a trusted LAN. Leave unset to run
       # open (the server logs a loud warning).
       PUPPETTERM_BASIC_AUTH: "${PUPPETTERM_BASIC_AUTH:-}"
-      PUPPETTERM_PORT: "8080"
+      PUPPETTERM_PORT: "7070"
       # Optional: point the AI client at a provider without UI setup.
       # PUPPETTERM_AI_BASE_URL / PUPPETTERM_AI_MODEL / PUPPETTERM_AI_API_KEY /
       # PUPPETTERM_AI_PROVIDER

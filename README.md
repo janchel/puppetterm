@@ -154,7 +154,7 @@ docker compose up -d --build
 
 # with basic auth (recommended for anything reachable beyond localhost):
 PUPPETTERM_BASIC_AUTH=admin:s3cret docker compose up -d --build
-# → http://localhost:8080
+# → http://localhost:7070
 ```
 
 What compose mounts:
@@ -178,7 +178,7 @@ overrides). The AI provider/model/key can also be set in-app via ⚙ Settings.
 
 ```bash
 docker build -t puppetterm .
-docker run --rm -p 8080:8080 -e PUPPETTERM_BASIC_AUTH=me:pass \
+docker run --rm -p 7070:7070 -e PUPPETTERM_BASIC_AUTH=me:pass \
   -v "$HOME/.ssh:/ssh-in:ro" puppetterm
 ```
 
